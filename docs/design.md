@@ -84,8 +84,13 @@ expression statement.
 The universe records both hashes (`Universe.rootHash` = document,
 `Universe.analysisHash` = what was parsed, `serverWouldHitAnalysis`), so the
 debounced analyze for that same document text is a hit: one build per
-document version, not one per request. Placeholder diagnostics are rewritten
-back to document columns (`mapFixDiags`). `tests/test_spawn.py` locks this in
+document version, not one per request. Only **completion** needs the exact
+analysis text (it walks the AST at the cursor); **hover, definition and
+signature help** match on document identity alone (`serverWouldHit`), since
+neutralisation rewrites only the incomplete statement, never declarations —
+so a symbol request after a placeholder completion reuses that universe
+instead of rebuilding. Placeholder diagnostics are rewritten back to document
+columns (`mapFixDiags`). `tests/test_spawn.py` locks the spawn accounting in
 by counting worker spawns.
 
 ## Request loop
@@ -99,7 +104,7 @@ strands messages in the userspace buffer.
 
 ## Status
 
-Verified by `make check` (81 assertions across the LSP, universe-cache,
+Verified by `make check` (85 assertions across the LSP, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd
 sources (378 KB file, full frontend semantic):
 
@@ -116,6 +121,8 @@ sources (378 KB file, full frontend semantic):
   literals (`Entry(target, hate)`), active parameter by comma nesting.
 - `textDocument/definition` for locals/params, module members, imported
   symbols and members of dotted chains (cross-file, absolute URI).
+- `textDocument/hover`: declaration (`int add(int a, int b)`) plus doc
+  comment as Markdown, for the same symbol set as goto-definition.
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
 - Universe cache: repeated requests ~free (13× on the stress file); edits

@@ -212,6 +212,20 @@ version (Posix)
         writeFrame(fd, printJsonStr(root));
     }
 
+    private void sendHover(int fd, const ref HoverInfo h)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        js.add_bool_to_object(root, "found", h.found);
+        if (h.found)
+        {
+            addStrOpt(js, root, "detail", h.detail);
+            addStrOpt(js, root, "doc", h.doc);
+        }
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(fd, printJsonStr(root));
+    }
+
     private void workerLoop(int fd)
     {
         ServerState s;
@@ -319,7 +333,7 @@ version (Posix)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                if (built && !serverWouldHitAnalysis(s, path, orig, atext))
+                if (built && !serverWouldHit(s, path, orig))
                 {
                     sendNeedRespawn(fd);
                     continue;
@@ -345,7 +359,7 @@ version (Posix)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                if (built && !serverWouldHitAnalysis(s, path, orig, atext))
+                if (built && !serverWouldHit(s, path, orig))
                 {
                     sendNeedRespawn(fd);
                     continue;
@@ -357,6 +371,32 @@ version (Posix)
                 DefLoc def;
                 definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
                 sendDefinition(fd, def);
+                built = true;
+                continue;
+            }
+            if (ops == "hover")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                if (built && !serverWouldHit(s, path, orig))
+                {
+                    sendNeedRespawn(fd);
+                    continue;
+                }
+                auto a = serverAnalyze(s, path, atext, orig);
+                CompleteCtx ctx;
+                ctx.line = line;
+                ctx.character = col;
+                HoverInfo h;
+                hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
+                sendHover(fd, h);
                 built = true;
                 continue;
             }
@@ -526,6 +566,13 @@ struct WDef
     uint line = 0; // 1-based
     uint col = 0;  // 1-based
     size_t len = 0;
+}
+
+struct WHover
+{
+    bool found = false;
+    string detail;
+    string doc;
 }
 
 enum ExchangeResult
@@ -701,6 +748,34 @@ ExchangeResult workerDefinition(ref Worker w, const(char)[] path, const(char)[] 
         out_.line = cast(uint)jint(jget(r, "line"));
         out_.col = cast(uint)jint(jget(r, "col"));
         out_.len = cast(size_t)jint(jget(r, "len"));
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, ref WHover out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("hover"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    out_.found = jbool(jget(r, "found"), false);
+    if (out_.found)
+    {
+        out_.detail = dupOrEmpty(jstr(jget(r, "detail")));
+        out_.doc = dupOrEmpty(jstr(jget(r, "doc")));
     }
     return ExchangeResult.ok;
 }

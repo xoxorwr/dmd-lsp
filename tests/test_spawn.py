@@ -70,6 +70,19 @@ msg = read_msg()
 check('flush-publishes', msg.get('method') == 'textDocument/publishDiagnostics',
       str(msg.get('method')))
 
+# Symbol requests for the same document must reuse that placeholder universe
+# by identity (root text), not rebuild it.
+send({"jsonrpc": "2.0", "id": 4, "method": "textDocument/hover",
+      "params": {"textDocument": {"uri": URI}, "position": {"line": 1, "character": 7}}})
+hov = read_msg()['result']
+check('hover-reuses',
+      hov is not None and 'struct S' in hov['contents']['value'], str(hov))
+send({"jsonrpc": "2.0", "id": 5, "method": "textDocument/definition",
+      "params": {"textDocument": {"uri": URI}, "position": {"line": 1, "character": 7}}})
+dfn = read_msg()['result']
+check('definition-reuses',
+      dfn is not None and dfn[0]['range']['start']['line'] == 1, str(dfn))
+
 send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})

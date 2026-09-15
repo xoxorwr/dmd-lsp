@@ -21,7 +21,7 @@ import dmd.statement : Statement;
 import dmd.arraytypes : Dsymbols;
 import dmd.attrib : ConditionalDeclaration;
 import dmd.dsymbol : DSYM;
-import dmd.mtype : Type, TypePointer;
+import dmd.mtype : Type, TypePointer, TypeFunction;
 import dmd.astenums : TY, VarArg;
 import dmd.typesem : nextOf, toBasetype;
 import dmd.dsymbolsem : toAlias;
@@ -182,15 +182,8 @@ private Type symType(Dsymbol s)
 
 // Function label parts for LSP 3.17 `labelDetails`: the parameter list
 // (e.g. "(int, string)") and the return type. Empty for non-functions.
-private void funcParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
-    ref const(char)[] labelDesc)
+private const(char)[] funcParamList(Arena* a, TypeFunction tf, bool withNames)
 {
-    auto fd = s.isFuncDeclaration();
-    if (!fd || !fd.type)
-        return;
-    auto tf = fd.type.isTypeFunction();
-    if (!tf)
-        return;
     import core.stdc.string : strlen;
     string buf = "(";
     bool first = true;
@@ -205,6 +198,11 @@ private void funcParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
             first = false;
             const(char)* ts = p.type ? p.type.toChars() : null;
             buf ~= ts ? ts[0 .. strlen(ts)] : "?";
+            if (withNames && p.ident)
+            {
+                buf ~= " ";
+                buf ~= p.ident.toString();
+            }
         }
     if (tf.parameterList.varargs != VarArg.none)
     {
@@ -213,7 +211,19 @@ private void funcParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
         buf ~= "...";
     }
     buf ~= ")";
-    labelDetail = arenaDupStr(a, buf);
+    return arenaDupStr(a, buf);
+}
+
+private void funcParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
+    ref const(char)[] labelDesc)
+{
+    auto fd = s.isFuncDeclaration();
+    if (!fd || !fd.type)
+        return;
+    auto tf = fd.type.isTypeFunction();
+    if (!tf)
+        return;
+    labelDetail = funcParamList(a, tf, false);
     labelDesc = arenaDupStr(a, typeDetail(tf.next));
 }
 
@@ -1591,16 +1601,19 @@ private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
 
 // Jump target for the symbol under the cursor: locals/params, module
 // members, imported names, or members of a resolved dotted chain.
-void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
-    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+// Resolve the symbol under the cursor: locals/params, module members,
+// imported names (incl. public re-exports), or members of a dotted chain.
+// Aliases are followed to their target.
+private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
+    uint character, const(char)[] text)
 {
     if (!mod || !mod.members)
-        return;
-    if (!posInCode(text, ctx.line, ctx.character))
-        return;
-    auto chain = chainUnderCursor(text, ctx.line, ctx.character);
+        return null;
+    if (!posInCode(text, line, character))
+        return null;
+    auto chain = chainUnderCursor(text, line, character);
     if (!chain.length)
-        return;
+        return null;
 
     const(char)[][] segs;
     size_t s = 0;
@@ -1615,13 +1628,13 @@ void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         }
     }
     if (!segs.length)
-        return;
+        return null;
 
     Dsymbol[] rootMembers;
     flattenMembers(mod.members, rootMembers);
     NameType[] locals;
-    auto fd = findEnclosingFunc(mod, ctx.line);
-    collectSlots(mod, syn, ctx.line, fd, locals);
+    auto fd = findEnclosingFunc(mod, line);
+    collectSlots(mod, syn, line, fd, locals);
 
     Dsymbol sym = null;
     if (segs.length == 1)
@@ -1646,12 +1659,28 @@ void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             sym = findMember(scope_, segs[$ - 1]);
     }
     if (!sym)
-        return;
+        return null;
 
     auto t = sym.toAlias();
     if (t && t !is sym)
         sym = t;
+    return sym;
+}
 
+private size_t lastSegLen(const(char)[] chain)
+{
+    size_t s = chain.length;
+    while (s > 0 && chain[s - 1] != '.')
+        s--;
+    return baseName(chain[s .. $]).length;
+}
+
+void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+{
+    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
+    if (!sym)
+        return;
     auto loc = sym.loc;
     const(char)* f = loc.filename();
     if (!f)
@@ -1661,7 +1690,86 @@ void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     out_.file = arenaDupStr(arena, f[0 .. strlen(f)]);
     out_.line = loc.linnum();
     out_.col = loc.charnum();
-    out_.len = segs[$ - 1].length;
+    out_.len = lastSegLen(chainUnderCursor(text, ctx.line, ctx.character));
+}
+
+// ---------- hover ----------
+struct HoverInfo
+{
+    bool found = false;
+    const(char)[] detail; // declaration line for a ```d block
+    const(char)[] doc;    // doc comment, if any
+}
+
+private const(char)[] declLine(Arena* a, Dsymbol sym)
+{
+    import core.stdc.string : strlen;
+    char[] buf;
+    if (auto vd = sym.isVarDeclaration())
+    {
+        if (vd.type)
+        {
+            const(char)* t = vd.type.toChars();
+            if (t)
+            {
+                buf ~= t[0 .. strlen(t)];
+                buf ~= " ";
+            }
+        }
+        if (sym.ident)
+            buf ~= sym.ident.toString();
+    }
+    else if (auto fd = sym.isFuncDeclaration())
+    {
+        auto tf = fd.type ? fd.type.isTypeFunction() : null;
+        if (tf)
+        {
+            if (tf.next)
+            {
+                const(char)* rt = tf.next.toChars();
+                if (rt)
+                {
+                    buf ~= rt[0 .. strlen(rt)];
+                    buf ~= " ";
+                }
+            }
+            if (sym.ident)
+                buf ~= sym.ident.toString();
+            buf ~= funcParamList(a, tf, true);
+        }
+        else if (fd.type)
+        {
+            const(char)* t = fd.type.toChars();
+            if (t)
+                buf ~= t[0 .. strlen(t)];
+        }
+    }
+    else if (sym.ident)
+    {
+        const(char)* k = sym.kind();
+        if (k)
+            buf ~= k[0 .. strlen(k)];
+        buf ~= " ";
+        buf ~= sym.ident.toString();
+    }
+    else
+    {
+        const(char)* k = sym.kind();
+        if (k)
+            buf ~= k[0 .. strlen(k)];
+    }
+    return arenaDupStr(a, buf);
+}
+
+void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref HoverInfo out_)
+{
+    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
+    if (!sym)
+        return;
+    out_.detail = declLine(arena, sym);
+    out_.doc = arenaDupStr(arena, docOf(sym));
+    out_.found = out_.detail.length > 0 || out_.doc.length > 0;
 }
 
 // ---------- entry ----------

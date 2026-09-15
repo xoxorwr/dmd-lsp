@@ -264,6 +264,32 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
     return false;
 }
 
+// Run a hover request against the worker, respawning once if needed.
+private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, ref worker.WHover hov)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerHover(app.wk, path, atext, origText, line, col, hov);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 private void publishFor(App* app, const(char)[] path, const(char)[] text)
 {
     worker.WAnalysis a;
@@ -1021,6 +1047,7 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_item_to_object(sh, "triggerCharacters", sht);
         js.add_item_to_object(caps, "signatureHelpProvider", sh);
         js.add_bool_to_object(caps, "definitionProvider", true);
+        js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "codeActionProvider", true);
         auto si = js.create_object();
         js.add_string_to_object(si, "name", "dmd-lsp");
@@ -1206,6 +1233,54 @@ private void handleMessage(App* app, ref RawMsg m)
                 auto arr = js.create_array();
                 js.add_item_to_array(arr, loc);
                 lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/hover")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            worker.WHover hov;
+            if (workerHoverRetry(app, path, atext, text, line, col, hov) && hov.found)
+            {
+                string value;
+                if (hov.detail.length)
+                    value ~= "```d\n" ~ hov.detail ~ "\n```";
+                if (hov.doc.length)
+                {
+                    if (value.length)
+                        value ~= "\n\n";
+                    value ~= hov.doc;
+                }
+                auto js = jmake();
+                auto md = js.create_object();
+                js.add_string_to_object(md, "kind", "markdown");
+                js.add_string_to_object(md, "value", zstr(value));
+                auto res = js.create_object();
+                js.add_item_to_object(res, "contents", md);
+                lspRespond(m.idJson, printJsonStr(res));
             }
             else
                 lspRespond(m.idJson, "null");

@@ -50,8 +50,8 @@ CLI:
 Editor: point any LSP client at `dmd-lsp` for `.d`/`.di`. Supported:
 `initialize`, `textDocument/{didOpen,didChange,didClose,didSave}`,
 `completion` (LSP 3.17 `labelDetails` when the client opts in),
-`signatureHelp`, `definition` (goto), `codeAction` (remove unused import),
-`publishDiagnostics`.
+`signatureHelp`, `definition` (goto), `hover` (type + docs), `codeAction`
+(remove unused import), `publishDiagnostics`.
 
 Configuration (precedence: editor settings → CLI → `dls.json` → builtin
 stdlib defaults):

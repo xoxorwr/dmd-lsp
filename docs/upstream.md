@@ -29,18 +29,16 @@ Ordered by value/effort:
 1. **Follow through upstream**: submit the three patches, handle review
    (likely questions: `ParsedModule` vs `Tuple`, `string[]` vs ranges,
    Windows branches which can't be CI-checked locally).
-2. **Hover** from resolved `toAlias()` symbols; the resolution machinery
-   already exists for completion and goto-definition (now shipped).
-3. **Per-symbol selective-import pruning** (`import m : unused` quickfix) and
+2. **Per-symbol selective-import pruning** (`import m : unused` quickfix) and
    **unused locals** via the snapshot walker (names already collected; needs
    def-use over the range).
-4. **dub support**: derive import/string-import paths and `-version` flags
+3. **dub support**: derive import/string-import paths and `-version` flags
    from `dub describe`, and re-read them when `dub.json`/`dub.sdl` changes,
    so dub projects need no manual `dls.json`.
-5. **UFCS candidates** for dot completion (the placeholder already proves the
+4. **UFCS candidates** for dot completion (the placeholder already proves the
    technique).
-6. **Hit-path IPC trim**: send a content hash (or version) instead of the
+5. **Hit-path IPC trim**: send a content hash (or version) instead of the
    whole document to the worker when it already holds that universe.
-7. Revisit remaining gaps only if they bite: unparseable-region fallback,
+6. Revisit remaining gaps only if they bite: unparseable-region fallback,
    `auto` condition-var dot types, Windows worker port (`threads` or
    `CreateProcess`).

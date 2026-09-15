@@ -346,6 +346,29 @@ pdef = def_at(puri, 2, 11)
 check('def-public-import',
       bool(pdef) and pdef[0]['uri'].endswith('/tests/pkg2.d'), str(pdef))
 
+# hover: declaration line + doc comment.
+hovertext = ('module hovt;\n'
+             'struct Point { int x; int y; }\n'
+             '/// Adds two things.\n'
+             'int add(int a, int b) { return a + b; }\n'
+             'void main()\n{\n'
+             '    Point p;\n'
+             '    int z = add(p.x, 2);\n}\n')
+huri = open_doctype('hovt.d', hovertext)
+def hover_at(line, ch):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0], "method": "textDocument/hover",
+          "params": {"textDocument": {"uri": huri},
+                     "position": {"line": line, "character": ch}}})
+    r = read_msg()['result']
+    return r['contents']['value'] if r else None
+hv = hover_at(7, 13)
+check('hover-fn',
+      hv is not None and 'int add(int a, int b)' in hv and 'Adds two things.' in hv,
+      str(hv))
+hv = hover_at(7, 18)
+check('hover-field', hv is not None and 'int x' in hv, str(hv))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
