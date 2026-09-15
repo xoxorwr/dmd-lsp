@@ -1,0 +1,124 @@
+name: nightly
+
+# Rolling nightly binaries for the VS Code extension. Published as a
+# prerelease tagged `nightly` with stable asset names, so the client can
+# always fetch:
+#   https://github.com/<owner>/<repo>/releases/download/nightly/<asset>
+# Assets:
+#   dmd-lsp-linux-x64.tar.gz
+#   dmd-lsp-darwin-arm64.tar.gz
+#   dmd-lsp-darwin-x64.tar.gz
+#   SHA256SUMS
+#
+# Windows is intentionally absent: the worker (fork/socketpair) and the
+# poll-gated stdio loop are POSIX-only, so a Windows binary would not run.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  # LDC's dmd-compatible driver (`ldmd2`) accepts our dmd-style Makefile
+  # flags (-i, -version=, -preview=, -J, -of). The frontend must be new
+  # enough to compile src/dmd (2.113 line).
+  LDC_VERSION: "1.42.0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # macos-13 (Intel) is being retired; keep it optional so the nightly
+    # still succeeds with whatever runner is available.
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            asset: dmd-lsp-linux-x64.tar.gz
+            ldc: linux-x86_64
+          - os: macos-14
+            target: darwin-arm64
+            asset: dmd-lsp-darwin-arm64.tar.gz
+            ldc: osx-universal
+          - os: macos-13
+            target: darwin-x64
+            asset: dmd-lsp-darwin-x64.tar.gz
+            ldc: osx-universal
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LDC ${{ env.LDC_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-${{ matrix.ldc }}.tar.xz"
+          curl -fsSL "$url" -o "$RUNNER_TEMP/ldc.tar.xz"
+          mkdir -p "$HOME/ldc"
+          tar -xJf "$RUNNER_TEMP/ldc.tar.xz" -C "$HOME/ldc" --strip-components=1
+          echo "$HOME/ldc/bin" >> "$GITHUB_PATH"
+          "$HOME/ldc/bin/ldmd2" --version
+
+      - name: Build (ldmd2)
+        shell: bash
+        run: make DC=ldmd2
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./dmd-lsp --version
+          ./dmd-lsp --check tests/ok.d || true
+
+      - name: Package
+        shell: bash
+        run: |
+          tar -czf "${{ matrix.asset }}" dmd-lsp README.md
+          echo "packaged ${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish nightly
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum dmd-lsp-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          prerelease: true
+          make_latest: "false"
+          overwrite_files: true
+          body: |
+            Rolling nightly build of `dmd-lsp` (commit `${{ github.sha }}`),
+            compiled with LDC ${{ env.LDC_VERSION }} via `ldmd2`.
+
+            Assets: `dmd-lsp-linux-x64.tar.gz`,
+            `dmd-lsp-darwin-arm64.tar.gz`, `dmd-lsp-darwin-x64.tar.gz`,
+            plus `SHA256SUMS`.
+          files: dist/*

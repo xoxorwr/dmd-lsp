@@ -23,7 +23,8 @@ Rules this repo lives by:
   (crasher found via `cast(ConditionalDeclaration)` on a
   `MixinDeclaration`). Tag-check (`dsym`, `ty`, `isX()`) first.
 - Hot paths allocate from arena/bump allocators, not the GC.
-- Toolchain is pinned to `/home/ryuukk/dlang/dmd-2.113.0` (never system dmd).
+- Toolchain is pinned to the 2.113.0 line (never system dmd). LDC's
+  `ldmd2` is supported (`make DC=ldmd2`) and is what CI/nightlies use.
 
 ## Build
 
@@ -37,7 +38,27 @@ make vendor     # re-copy the frontend closure from ../dmd
 
 `make` uses `dmd -i`, so only transitively-imported frontend modules
 compile — no backend/glue. Needs `stringimp/SYSCONFDIR.imp` (present) and
-`-J` paths from the Makefile.
+`-J` paths from the Makefile. The compiler is overridable: `make DC=ldmd2`
+builds with LDC's dmd-compatible driver (produces a smaller binary; the
+LDC frontend must be new enough to compile `src/dmd`).
+
+## Nightly builds
+
+`.github/workflows/nightly.yml` builds a rolling prerelease tagged
+`nightly` (LDC `ldmd2`, on a schedule + manual dispatch). Asset names are
+stable so a VS Code client can fetch and verify:
+
+- `dmd-lsp-linux-x64.tar.gz`
+- `dmd-lsp-darwin-arm64.tar.gz`
+- `dmd-lsp-darwin-x64.tar.gz`
+- `SHA256SUMS`
+
+Each archive contains the `dmd-lsp` binary at its root. Download base:
+`https://github.com/<owner>/<repo>/releases/download/nightly/`.
+
+Windows is not built: the worker (`fork`/`socketpair`) and the poll-gated
+stdio loop are POSIX-only, so a Windows binary would not run. Porting the
+worker (threads or `CreateProcess`) is a prerequisite.
 
 ## Vendored dmd
 
