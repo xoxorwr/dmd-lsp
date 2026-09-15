@@ -238,6 +238,32 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
     return false;
 }
 
+// Run a goto-definition request against the worker, respawning once if needed.
+private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, ref worker.WDef def)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerDefinition(app.wk, path, atext, origText, line, col, def);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 private void publishFor(App* app, const(char)[] path, const(char)[] text)
 {
     worker.WAnalysis a;
@@ -784,6 +810,44 @@ private string tokenPlaceholder(const(char)[] text, uint line, uint col)
     return (text[0 .. ls + s2] ~ text[ls + e2 .. $]).idup;
 }
 
+// Absolute path for a possibly-relative dmd filename (imports found via a
+// relative -I are reported relative to the daemon's cwd).
+private string absolutePath(const(char)[] p)
+{
+    if (p.length && p[0] == '/')
+        return p.idup;
+    import core.sys.posix.unistd : getcwd;
+    import core.stdc.string : strlen;
+    char[4096] buf;
+    if (getcwd(buf.ptr, buf.length) is null)
+        return p.idup;
+    auto cwd = buf[0 .. strlen(buf.ptr)];
+    return cast(string)((cwd ~ "/" ~ p).idup);
+}
+
+// file:// URI with minimal percent-encoding (round-trips with uriToPath).
+private string pathToUri(const(char)[] path)
+{
+    static immutable char[] hex = "0123456789ABCDEF";
+    auto abs = absolutePath(path);
+    char[] out_;
+    out_ ~= "file://";
+    foreach (c; abs)
+    {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '/' || c == '-' || c == '_' ||
+            c == '.' || c == '~')
+            out_ ~= c;
+        else
+        {
+            out_ ~= '%';
+            out_ ~= hex[(cast(ubyte)c) >> 4];
+            out_ ~= hex[cast(ubyte)c & 0xF];
+        }
+    }
+    return out_.idup;
+}
+
 private void handleMessage(App* app, ref RawMsg m)
 {
     if (!m.ok)
@@ -956,6 +1020,7 @@ private void handleMessage(App* app, ref RawMsg m)
         auto sh = js.create_object();
         js.add_item_to_object(sh, "triggerCharacters", sht);
         js.add_item_to_object(caps, "signatureHelpProvider", sh);
+        js.add_bool_to_object(caps, "definitionProvider", true);
         js.add_bool_to_object(caps, "codeActionProvider", true);
         auto si = js.create_object();
         js.add_string_to_object(si, "name", "dmd-lsp");
@@ -1094,6 +1159,56 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             else
                 lspRespond(m.idJson, `{"signatures":[]}`);
+            return;
+        }
+        if (m.method == "textDocument/definition")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            worker.WDef def;
+            if (workerDefinitionRetry(app, path, atext, text, line, col, def) && def.found)
+            {
+                auto js = jmake();
+                auto loc = js.create_object();
+                js.add_string_to_object(loc, "uri", zstr(pathToUri(def.file)));
+                uint sline = def.line > 0 ? def.line - 1 : 0;
+                uint scol = def.col > 0 ? def.col - 1 : 0;
+                auto range = js.create_object();
+                auto st = js.create_object();
+                js.add_number_to_object(st, "line", sline);
+                js.add_number_to_object(st, "character", scol);
+                auto en = js.create_object();
+                js.add_number_to_object(en, "line", sline);
+                js.add_number_to_object(en, "character", scol + def.len);
+                js.add_item_to_object(range, "start", st);
+                js.add_item_to_object(range, "end", en);
+                js.add_item_to_object(loc, "range", range);
+                auto arr = js.create_array();
+                js.add_item_to_array(arr, loc);
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
             return;
         }
         if (m.method == "textDocument/codeAction")

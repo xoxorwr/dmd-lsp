@@ -46,7 +46,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
   args.push(`--debounce-ms=${config.get<number>('debounceMs', 300)}`);
 
-  const serverOptions: ServerOptions = { command: serverPath, args };
+  // Run the server in the workspace root so relative import paths (and the
+  // dep paths dmd reports for goto-definition) resolve correctly.
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const serverOptions: ServerOptions = {
+    command: serverPath,
+    args,
+    options: cwd ? { cwd } : undefined,
+  };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'd' }],
   };

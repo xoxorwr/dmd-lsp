@@ -196,6 +196,22 @@ version (Posix)
         writeFrame(fd, printJsonStr(root));
     }
 
+    private void sendDefinition(int fd, const ref DefLoc def)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        js.add_bool_to_object(root, "found", def.found);
+        if (def.found)
+        {
+            addStrOpt(js, root, "file", def.file);
+            js.add_number_to_object(root, "line", def.line);
+            js.add_number_to_object(root, "col", def.col);
+            js.add_number_to_object(root, "len", cast(double)def.len);
+        }
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(fd, printJsonStr(root));
+    }
+
     private void workerLoop(int fd)
     {
         ServerState s;
@@ -315,6 +331,32 @@ version (Posix)
                 SignatureInfo si;
                 signatureAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, si);
                 sendSignature(fd, si);
+                built = true;
+                continue;
+            }
+            if (ops == "definition")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                if (built && !serverWouldHitAnalysis(s, path, orig, atext))
+                {
+                    sendNeedRespawn(fd);
+                    continue;
+                }
+                auto a = serverAnalyze(s, path, atext, orig);
+                CompleteCtx ctx;
+                ctx.line = line;
+                ctx.character = col;
+                DefLoc def;
+                definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+                sendDefinition(fd, def);
                 built = true;
                 continue;
             }
@@ -477,6 +519,15 @@ struct WSig
     int activeParameter = 0;
 }
 
+struct WDef
+{
+    bool found = false;
+    string file;
+    uint line = 0; // 1-based
+    uint col = 0;  // 1-based
+    size_t len = 0;
+}
+
 enum ExchangeResult
 {
     ok,
@@ -620,6 +671,36 @@ ExchangeResult workerSignature(ref Worker w, const(char)[] path, const(char)[] a
                 out_.params ~= p;
             }
         }
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerDefinition(ref Worker w, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, ref WDef out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("definition"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    out_.found = jbool(jget(r, "found"), false);
+    if (out_.found)
+    {
+        out_.file = dupOrEmpty(jstr(jget(r, "file")));
+        out_.line = cast(uint)jint(jget(r, "line"));
+        out_.col = cast(uint)jint(jget(r, "col"));
+        out_.len = cast(size_t)jint(jget(r, "len"));
     }
     return ExchangeResult.ok;
 }

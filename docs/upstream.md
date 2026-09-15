@@ -29,8 +29,8 @@ Ordered by value/effort:
 1. **Follow through upstream**: submit the three patches, handle review
    (likely questions: `ParsedModule` vs `Tuple`, `string[]` vs ranges,
    Windows branches which can't be CI-checked locally).
-2. **Hover + goto-definition** from resolved `toAlias()` symbols; the
-   resolution machinery already exists for completion.
+2. **Hover** from resolved `toAlias()` symbols; the resolution machinery
+   already exists for completion and goto-definition (now shipped).
 3. **Per-symbol selective-import pruning** (`import m : unused` quickfix) and
    **unused locals** via the snapshot walker (names already collected; needs
    def-use over the range).

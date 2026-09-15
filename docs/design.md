@@ -99,7 +99,7 @@ strands messages in the userspace buffer.
 
 ## Status
 
-Verified by `make check` (76 assertions across the LSP, universe-cache,
+Verified by `make check` (81 assertions across the LSP, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd
 sources (378 KB file, full frontend semantic):
 
@@ -114,6 +114,8 @@ sources (378 KB file, full frontend semantic):
   as label + `(params)` + return type (`dist(Point, int) int`).
 - `textDocument/signatureHelp` (trigger `(`, `,`) for calls and struct
   literals (`Entry(target, hate)`), active parameter by comma nesting.
+- `textDocument/definition` for locals/params, module members, imported
+  symbols and members of dotted chains (cross-file, absolute URI).
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
 - Universe cache: repeated requests ~free (13× on the stress file); edits

@@ -308,6 +308,44 @@ items = read_msg()['result']['items']
 cdet = [i.get('detail') for i in items if i['label'] == 'c']
 check('plain-in-call-arg-type', cdet == ['Combatant*'], str(cdet))
 
+# goto definition: local, module member, dotted field, imported symbol.
+def def_at(uri, line, ch):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0], "method": "textDocument/definition",
+          "params": {"textDocument": {"uri": uri},
+                     "position": {"line": line, "character": ch}}})
+    return read_msg()['result']
+
+deftext = ('module defs;\n'
+           'struct Point { int x; int y; }\n'
+           'int add(int a, int b) { return a + b; }\n'
+           'void main()\n{\n'
+           '    Point p;\n'
+           '    int z = add(p.x, 2);\n}\n')
+duri = open_doctype('defs.d', deftext)
+check('def-fn',
+      def_at(duri, 6, 13)[0]['range']['start'] == {'line': 2, 'character': 4},
+      str(def_at(duri, 6, 13)))
+check('def-field',
+      def_at(duri, 6, 18)[0]['range']['start'] == {'line': 1, 'character': 19},
+      '')
+check('def-local',
+      def_at(duri, 6, 8)[0]['range']['start'] == {'line': 6, 'character': 8},
+      '')
+
+xuri = open_doctype('usedef.d',
+    'module usedef;\nimport autolib;\nvoid f() { auto c = globalCfg; }\n')
+xdef = def_at(xuri, 2, 25)
+check('def-import', bool(xdef) and xdef[0]['uri'].endswith('/tests/autolib.d'),
+      str(xdef))
+
+# goto through a `public import` chain (pkg1 publicly imports pkg2).
+puri = open_doctype('usedef2.d',
+    'module usedef2;\nimport pkg1;\nvoid f() { pkg_exported_symbol; }\n')
+pdef = def_at(puri, 2, 11)
+check('def-public-import',
+      bool(pdef) and pdef[0]['uri'].endswith('/tests/pkg2.d'), str(pdef))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})

@@ -928,6 +928,7 @@ struct NameType
     const(char)[] name;
     Type type; // null when unknown (e.g. body rewritten by errors)
     const(char)[] typeName; // unresolved (pre-semantic) type ident
+    Dsymbol sym; // declaring symbol when semantic (goto-definition)
 }
 
 // Resolve the scope denoted by `lhs` chain segments.
@@ -1024,31 +1025,42 @@ private Dsymbol[] stepInto(Dsymbol s, int depth, Module root, Dsymbol[] rootMemb
 // public level, mirroring walkImports).
 private Dsymbol findImportMember(Module root, const(char)[] name)
 {
-    return findImportMemberDepth(root, name, 0);
-}
-
-private Dsymbol findImportMemberDepth(Module root, const(char)[] name, int depth)
-{
-    if (!root || !root.members || depth > 4)
+    if (!root || !root.members)
         return null;
     Dsymbol[] flat;
     flattenMembers(root.members, flat);
     foreach (s; flat)
     {
         auto imp = s.isImport();
-        if (!imp || !imp.mod || !imp.mod.members)
+        if (!imp || !imp.mod || imp.isstatic)
             continue;
-        Dsymbol[] ms;
-        flattenMembers(imp.mod.members, ms);
-        foreach (q; ms)
-        {
-            if (q.ident && q.ident.toString() == name)
-                return q;
-        }
+        // The root can see the imported module's whole public interface
+        // regardless of this import's own visibility.
+        auto r = findInModuleInterface(imp.mod, name, 0);
+        if (r)
+            return r;
+    }
+    return null;
+}
+
+// Search `m`'s own members, then (recursively) what it `public import`s.
+private Dsymbol findInModuleInterface(Module m, const(char)[] name, int depth)
+{
+    if (!m || !m.members || depth > 4)
+        return null;
+    Dsymbol[] flat;
+    flattenMembers(m.members, flat);
+    foreach (s; flat)
+    {
+        if (s.ident && s.ident.toString() == name)
+            return s;
+        auto imp = s.isImport();
+        if (!imp || !imp.mod || !imp.mod.members || imp.isstatic)
+            continue;
         auto vk = imp.visibility.kind;
         if (vk == Visibility.Kind.public_ || vk == Visibility.Kind.export_)
         {
-            auto r = findImportMemberDepth(imp.mod, name, depth + 1);
+            auto r = findInModuleInterface(imp.mod, name, depth + 1);
             if (r)
                 return r;
         }
@@ -1097,7 +1109,7 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
                 if (auto vd = de.declaration.isVarDeclaration())
                 {
                     if (vd.ident && vd.loc.linnum() <= cursorLine)
-                        r ~= NameType(vd.ident.toString(), vd.type, null);
+                        r ~= NameType(vd.ident.toString(), vd.type, null, vd);
                 }
             }
         }
@@ -1117,7 +1129,7 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     if (auto is_ = s.isIfStatement())
     {
         if (is_.param && is_.param.ident)
-            r ~= NameType(is_.param.ident.toString(), is_.param.type, null);
+            r ~= NameType(is_.param.ident.toString(), is_.param.type, null, null);
         collectSemSlots(is_.ifbody, cursorLine, r);
         collectSemSlots(is_.elsebody, cursorLine, r);
         return;
@@ -1125,7 +1137,7 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     if (auto ws = s.isWhileStatement())
     {
         if (ws.param && ws.param.ident)
-            r ~= NameType(ws.param.ident.toString(), ws.param.type, null);
+            r ~= NameType(ws.param.ident.toString(), ws.param.type, null, null);
         collectSemSlots(ws._body, cursorLine, r);
         return;
     }
@@ -1147,19 +1159,19 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
             {
                 auto fp = (*fes.parameters)[i];
                 if (fp && fp.ident)
-                    r ~= NameType(fp.ident.toString(), fp.type, null);
+                    r ~= NameType(fp.ident.toString(), fp.type, null, null);
             }
         if (fes.key && fes.key.ident)
-            r ~= NameType(fes.key.ident.toString(), fes.key.type, null);
+            r ~= NameType(fes.key.ident.toString(), fes.key.type, null, fes.key);
         if (fes.value && fes.value.ident)
-            r ~= NameType(fes.value.ident.toString(), fes.value.type, null);
+            r ~= NameType(fes.value.ident.toString(), fes.value.type, null, fes.value);
         collectSemSlots(fes._body, cursorLine, r);
         return;
     }
     if (auto sw = s.isSwitchStatement())
     {
         if (sw.param && sw.param.ident)
-            r ~= NameType(sw.param.ident.toString(), sw.param.type, null);
+            r ~= NameType(sw.param.ident.toString(), sw.param.type, null, null);
         collectSemSlots(sw._body, cursorLine, r);
         return;
     }
@@ -1177,7 +1189,7 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
             {
                 auto c = (*tc.catches)[i];
                 if (c.var && c.var.ident)
-                    r ~= NameType(c.var.ident.toString(), c.var.type, null);
+                    r ~= NameType(c.var.ident.toString(), c.var.type, null, c.var);
                 collectSemSlots(c.handler, cursorLine, r);
             }
         return;
@@ -1185,7 +1197,7 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     if (auto w = s.isWithStatement())
     {
         if (w.prm && w.prm.ident)
-            r ~= NameType(w.prm.ident.toString(), w.prm.type, null);
+            r ~= NameType(w.prm.ident.toString(), w.prm.type, null, null);
         collectSemSlots(w._body, cursorLine, r);
         return;
     }
@@ -1219,7 +1231,7 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             const(char)[] nm = v.ident.toString();
             if (has(nm))
                 continue;
-            slots ~= NameType(nm, v.type, null);
+            slots ~= NameType(nm, v.type, null, v);
         }
     if (fd && fd.fbody)
     {
@@ -1240,13 +1252,13 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             if (has(pn))
                 continue;
             string tn = pi < sfn.paramTypes.length ? sfn.paramTypes[pi] : null;
-            slots ~= NameType(pn, null, tn);
+            slots ~= NameType(pn, null, tn, null);
         }
         foreach (ref vl; sfn.vars)
         {
             if (vl.line > line || has(vl.name))
                 continue;
-            slots ~= NameType(vl.name, null, vl.typeName);
+            slots ~= NameType(vl.name, null, vl.typeName, null);
         }
     }
 }
@@ -1537,6 +1549,119 @@ void signatureAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     break;
                 }
     }
+}
+
+// ---------- goto definition ----------
+struct DefLoc
+{
+    bool found = false;
+    const(char)[] file; // absolute path (arena)
+    uint line = 0;      // 1-based
+    uint col = 0;       // 1-based
+    size_t len = 0;     // identifier length at the definition (for the range)
+}
+
+// Full identifier/dot chain under the cursor, expanded both directions so a
+// cursor mid-identifier still yields the whole token.
+private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    while (i < text.length && text[i] != '\n')
+        i++;
+    auto lt = text[ls .. i];
+    size_t e = col - 1;
+    if (e > lt.length)
+        e = lt.length;
+    size_t s = e;
+    while (s > 0 && isChainChar(lt[s - 1]))
+        s--;
+    size_t f = e;
+    while (f < lt.length && isChainChar(lt[f]))
+        f++;
+    return lt[s .. f];
+}
+
+// Jump target for the symbol under the cursor: locals/params, module
+// members, imported names, or members of a resolved dotted chain.
+void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+{
+    if (!mod || !mod.members)
+        return;
+    if (!posInCode(text, ctx.line, ctx.character))
+        return;
+    auto chain = chainUnderCursor(text, ctx.line, ctx.character);
+    if (!chain.length)
+        return;
+
+    const(char)[][] segs;
+    size_t s = 0;
+    foreach (k; 0 .. chain.length + 1)
+    {
+        if (k == chain.length || chain[k] == '.')
+        {
+            auto bn = baseName(chain[s .. k]);
+            if (bn.length)
+                segs ~= bn;
+            s = k + 1;
+        }
+    }
+    if (!segs.length)
+        return;
+
+    Dsymbol[] rootMembers;
+    flattenMembers(mod.members, rootMembers);
+    NameType[] locals;
+    auto fd = findEnclosingFunc(mod, ctx.line);
+    collectSlots(mod, syn, ctx.line, fd, locals);
+
+    Dsymbol sym = null;
+    if (segs.length == 1)
+    {
+        foreach (v; locals)
+            if (v.sym && v.name == segs[0])
+            {
+                sym = v.sym;
+                break;
+            }
+        if (!sym && fd && fd.ident && fd.ident.toString() == segs[0])
+            sym = fd; // recursive call
+        if (!sym)
+            sym = findMember(rootMembers, segs[0]);
+        if (!sym)
+            sym = findImportMember(mod, segs[0]);
+    }
+    else
+    {
+        Dsymbol[] scope_ = resolveLhs(mod, segs[0 .. $ - 1], rootMembers, locals);
+        if (scope_.length)
+            sym = findMember(scope_, segs[$ - 1]);
+    }
+    if (!sym)
+        return;
+
+    auto t = sym.toAlias();
+    if (t && t !is sym)
+        sym = t;
+
+    auto loc = sym.loc;
+    const(char)* f = loc.filename();
+    if (!f)
+        return;
+    import core.stdc.string : strlen;
+    out_.found = true;
+    out_.file = arenaDupStr(arena, f[0 .. strlen(f)]);
+    out_.line = loc.linnum();
+    out_.col = loc.charnum();
+    out_.len = segs[$ - 1].length;
 }
 
 // ---------- entry ----------
