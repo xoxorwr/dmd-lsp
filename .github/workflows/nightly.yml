@@ -65,7 +65,7 @@ jobs:
           url="https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-${{ matrix.ldc }}.tar.xz"
           curl -fsSL "$url" -o "$RUNNER_TEMP/ldc.tar.xz"
           mkdir -p "$HOME/ldc"
-          tar -xJf "$RUNNER_TEMP/ldc.tar.xz" -C "$HOME/ldc" --strip-components=1
+          tar -xf "$RUNNER_TEMP/ldc.tar.xz" -C "$HOME/ldc" --strip-components=1
           echo "$HOME/ldc/bin" >> "$GITHUB_PATH"
           "$HOME/ldc/bin/ldmd2" --version
 

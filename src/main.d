@@ -62,11 +62,12 @@ struct FileConfig
 // Monotonic milliseconds (debounce clock; no phobos).
 private ulong nowMs()
 {
-    import core.sys.posix.time : clock_gettime, timespec, CLOCK_MONOTONIC;
+    // core.time.MonoTime is portable (clock_gettime on Linux, which
+    // core.sys.posix.time does not expose on macOS, mach_absolute_time on
+    // Darwin, QPC on Windows). Duration ticks are hectonanoseconds.
+    import core.time : MonoTime;
 
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return cast(ulong)ts.tv_sec * 1000 + cast(ulong)(ts.tv_nsec / 1000000);
+    return cast(ulong)(MonoTime.currTime.ticks / 10_000);
 }
 
 private bool hasPending(App* app, const(char)[] path)
