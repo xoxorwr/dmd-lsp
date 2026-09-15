@@ -42,10 +42,34 @@ struct CompleteOut
 }
 
 // ---------- item sink ----------
+// labelDetails for any symbol: functions split into "(params)" + return
+// type; values/fields describe their type; other declarations their kind.
+private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
+    ref const(char)[] labelDesc)
+{
+    if (auto fd = s.isFuncDeclaration())
+    {
+        funcParts(a, s, labelDetail, labelDesc);
+        return;
+    }
+    if (auto vd = s.isVarDeclaration())
+    {
+        labelDesc = typeDetail(vd.type); // caller arena-dups
+        if (labelDesc.length)
+            return;
+    }
+    const(char)* k = s.kind();
+    if (k)
+    {
+        import core.stdc.string : strlen;
+        labelDesc = k[0 .. strlen(k)];
+    }
+}
+
 private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte kind,
     const(char)[] detail, const(char)[] doc, const(char)[] sortPrefix,
     ref bool[const(char)[]] seen,
-    const(char)[] labelDetail = null, const(char)[] labelDesc = null)
+    Dsymbol sym = null, const(char)[] desc = null)
 {
     if (label.length == 0 || label in seen)
         return;
@@ -58,8 +82,14 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
     const(char)[] ls = lp[0 .. label.length];
     const(char)[] ds = arenaDupStr(a, detail);
     const(char)[] dc = arenaDupStr(a, doc);
-    const(char)[] ld = arenaDupStr(a, labelDetail);
-    const(char)[] lx = arenaDupStr(a, labelDesc);
+    const(char)[] ld = null;
+    const(char)[] lx = null;
+    if (sym)
+        itemParts(a, sym, ld, lx);
+    else if (desc.length)
+        lx = desc;
+    ld = arenaDupStr(a, ld);
+    lx = arenaDupStr(a, lx);
     string sort = (cast(string)sortPrefix ~ label.idup);
     char* sp = cast(char*)a.alloc(sort.length + 1);
     const(char)[] ss = null;
@@ -163,9 +193,7 @@ private void addMembers(Arena* a, Dsymbol[] members, const(char)[] prefix,
         const(char)[] nm = s.ident.toString();
         if (!hasPrefix(nm, prefix))
             continue;
-        const(char)[] ld = null, lx = null;
-        funcParts(a, s, ld, lx);
-        pushItem(a, o, nm, kindOf(s), typeDetail(symType(s)), docOf(s), sortPrefix, seen, ld, lx);
+        pushItem(a, o, nm, kindOf(s), typeDetail(symType(s)), docOf(s), sortPrefix, seen, s);
         if (o.nitems >= 500)
             return;
     }
@@ -635,7 +663,7 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
         return;
     if (nm == "this" || nm == "super" || nm == "_")
         return;
-    pushItem(a, o, nm, 6, typeDetail(vd.type), docOf(vd), "0", seen);
+    pushItem(a, o, nm, 6, typeDetail(vd.type), docOf(vd), "0", seen, vd);
 }
 
 private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(char)[] prefix,
@@ -659,9 +687,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
                         const(char)[] nm = fd.ident.toString();
                         if (hasPrefix(nm, prefix))
                         {
-                            const(char)[] ld = null, lx = null;
-                            funcParts(a, fd, ld, lx);
-                            pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(fd), "0", seen, ld, lx);
+                            pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(fd), "0", seen, fd);
                         }
                         uint el = fd.endloc.linnum();
                         if (fd.loc.linnum() <= cursorLine && (el == 0 || cursorLine <= el))
@@ -689,7 +715,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         {
             const(char)[] inm = is_.param.ident.toString();
             if (hasPrefix(inm, prefix))
-                pushItem(a, o, inm, 6, typeDetail(is_.param.type), null, "0", seen);
+                pushItem(a, o, inm, 6, typeDetail(is_.param.type), null, "0", seen, null, typeDetail(is_.param.type));
         }
         if (is_.match)
             addLocal(a, o, seen, is_.match, cursorLine, prefix);
@@ -703,7 +729,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         {
             const(char)[] wnm = ws.param.ident.toString();
             if (hasPrefix(wnm, prefix))
-                pushItem(a, o, wnm, 6, typeDetail(ws.param.type), null, "0", seen);
+                pushItem(a, o, wnm, 6, typeDetail(ws.param.type), null, "0", seen, null, typeDetail(ws.param.type));
         }
         walkStmt(ws._body, cur, cursorLine, prefix, a, o, seen);
         return;
@@ -729,7 +755,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
                 {
                     const(char)[] fnm = fp.ident.toString();
                     if (hasPrefix(fnm, prefix))
-                        pushItem(a, o, fnm, 6, typeDetail(fp.type), null, "0", seen);
+                        pushItem(a, o, fnm, 6, typeDetail(fp.type), null, "0", seen, null, typeDetail(fp.type));
                 }
             }
         if (fes.key)
@@ -745,7 +771,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         {
             const(char)[] snm = sw.param.ident.toString();
             if (hasPrefix(snm, prefix))
-                pushItem(a, o, snm, 6, typeDetail(sw.param.type), null, "0", seen);
+                pushItem(a, o, snm, 6, typeDetail(sw.param.type), null, "0", seen, null, typeDetail(sw.param.type));
         }
         walkStmt(sw._body, cur, cursorLine, prefix, a, o, seen);
         return;
@@ -790,7 +816,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         {
             const(char)[] wnm = w.prm.ident.toString();
             if (hasPrefix(wnm, prefix))
-                pushItem(a, o, wnm, 6, typeDetail(w.prm.type), null, "0", seen);
+                pushItem(a, o, wnm, 6, typeDetail(w.prm.type), null, "0", seen, null, typeDetail(w.prm.type));
         }
         walkStmt(w._body, cur, cursorLine, prefix, a, o, seen);
         return;
@@ -1571,8 +1597,10 @@ struct DefLoc
     size_t len = 0;     // identifier length at the definition (for the range)
 }
 
-// Full identifier/dot chain under the cursor, expanded both directions so a
-// cursor mid-identifier still yields the whole token.
+// Full chain ending at the identifier under the cursor. The cursor's own
+// segment is found by expanding over identifier chars only (so hovering
+// `allocator` in `allocator.create` targets `allocator`, not `create`);
+// the left-hand prefix is then extended back over the chain.
 private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
 {
     size_t i = 0;
@@ -1590,13 +1618,18 @@ private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
     size_t e = col - 1;
     if (e > lt.length)
         e = lt.length;
-    size_t s = e;
+    size_t segS = e;
+    while (segS > 0 && isPc(lt[segS - 1]))
+        segS--;
+    size_t segE = e;
+    while (segE < lt.length && isPc(lt[segE]))
+        segE++;
+    if (segE == segS)
+        return null; // cursor is not on an identifier
+    size_t s = segS;
     while (s > 0 && isChainChar(lt[s - 1]))
         s--;
-    size_t f = e;
-    while (f < lt.length && isChainChar(lt[f]))
-        f++;
-    return lt[s .. f];
+    return lt[s .. segE];
 }
 
 // Jump target for the symbol under the cursor: locals/params, module
@@ -1815,13 +1848,14 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             collectInFunc(fd, ctx.line, prefix, arena, out_, seen);
         if (sfn)
         {
-            foreach (pn; sfn.params)
+            foreach (i, pn; sfn.params)
             {
                 if (pn in seen)
                     continue;
                 if (!hasPrefix(pn, prefix))
                     continue;
-                pushItem(arena, out_, pn, 6, "parameter", null, "0", seen);
+                string tn = i < sfn.paramTypes.length ? sfn.paramTypes[i] : null;
+                pushItem(arena, out_, pn, 6, "parameter", null, "0", seen, null, tn);
             }
             foreach (ref vl; sfn.vars)
             {
@@ -1829,7 +1863,7 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     continue;
                 if (!hasPrefix(vl.name, prefix))
                     continue;
-                pushItem(arena, out_, vl.name, 6, "local", null, "0", seen);
+                pushItem(arena, out_, vl.name, 6, "local", null, "0", seen, null, vl.typeName);
             }
         }
     }
@@ -1865,10 +1899,8 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             const(char)[] nm = m.ident.toString();
             if (!hasPrefix(nm, prefix))
                 continue;
-            const(char)[] ld = null, lx = null;
-            funcParts(arena, m, ld, lx);
             pushItem(arena, out_, nm, kindOf(m), typeDetail(symType(m)),
-                docOf(m), "1", seen, ld, lx);
+                docOf(m), "1", seen, m);
             if (out_.nitems >= 500)
                 break;
         }

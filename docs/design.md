@@ -104,7 +104,7 @@ strands messages in the userspace buffer.
 
 ## Status
 
-Verified by `make check` (85 assertions across the LSP, universe-cache,
+Verified by `make check` (90 assertions across the LSP, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd
 sources (378 KB file, full frontend semantic):
 
@@ -115,8 +115,10 @@ sources (378 KB file, full frontend semantic):
   suppression; trailing-dot completion (including inside an unclosed call
   argument list); CTFE string-mixin declarations; symbols re-exported
   through `public import` chains.
-- LSP 3.17 `labelDetails` for functions when the client opts in, rendered
-  as label + `(params)` + return type (`dist(Point, int) int`).
+- LSP 3.17 `labelDetails` when the client opts in: functions render as
+  label + `(params)` + return type (`dist(Point, int) int`); variables and
+  fields show their type (`p Point`, `x int`); other declarations their
+  kind (`Point struct`, `ptrdiff_t alias`).
 - `textDocument/signatureHelp` (trigger `(`, `,`) for calls and struct
   literals (`Entry(target, hate)`), active parameter by comma nesting.
 - `textDocument/definition` for locals/params, module members, imported

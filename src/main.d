@@ -1111,8 +1111,9 @@ private void handleMessage(App* app, ref RawMsg m)
                         auto j = js.create_object();
                         js.add_string_to_object(j, "label", zstr(it.label));
                         js.add_number_to_object(j, "kind", it.kind);
-                        bool isFn = it.labelDetail.length > 0 || it.labelDesc.length > 0;
-                        if (isFn && app.labelDetails)
+                        bool hasLabelDetails =
+                            it.labelDetail.length > 0 || it.labelDesc.length > 0;
+                        if (hasLabelDetails && app.labelDetails)
                         {
                             // LSP 3.17: label + "(params)" + " " + return type.
                             auto ld = js.create_object();

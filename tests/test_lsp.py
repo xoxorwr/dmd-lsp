@@ -197,7 +197,8 @@ send({"jsonrpc": "2.0", "id": 109, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": "file:///tmp/autotype.d"},
                  "position": {"line": 6, "character": 6}}})
 items = read_msg()['result']['items']
-det = [i.get('detail') for i in items if i['label'] == 'state']
+det = [(i.get('labelDetails') or {}).get('description') or i.get('detail')
+       for i in items if i['label'] == 'state']
 check('standalone-prefix-auto-type', det == ['State'], str(det))
 
 # LSP 3.17 labelDetails: functions render as label + "(params)" + return type.
@@ -305,7 +306,8 @@ send({"jsonrpc": "2.0", "id": 301, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": plainuri},
                  "position": {"line": 9, "character": 31}}})
 items = read_msg()['result']['items']
-cdet = [i.get('detail') for i in items if i['label'] == 'c']
+cdet = [(i.get('labelDetails') or {}).get('description') or i.get('detail')
+        for i in items if i['label'] == 'c']
 check('plain-in-call-arg-type', cdet == ['Combatant*'], str(cdet))
 
 # goto definition: local, module member, dotted field, imported symbol.
@@ -346,6 +348,33 @@ pdef = def_at(puri, 2, 11)
 check('def-public-import',
       bool(pdef) and pdef[0]['uri'].endswith('/tests/pkg2.d'), str(pdef))
 
+# labelDetails for non-functions: variables describe their type, types their kind.
+ld2 = ('module ld2;\n'
+       'struct Point { int x; int y; }\n'
+       'void use()\n{\n'
+       '    Point p;\n'
+       '    p.\n'
+       '    \n}\n')
+ld2uri = open_doctype('ld2.d', ld2)
+send({"jsonrpc": "2.0", "id": 112, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": ld2uri},
+                 "position": {"line": 6, "character": 4}}})
+items = read_msg()['result']['items']
+def _ld(label):
+    for i in items:
+        if i['label'] == label:
+            return i.get('labelDetails')
+    return None
+check('labeldetails-type', _ld('Point') == {'description': 'struct'}, str(_ld('Point')))
+check('labeldetails-var', _ld('p') == {'description': 'Point'}, str(_ld('p')))
+send({"jsonrpc": "2.0", "id": 113, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": ld2uri},
+                 "position": {"line": 5, "character": 6}}})
+items = read_msg()['result']['items']
+check('labeldetails-field',
+      any(i['label'] == 'x' and i.get('labelDetails') == {'description': 'int'}
+          for i in items), str(items[:5]))
+
 # hover: declaration line + doc comment.
 hovertext = ('module hovt;\n'
              'struct Point { int x; int y; }\n'
@@ -368,6 +397,23 @@ check('hover-fn',
       str(hv))
 hv = hover_at(7, 18)
 check('hover-field', hv is not None and 'int x' in hv, str(hv))
+
+# The prefix segment of a dotted chain targets that segment, not the tail:
+# hovering `s` in `s.x` must resolve the local, not the field.
+def hover_uri(uri, line, ch):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0], "method": "textDocument/hover",
+          "params": {"textDocument": {"uri": uri},
+                     "position": {"line": line, "character": ch}}})
+    r = read_msg()['result']
+    return r['contents']['value'] if r else None
+cuna = open_doctype('chain.d',
+    'module chain;\nstruct S { int x; }\nvoid f() { S s; int y = s.x; }\n')
+hv = hover_uri(cuna, 2, 24)
+check('hover-chain-prefix', hv is not None and 'S s' in hv, str(hv))
+dv = def_at(cuna, 2, 24)
+check('def-chain-prefix',
+      bool(dv) and dv[0]['range']['start'] == {'line': 2, 'character': 13}, str(dv))
 
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
