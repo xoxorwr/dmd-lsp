@@ -5,10 +5,23 @@ import {
   ServerOptions,
 } from 'vscode-languageclient/node';
 import { ensureServer } from './server';
+import { createDlsJson } from './config';
 
 let client: LanguageClient | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  context.subscriptions.push(
+    vscode.commands.registerCommand('dmdLsp.createConfig', async () => {
+      const created = await createDlsJson();
+      // The server reads dls.json at initialize (and on its save); restart
+      // so a freshly created file takes effect immediately.
+      if (created && client) {
+        await client.stop();
+        await client.start();
+      }
+    }),
+  );
+
   const config = vscode.workspace.getConfiguration('dmdLsp');
 
   let serverPath: string;

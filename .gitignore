@@ -11,6 +11,7 @@
 # VS Code extension (editor/vscode)
 editor/vscode/node_modules/
 editor/vscode/out/
+editor/vscode/dist/
 *.vsix
 
 # Python test cache

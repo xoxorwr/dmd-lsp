@@ -30,6 +30,13 @@ Set `dmdLsp.serverPath` to use a local build instead.
 Project defaults belong in `dls.json` at the workspace root; it is read by
 the server and overrides these per-run.
 
+## Commands
+
+- **dmd-lsp: Create dls.json** — writes a starter `dls.json` at the
+  workspace root (seeding `importPaths` from `src/`, `source/`, `sandbox/`
+  when they exist, plus any `dmdLsp.*` settings) and restarts the server so
+  it takes effect. If the file already exists it is just opened.
+
 ## Build
 
 ```sh

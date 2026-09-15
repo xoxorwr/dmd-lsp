@@ -109,7 +109,7 @@ jobs:
         run: |
           npm ci
           npm run compile
-          npx vsce package --pre-release -o dmd-lsp.vsix
+          npm run package
 
       - uses: actions/upload-artifact@v7
         with:
