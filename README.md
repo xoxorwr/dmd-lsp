@@ -6,7 +6,10 @@ used read-only as a library.
 
 Rules this repo lives by:
 
-- Never copy `../dmd` files; reference via `-I` only.
+- The dmd frontend is **vendored** under `src/dmd/` so the build is
+  self-contained (see "Vendored dmd"). `../dmd` stays a read-only
+  reference/dev tree — refresh the snapshot with `make vendor`, never edit
+  `src/dmd/` by hand.
 - Never edit `../dmd` without explicit permission.
 - Our code is `struct`-only (no `class`/`interface`/inheritance).
 - Our code uses no phobos (`std.*`): JSON comes from vendored
@@ -25,15 +28,41 @@ Rules this repo lives by:
 ## Build
 
 ```sh
-make            # builds ./dmd-lsp
+make            # builds ./dmd-lsp (from the vendored src/dmd/)
 make check      # struct-only guard + batch fixtures + LSP regression suite
 make check-no-oop
 make deps       # audit exactly which dmd modules got pulled in
+make vendor     # re-copy the frontend closure from ../dmd
 ```
 
 `make` uses `dmd -i`, so only transitively-imported frontend modules
 compile — no backend/glue. Needs `stringimp/SYSCONFDIR.imp` (present) and
 `-J` paths from the Makefile.
+
+## Vendored dmd
+
+`src/dmd/` is a snapshot of `../dmd/compiler/src/dmd` containing the exact
+`-i` closure plus the two string imports it needs (`VERSION`,
+`res/default_ddoc_theme.ddoc`): 145 files, ~6.9 MB. It includes the fixes
+below, so `make` needs no `../dmd` at all — only the D compiler's
+druntime/phobos are external. This is packaging, **not a fork**: do not
+edit files under `src/dmd/`.
+
+The set is exactly what the frontend imports (nothing extra to strip).
+Cross-platform notes:
+
+- **Windows**: one extra module, `root/strtold.d` (the MSVC `strtold`
+  used by `root/ctfloat.d` under `version(CRuntime_Microsoft)`), copied
+  from `PLATFORM_EXTRA` in the Makefile.
+- **macOS/BSD**: no extra dmd modules; their code uses `core.sys.*` from
+  druntime.
+- `dmd/iasm.d` and `dmd/backend/symbol.d` are intentionally absent — the
+  build sets `-version=NoBackend`, so those imports are compiled out.
+
+- Refresh: `make vendor` re-derives the closure from `../dmd` and
+  re-copies it (plus `PLATFORM_EXTRA`). Run it after pulling the dev tree,
+  or once the patches land upstream, delete `src/dmd/` and restore
+  `-I../dmd/compiler/src`.
 
 ## Usage
 

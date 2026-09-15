@@ -190,6 +190,11 @@ OS reclaims everything. Results crossing the boundary are plain data.
 3. `identifier.d` + `tokens.d` + `frontend.d`: reset the identifier pool in
    `deinitializeDMD` (§3).
 
+Until these land, `dmd-lsp` vendors the exact frontend closure under
+`src/dmd/` (refresh with `make vendor`), so the shipped build is
+self-contained and carries the patches. It is a snapshot, not a fork —
+delete it and restore `-I../dmd/compiler/src` once upstream merges.
+
 ## 8. Recommendations
 
 - **Keep dmd's semantic** (it is the product's value); treat the process /

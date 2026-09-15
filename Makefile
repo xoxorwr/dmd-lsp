@@ -1,12 +1,22 @@
-# dmd-lsp Makefile — minimal, exact, no copies.
-# RULE: never copy ../dmd files; reference via -I only.
-# RULE: never edit ../dmd without explicit permission.
+# dmd-lsp Makefile — minimal, exact.
+# The dmd frontend is VENDORED under src/dmd/ (a snapshot of the exact
+# transitive closure, plus the two string imports VERSION and
+# res/default_ddoc_theme.ddoc), so the build is self-contained and carries
+# our fixes until they land upstream. See "Vendored dmd" in README.md.
+# RULE: never edit ../dmd without explicit permission; refresh the snapshot
+# with `make vendor` instead.
 # Build uses `dmd -i` so the compiler pulls *exactly* the transitively
 # imported dmd modules — nothing else. `make deps` audits the list.
 
 # Toolchain: pinned to 2.113.0 (never system dmd).
 DC ?= dmd
-DMD_SRC = ../dmd/compiler/src
+# Vendored dmd frontend root: `import dmd.x` resolves under src/dmd/.
+DMD_SRC = src
+# Modules imported only under non-Linux version blocks, so `dmd -i` on this
+# host never pulls them: `root/strtold.d` is the MSVC (CRuntime_Microsoft)
+# strtold used by root/ctfloat.d. (`dmd/iasm.d` and `dmd/backend/symbol.d`
+# stay out because we build with -version=NoBackend.)
+PLATFORM_EXTRA = root/strtold.d
 
 SRC = src/main.d src/arena.d src/lsp.d src/session.d \
       src/dmdwrap.d src/lexutil.d src/lint.d src/complete.d src/server.d \
@@ -18,7 +28,7 @@ DFLAGS = -I$(DMD_SRC) -i \
   -version=MARS -version=NoMain -version=GC -version=NoBackend \
   -version=CallbackAPI -version=DMDLIB \
   -preview=dip1000 -O \
-  -J$(DMD_SRC)/dmd/res -J../dmd -Jstringimp
+  -Jsrc/dmd/res -Jsrc/dmd -Jstringimp
 
 BIN = dmd-lsp
 
@@ -27,10 +37,29 @@ all: $(BIN)
 $(BIN): $(SRC) Makefile stringimp/SYSCONFDIR.imp
 	$(DC) $(DFLAGS) $(SRC) -of$(BIN)
 
-# Guard: our sources must stay struct-only (no class/interface inheritance).
+# Guard: our sources must stay struct-only (vendored dmd is excluded).
 check-no-oop:
-	@if grep -rnE '^\s*(class|interface) ' src/ ; then echo "OOP forbidden in src/"; exit 1; fi
+	@if grep -rnE '^\s*(class|interface) ' src/ | grep -v '^src/dmd/' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
 	@echo "struct-only check ok"
+
+# Refresh the vendored snapshot from the ../dmd dev tree.
+vendor:
+	@$(DC) -I../dmd/compiler/src -i \
+	  -version=MARS -version=NoMain -version=GC -version=NoBackend \
+	  -version=CallbackAPI -version=DMDLIB -preview=dip1000 \
+	  -J../dmd/compiler/src/dmd/res -J../dmd -Jstringimp \
+	  $(SRC) -of/dev/null -deps 2>/dev/null \
+	  | grep -oE '\.\./dmd/[^ )]+' | sort -u \
+	  | while read -r p; do \
+	      if [ "$$p" = "../dmd/VERSION" ]; then d="src/dmd/VERSION"; \
+	      else d="src/dmd/$${p#../dmd/compiler/src/dmd/}"; fi; \
+	      mkdir -p "$$(dirname "$$d")"; cp "$$p" "$$d"; \
+	    done
+	@for f in $(PLATFORM_EXTRA); do \
+	  mkdir -p "src/dmd/$$(dirname $$f)"; \
+	  cp "../dmd/compiler/src/dmd/$$f" "src/dmd/$$f"; \
+	done
+	@echo "vendored $$(find src/dmd -type f | wc -l) files from ../dmd"
 
 # Audit exactly which dmd modules got pulled in.
 deps:
@@ -52,4 +81,4 @@ check: $(BIN) check-no-oop
 clean:
 	rm -f $(BIN) *.o
 
-.PHONY: all clean check-no-oop deps
+.PHONY: all clean check-no-oop deps vendor
