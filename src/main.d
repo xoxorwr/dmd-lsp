@@ -5,7 +5,8 @@ module main;
 
 import core.stdc.stdio : printf, fprintf, stderr;
 import core.stdc.signal : signal, SIG_IGN;
-import core.sys.posix.signal : SIGPIPE;
+version (Posix)
+    import core.sys.posix.signal : SIGPIPE;
 import core.memory : GC;
 import json;
 
@@ -173,9 +174,7 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
         auto r = workerAnalyze(app.wk, path, text, out_);
         if (r == worker.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.failed && !app.wk.alive)
-            continue;
-        if (r == worker.ExchangeResult.respawn)
+        if (r == worker.ExchangeResult.failed || r == worker.ExchangeResult.respawn)
         {
             workerKill(app.wk);
             continue;
@@ -200,8 +199,9 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
         auto r = workerComplete(app.wk, path, atext, origText, line, col, prefix, items);
         if (r == worker.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn)
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
+            // Respawn, or recover from a worker that died mid-request.
             workerKill(app.wk);
             continue;
         }
@@ -226,8 +226,9 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
         auto r = workerSignature(app.wk, path, atext, origText, line, col, sig);
         if (r == worker.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn)
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
+            // Respawn, or recover from a worker that died mid-request.
             workerKill(app.wk);
             continue;
         }
@@ -252,8 +253,9 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
         auto r = workerDefinition(app.wk, path, atext, origText, line, col, def);
         if (r == worker.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn)
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
+            // Respawn, or recover from a worker that died mid-request.
             workerKill(app.wk);
             continue;
         }
@@ -278,8 +280,9 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
         auto r = workerHover(app.wk, path, atext, origText, line, col, hov);
         if (r == worker.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn)
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
+            // Respawn, or recover from a worker that died mid-request.
             workerKill(app.wk);
             continue;
         }
@@ -837,18 +840,29 @@ private string tokenPlaceholder(const(char)[] text, uint line, uint col)
 }
 
 // Absolute path for a possibly-relative dmd filename (imports found via a
-// relative -I are reported relative to the daemon's cwd).
+// relative -I are reported relative to the daemon's cwd). Cross-platform.
 private string absolutePath(const(char)[] p)
 {
     if (p.length && p[0] == '/')
+        return p.idup; // POSIX absolute
+    if (p.length >= 3 && p[1] == ':' && (p[2] == '/' || p[2] == '\\') &&
+        ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')))
+        return p.idup; // Windows drive-absolute
+    version (Posix)
+    {
+        import core.sys.posix.unistd : getcwd;
+        import core.stdc.string : strlen;
+        char[4096] buf;
+        if (getcwd(buf.ptr, buf.length) is null)
+            return p.idup;
+        auto cwd = buf[0 .. strlen(buf.ptr)];
+        return cast(string)((cwd ~ "/" ~ p).idup);
+    }
+    else
+    {
+        // No portable cwd without an OS call; dmd usually reports absolute.
         return p.idup;
-    import core.sys.posix.unistd : getcwd;
-    import core.stdc.string : strlen;
-    char[4096] buf;
-    if (getcwd(buf.ptr, buf.length) is null)
-        return p.idup;
-    auto cwd = buf[0 .. strlen(buf.ptr)];
-    return cast(string)((cwd ~ "/" ~ p).idup);
+    }
 }
 
 // file:// URI with minimal percent-encoding (round-trips with uriToPath).
@@ -856,13 +870,21 @@ private string pathToUri(const(char)[] path)
 {
     static immutable char[] hex = "0123456789ABCDEF";
     auto abs = absolutePath(path);
+    // Normalise Windows separators.
+    char[] norm;
+    norm.reserve(abs.length);
+    foreach (c; abs)
+        norm ~= (c == '\\' ? '/' : c);
+    auto p = norm;
     char[] out_;
     out_ ~= "file://";
-    foreach (c; abs)
+    if (p.length >= 2 && p[1] == ':')
+        out_ ~= "/"; // file:///C:/...
+    foreach (c; p)
     {
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '/' || c == '-' || c == '_' ||
-            c == '.' || c == '~')
+            c == '.' || c == '~' || c == ':')
             out_ ~= c;
         else
         {
@@ -1578,7 +1600,8 @@ int main(string[] args)
     app.baseStringImports = stringImports;
     app.baseFlags = flags;
     refreshImports(&app);
-    signal(SIGPIPE, SIG_IGN); // worker pipe may close on respawn
+    version (Posix)
+        signal(SIGPIPE, SIG_IGN); // worker pipe may close on respawn
     scope (exit)
         workerKill(app.wk);
     app.lastMsgMs = nowMs();

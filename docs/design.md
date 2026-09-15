@@ -104,7 +104,7 @@ strands messages in the userspace buffer.
 
 ## Status
 
-Verified by `make check` (90 assertions across the LSP, universe-cache,
+Verified by `make check` (91 assertions across the LSP, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd
 sources (378 KB file, full frontend semantic):
 
@@ -122,9 +122,16 @@ sources (378 KB file, full frontend semantic):
 - `textDocument/signatureHelp` (trigger `(`, `,`) for calls and struct
   literals (`Entry(target, hate)`), active parameter by comma nesting.
 - `textDocument/definition` for locals/params, module members, imported
-  symbols and members of dotted chains (cross-file, absolute URI).
-- `textDocument/hover`: declaration (`int add(int a, int b)`) plus doc
-  comment as Markdown, for the same symbol set as goto-definition.
+  symbols and members of dotted chains. Cross-file locations are turned into
+  absolute `file://` URIs (`absolutePath`/`pathToUri`), Windows-aware (drive
+  letters, backslash normalisation).
+- `textDocument/hover`: functions/types/templates/aliases are rendered by
+  dmd's own `hdrgen` (`toCBuffer` with `hdrgen=true, doFuncBodies=false`,
+  indented), so no source reading or brace-matching is needed. Variables/
+  fields/locals use a synthesized `type name` instead, because hdrgen's
+  header form marks declarations `extern` (locals become `extern S s;`).
+  Modules are excluded (a Module would dump the whole file). Doc comment
+  appended as Markdown.
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
 - Universe cache: repeated requests ~free (13× on the stress file); edits

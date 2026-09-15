@@ -1794,13 +1794,39 @@ private const(char)[] declLine(Arena* a, Dsymbol sym)
     return arenaDupStr(a, buf);
 }
 
+// Full declaration rendered by dmd itself (hdrgen) — no source reading or
+// brace-matching needed; works for any symbol.
+private const(char)[] hdrgenDecl(Arena* a, Dsymbol sym)
+{
+    import dmd.hdrgen : toCBuffer, HdrGenState;
+    import dmd.common.outbuffer : OutBuffer;
+
+    HdrGenState hgs;
+    hgs.hdrgen = true;
+    hgs.doFuncBodies = false;
+    OutBuffer buf;
+    buf.doindent = 1;
+    buf.spaces = true;
+    toCBuffer(sym, buf, hgs);
+    return arenaDupStr(a, buf.opSlice());
+}
+
 void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref HoverInfo out_)
 {
     auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
     if (!sym)
         return;
+    // Prefer dmd's own declaration renderer for functions/types/templates/
+    // aliases. Not for variables (hdrgen is header form: `extern int gval;`,
+    // and locals become `extern S s;`) nor Module (it would dump the file).
     out_.detail = declLine(arena, sym);
+    if (!sym.isVarDeclaration() && !sym.isModule())
+    {
+        if (auto hd = hdrgenDecl(arena, sym))
+            if (hd.length)
+                out_.detail = hd;
+    }
     out_.doc = arenaDupStr(arena, docOf(sym));
     out_.found = out_.detail.length > 0 || out_.doc.length > 0;
 }

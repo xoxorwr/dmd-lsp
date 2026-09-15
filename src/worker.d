@@ -22,7 +22,7 @@ version (Posix):
 import core.stdc.stdio : fprintf, stderr;
 import core.sys.posix.unistd : read, write, close, fork, dup2, pid_t;
 import core.sys.posix.sys.socket : socketpair, AF_UNIX, SOCK_STREAM;
-import core.sys.posix.sys.wait : waitpid;
+import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG;
 import core.sys.posix.unistd : _exit;
 
 // ---------- framing (length-prefixed, like LSP) ----------
@@ -417,7 +417,11 @@ private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
 {
     if (!w.alive)
         return false;
-    return writeFrame(w.fd, req) && readFrame(w.fd, resp);
+    if (writeFrame(w.fd, req) && readFrame(w.fd, resp))
+        return true;
+    import core.stdc.stdio : fprintf, stderr;
+    fprintf(stderr, "dmd-lsp: worker exchange failed; respawning\n");
+    return false;
 }
 
 void workerKill(ref Worker w)
@@ -431,7 +435,14 @@ void workerKill(ref Worker w)
         }
         if (w.pid > 0)
         {
-            waitpid(w.pid, null, 0);
+            int status = 0;
+            waitpid(w.pid, &status, 0);
+            if (WIFSIGNALED(status))
+            {
+                import core.stdc.stdio : fprintf, stderr;
+                fprintf(stderr, "dmd-lsp: worker killed by signal %d\n",
+                    WTERMSIG(status));
+            }
             w.pid = -1;
         }
     }

@@ -415,6 +415,11 @@ dv = def_at(cuna, 2, 24)
 check('def-chain-prefix',
       bool(dv) and dv[0]['range']['start'] == {'line': 2, 'character': 13}, str(dv))
 
+# hover on a type shows the declaration source, not just "struct S".
+hv = hover_uri(cuna, 1, 7)
+check('hover-type-def', hv is not None and 'struct S' in hv and 'int x' in hv,
+      str(hv))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
