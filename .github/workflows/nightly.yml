@@ -37,26 +37,24 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    # macos-13 (Intel) is being retired; keep it optional so the nightly
-    # still succeeds with whatever runner is available.
-    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
+        # macOS arm64 = macos-15; Intel x64 = macos-15-intel (macos-13 was
+        # retired, and macos-14 is deprecated).
         include:
           - os: ubuntu-latest
             target: linux-x64
             asset: dmd-lsp-linux-x64.tar.gz
             ldc: linux-x86_64
-          - os: macos-14
+          - os: macos-15
             target: darwin-arm64
             asset: dmd-lsp-darwin-arm64.tar.gz
             ldc: osx-universal
-          - os: macos-13
+          - os: macos-15-intel
             target: darwin-x64
             asset: dmd-lsp-darwin-x64.tar.gz
             ldc: osx-universal
-            optional: true
     steps:
       - uses: actions/checkout@v7
 
