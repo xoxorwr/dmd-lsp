@@ -1,0 +1,97 @@
+{
+  "name": "dmd-lsp",
+  "displayName": "dmd-lsp",
+  "description": "D language support from the real dmd frontend: diagnostics, completion, signature help.",
+  "version": "0.0.0",
+  "publisher": "xoxorwr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xoxorwr/dmd-lsp.git"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:d"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "d",
+        "aliases": [
+          "D"
+        ],
+        "extensions": [
+          ".d",
+          ".di"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "d",
+        "scopeName": "source.d",
+        "path": "./syntaxes/d.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "dmd-lsp",
+      "properties": {
+        "dmdLsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the dmd-lsp binary. Empty = download the nightly build for this platform into the extension's storage."
+        },
+        "dmdLsp.importPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Module import paths (-I). Per-editor defaults; prefer dls.json in the workspace for project truth."
+        },
+        "dmdLsp.stringImportPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "String import paths (-J) for import(\"...\") files."
+        },
+        "dmdLsp.flags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra dmd flags to mirror the project build, e.g. -preview=rvaluerefparam."
+        },
+        "dmdLsp.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "Diagnostics idle delay in milliseconds."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "package": "vsce package --pre-release -o dmd-lsp.vsix"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.91.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}

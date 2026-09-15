@@ -51,10 +51,16 @@ stable so a VS Code client can fetch and verify:
 - `dmd-lsp-linux-x64.tar.gz`
 - `dmd-lsp-darwin-arm64.tar.gz`
 - `dmd-lsp-darwin-x64.tar.gz`
+- `dmd-lsp.vsix` (VS Code extension; downloads the right binary on first run)
 - `SHA256SUMS`
 
 Each archive contains the `dmd-lsp` binary at its root. Download base:
 `https://github.com/<owner>/<repo>/releases/download/nightly/`.
+
+The VS Code client lives in [`editor/vscode/`](editor/vscode/) and is
+published as `dmd-lsp.vsix`; on first activation it downloads the binary
+for the host platform into the extension's global storage (set
+`dmdLsp.serverPath` to use a local build).
 
 Windows is not built: the worker (`fork`/`socketpair`) and the poll-gated
 stdio loop are POSIX-only, so a Windows binary would not run. Porting the

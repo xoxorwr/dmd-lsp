@@ -8,6 +8,11 @@
 *.dylib
 *.exe
 
+# VS Code extension (editor/vscode)
+editor/vscode/node_modules/
+editor/vscode/out/
+*.vsix
+
 # Python test cache
 __pycache__/
 *.pyc

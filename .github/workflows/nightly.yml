@@ -8,6 +8,7 @@ name: nightly
 #   dmd-lsp-linux-x64.tar.gz
 #   dmd-lsp-darwin-arm64.tar.gz
 #   dmd-lsp-darwin-x64.tar.gz
+#   dmd-lsp.vsix
 #   SHA256SUMS
 #
 # Windows is intentionally absent: the worker (fork/socketpair) and the
@@ -91,9 +92,34 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: error
 
+  vsix:
+    name: build (vsix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: editor/vscode/package-lock.json
+
+      - name: Package extension
+        working-directory: editor/vscode
+        run: |
+          npm ci
+          npm run compile
+          npx vsce package --pre-release -o dmd-lsp.vsix
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix
+          path: editor/vscode/dmd-lsp.vsix
+          if-no-files-found: error
+
   release:
     name: publish nightly
-    needs: build
+    needs: [build, vsix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -104,7 +130,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum dmd-lsp-* > SHA256SUMS
+          sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v3
@@ -120,5 +146,5 @@ jobs:
 
             Assets: `dmd-lsp-linux-x64.tar.gz`,
             `dmd-lsp-darwin-arm64.tar.gz`, `dmd-lsp-darwin-x64.tar.gz`,
-            plus `SHA256SUMS`.
+            `dmd-lsp.vsix` (VS Code extension), plus `SHA256SUMS`.
           files: dist/*
