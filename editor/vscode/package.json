@@ -55,6 +55,11 @@
           "default": "",
           "description": "Path to the dmd-lsp binary. Empty = download the nightly build for this platform into the extension's storage."
         },
+        "dmdLsp.autoUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "On activation, compare the nightly release's SHA256SUMS with the cached binary and re-download when it changed."
+        },
         "dmdLsp.importPaths": {
           "type": "array",
           "items": {

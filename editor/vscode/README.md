@@ -14,6 +14,12 @@ On first activation the extension downloads the `dmd-lsp` binary for your
 platform (Linux x64, macOS arm64/x64) into the extension's global storage.
 Set `dmdLsp.serverPath` to use a local build instead.
 
+The binary is refreshed automatically: on each activation the extension
+fetches the nightly release's `SHA256SUMS` (a few hundred bytes) and
+re-downloads only when the hash changed. If the release can't be reached
+it falls back to the cached binary. Disable with `dmdLsp.autoUpdate`
+= `false`.
+
 > Windows is not supported yet: the server's worker and stdio loop are
 > POSIX-only.
 
@@ -22,6 +28,7 @@ Set `dmdLsp.serverPath` to use a local build instead.
 | Setting | Meaning |
 |---|---|
 | `dmdLsp.serverPath` | Path to the `dmd-lsp` binary; empty = download nightly |
+| `dmdLsp.autoUpdate` | Re-download the binary when the nightly changed (default true) |
 | `dmdLsp.importPaths` | Module import paths (`-I`) |
 | `dmdLsp.stringImportPaths` | String import paths (`-J`) |
 | `dmdLsp.flags` | Extra dmd flags, e.g. `-preview=rvaluerefparam` |

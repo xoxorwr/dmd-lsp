@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
 import * as https from 'https';
 import { execFile } from 'child_process';
 
@@ -41,27 +42,64 @@ export async function ensureServer(
 
   const dir = context.globalStorageUri.fsPath;
   const bin = path.join(dir, 'dmd-lsp');
-  if (fs.existsSync(bin)) {
+  const stamp = path.join(dir, 'dmd-lsp.sha256');
+  fs.mkdirSync(dir, { recursive: true });
+  const have = fs.existsSync(bin);
+
+  // `SHA256SUMS` is a few hundred bytes; a cheap freshness check per
+  // activation. Offline or rate-limited? fall back to the cached binary.
+  let expected: string | undefined;
+  if (config.get<boolean>('autoUpdate', true)) {
+    expected = await fetchExpectedSha(asset).catch(() => undefined);
+    if (have) {
+      if (!expected) {
+        return bin;
+      }
+      const current = fs.existsSync(stamp) ? fs.readFileSync(stamp, 'utf8').trim() : '';
+      if (current === expected) {
+        return bin;
+      }
+    }
+  } else if (have) {
     return bin;
   }
 
-  fs.mkdirSync(dir, { recursive: true });
   const url = `https://github.com/${REPO}/releases/download/${TAG}/${asset}`;
   const tarball = path.join(dir, asset);
-
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Downloading dmd-lsp (${asset})` },
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Downloading dmd-lsp (${asset})`,
+    },
     async () => {
       await download(url, tarball);
       await extract(tarball, dir);
       fs.chmodSync(bin, 0o755);
       fs.rmSync(tarball, { force: true });
+      if (expected) {
+        fs.writeFileSync(stamp, expected + '\n', 'utf8');
+      } else {
+        fs.rmSync(stamp, { force: true });
+      }
     },
   );
   return bin;
 }
 
-function download(url: string, dest: string): Promise<void> {
+// Hash of our nightly archive from the release's SHA256SUMS, if present.
+async function fetchExpectedSha(asset: string): Promise<string | undefined> {
+  const url = `https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS`;
+  const body = await fetchText(url);
+  for (const line of body.split('\n')) {
+    const m = line.trim().split(/\s+/);
+    if (m.length >= 2 && m[1] === asset) {
+      return m[0].toLowerCase();
+    }
+  }
+  return undefined;
+}
+
+function httpGet(url: string): Promise<http.IncomingMessage> {
   return new Promise((resolve, reject) => {
     const follow = (target: string, redirects: number): void => {
       if (redirects > 5) {
@@ -78,18 +116,39 @@ function download(url: string, dest: string): Promise<void> {
           }
           if (status !== 200) {
             res.resume();
-            reject(new Error(`download failed: HTTP ${status} for ${target}`));
+            reject(new Error(`HTTP ${status} for ${target}`));
             return;
           }
-          const out = fs.createWriteStream(dest);
-          res.pipe(out);
-          out.on('finish', () => out.close(() => resolve()));
-          out.on('error', reject);
+          resolve(res);
         })
         .on('error', reject);
     };
     follow(url, 0);
   });
+}
+
+function download(url: string, dest: string): Promise<void> {
+  return httpGet(url).then(
+    (res) =>
+      new Promise<void>((resolve, reject) => {
+        const out = fs.createWriteStream(dest);
+        res.pipe(out);
+        out.on('finish', () => out.close(() => resolve()));
+        out.on('error', reject);
+      }),
+  );
+}
+
+function fetchText(url: string): Promise<string> {
+  return httpGet(url).then(
+    (res) =>
+      new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', reject);
+      }),
+  );
 }
 
 function extract(tarball: string, dest: string): Promise<void> {
