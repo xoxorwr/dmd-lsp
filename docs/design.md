@@ -104,14 +104,15 @@ strands messages in the userspace buffer.
 
 ## Status
 
-Verified by `make check` (91 assertions across the LSP, universe-cache,
+Verified by `make check` (94 assertions across the LSP, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd
 sources (378 KB file, full frontend semantic):
 
 - Diagnostics (compiler errors as you type, incl. broken code), unused
   import/parameter hints, remove-import quickfixes.
 - Scope-aware completion with types, docs and sorting; dot-chains incl.
-  pointer deref and array element access (`xs[0].`); comment/string
+  pointer deref and array element access (`xs[0].`); selective-import
+  symbol lists (`import mod : a, b|` completes `mod`'s members); comment/string
   suppression; trailing-dot completion (including inside an unclosed call
   argument list); CTFE string-mixin declarations; symbols re-exported
   through `public import` chains.

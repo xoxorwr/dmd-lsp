@@ -1832,6 +1832,158 @@ void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
 }
 
 // ---------- entry ----------
+// If the cursor sits in the symbol list of a selective import
+// (`import mod : a, b|`), return that Import (with a loaded module).
+private Import selectiveImportAt(Module mod, const(char)[] text, const CompleteCtx* ctx)
+{
+    if (!mod || !mod.members)
+        return null;
+    // Current line up to the cursor.
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < ctx.line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    size_t e = ls;
+    for (uint c = 1; c < ctx.character && e < text.length && text[e] != '\n'; c++)
+        e++;
+    auto line = text[ls .. e];
+    // Last ':' on the line, with an `import` keyword before it and no `;`
+    // in between.
+    size_t colon = size_t.max;
+    for (size_t k = line.length; k > 0; k--)
+        if (line[k - 1] == ':')
+        {
+            colon = k - 1;
+            break;
+        }
+    if (colon == size_t.max)
+        return null;
+    auto head = line[0 .. colon];
+    size_t imp = size_t.max;
+    foreach (k; 0 .. head.length)
+        if (k + 6 <= head.length && head[k .. k + 6] == "import" &&
+            (k == 0 || !isPc(head[k - 1])) &&
+            (k + 6 == head.length || !isPc(head[k + 6])))
+        {
+            imp = k;
+            break;
+        }
+    if (imp == size_t.max)
+        return null;
+    foreach (k; imp .. colon)
+        if (head[k] == ';')
+            return null;
+    // The Import declared on this line.
+    Dsymbol[] flat;
+    flattenMembers(mod.members, flat);
+    foreach (s; flat)
+        if (auto imp2 = s.isImport())
+            if (imp2.loc.linnum() == ctx.line && imp2.mod)
+                return imp2;
+    return null;
+}
+
+// True when the cursor is in the module list of an import statement
+// (`import mo|` / `import std.st|`), i.e. an `import` keyword precedes it
+// and the statement hasn't reached a `;` or a selective `:` yet.
+private bool inImportModuleList(const(char)[] text, const CompleteCtx* ctx)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < ctx.line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    size_t e = ls;
+    for (uint c = 1; c < ctx.character && e < text.length && text[e] != '\n'; c++)
+        e++;
+    auto line = text[ls .. e];
+    size_t imp = size_t.max;
+    foreach (k; 0 .. line.length)
+        if (k + 6 <= line.length && line[k .. k + 6] == "import" &&
+            (k == 0 || !isPc(line[k - 1])) &&
+            (k + 6 == line.length || !isPc(line[k + 6])))
+            imp = k;
+    if (imp == size_t.max)
+        return false;
+    foreach (k; imp .. line.length)
+    {
+        if (line[k] == ';')
+            return false; // statement ended
+        if (line[k] == ':')
+            return false; // selective symbol list follows
+    }
+    return true;
+}
+
+// Module-qualified completion: `import rt.dbg;` makes `rt.` list the next
+// path segment and `rt.dbg.` list that module's members. Returns true when
+// the chain is a module path (a prefix of, or exactly, an import's path).
+private bool importPathCompletion(Arena* a, Module root, const(char)[][] segs,
+    const(char)[] prefix, ref CompleteOut o, ref bool[const(char)[]] seen)
+{
+    if (!root || !root.members || !segs.length)
+        return false;
+    bool matched = false;
+    Dsymbol[] flat;
+    flattenMembers(root.members, flat);
+    foreach (s; flat)
+    {
+        auto imp = s.isImport();
+        if (!imp || imp.aliasId) // aliased imports use their alias name
+            continue;
+        const(char)[][32] parts;
+        size_t np = 0;
+        foreach (p; imp.packages)
+            if (np < parts.length)
+                parts[np++] = p.toString();
+        if (imp.id && np < parts.length)
+            parts[np++] = imp.id.toString();
+        if (!np)
+            continue;
+        size_t m = 0;
+        while (m < segs.length && m < np && segs[m] == parts[m])
+            m++;
+        if (m != segs.length)
+            continue;
+        matched = true;
+        if (segs.length == np)
+        {
+            if (!imp.mod)
+                continue;
+            foreach (mem; scopeMembers(imp.mod))
+            {
+                if (!mem.ident)
+                    continue;
+                if (mem.visible().kind == Visibility.Kind.private_)
+                    continue;
+                auto nm = mem.ident.toString();
+                if (!hasPrefix(nm, prefix))
+                    continue;
+                pushItem(a, o, nm, kindOf(mem), typeDetail(symType(mem)),
+                    docOf(mem), "1", seen, mem);
+                if (o.nitems >= 500)
+                    break;
+            }
+        }
+        else
+        {
+            auto next = parts[segs.length];
+            if (hasPrefix(next, prefix))
+                pushItem(a, o, next, 9, "module", null, "1", seen);
+        }
+    }
+    return matched;
+}
+
 void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref CompleteOut out_)
 {
@@ -1858,6 +2010,31 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             prefix = chain[dot .. $];
         }
     }
+
+    // Selective import symbol list: `import mod : sym1, sym|` -> offer the
+    // imported module's own members.
+    if (auto imp = selectiveImportAt(mod, text, ctx))
+    {
+        foreach (m; scopeMembers(imp.mod))
+        {
+            if (!m.ident)
+                continue;
+            if (m.visible().kind == Visibility.Kind.private_)
+                continue;
+            auto nm = m.ident.toString();
+            if (!hasPrefix(nm, prefix))
+                continue;
+            pushItem(arena, out_, nm, kindOf(m), typeDetail(symType(m)),
+                docOf(m), "1", seen, m);
+            if (out_.nitems >= 500)
+                break;
+        }
+        return;
+    }
+
+    // Module name(s) of an import: nothing useful to offer.
+    if (inImportModuleList(text, ctx))
+        return;
 
     // Semantic function (params with types + surviving body vars).
     auto fd = findEnclosingFunc(mod, ctx.line);
@@ -1910,6 +2087,10 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         }
         Dsymbol[] rootMembers;
         flattenMembers(mod.members, rootMembers);
+        // Module-qualified access from imports (`rt.` -> `dbg`, `rt.dbg.` ->
+        // its members), for both plain and `static import`.
+        if (importPathCompletion(arena, mod, segs, prefix, out_, seen))
+            return;
         auto scope_ = resolveLhs(mod, segs, rootMembers, slots);
         if (!scope_.length)
         {

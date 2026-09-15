@@ -420,6 +420,39 @@ hv = hover_uri(cuna, 1, 7)
 check('hover-type-def', hv is not None and 'struct S' in hv and 'int x' in hv,
       str(hv))
 
+# Selective import: complete the imported module's members after ':'.
+seluri = open_doctype('selimp.d',
+    'module selimp;\nimport autolib : gl\nvoid f() {}\n')
+send({"jsonrpc": "2.0", "id": 120, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": seluri},
+                 "position": {"line": 1, "character": 19}}})
+labels = [i['label'] for i in read_msg()['result']['items']]
+check('selective-import', labels == ['globalCfg'], str(labels))
+send({"jsonrpc": "2.0", "id": 121, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": seluri},
+                 "position": {"line": 1, "character": 16}}})
+labels = [i['label'] for i in read_msg()['result']['items']]
+check('selective-import-all', 'Cfg' in labels and 'globalCfg' in labels, str(labels))
+send({"jsonrpc": "2.0", "id": 122, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": seluri},
+                 "position": {"line": 1, "character": 10}}})
+labels = [i['label'] for i in read_msg()['result']['items']]
+check('import-module-no-complete', labels == [], str(labels))
+
+# Module-qualified completion: `import nm.a;` -> `nm.` / `nm.a.`
+mquri = open_doctype('modqual.d',
+    'module modqual;\nimport nm.a;\nvoid f()\n{\n    nm.\n    nm.a.\n}\n')
+send({"jsonrpc": "2.0", "id": 123, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": mquri},
+                 "position": {"line": 4, "character": 7}}})
+labels = [i['label'] for i in read_msg()['result']['items']]
+check('module-qualifier', labels == ['a'], str(labels))
+send({"jsonrpc": "2.0", "id": 124, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": mquri},
+                 "position": {"line": 5, "character": 9}}})
+labels = [i['label'] for i in read_msg()['result']['items']]
+check('module-members', labels == ['nm_a_symbol'], str(labels))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
