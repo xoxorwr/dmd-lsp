@@ -1,0 +1,1447 @@
+// dmd-lsp: LSP front end (struct-only). All dmd work happens in a forked
+// worker process (see worker.d); this module holds only session/config
+// state and formats results.
+module main;
+
+import core.stdc.stdio : printf, fprintf, stderr;
+import core.stdc.signal : signal, SIG_IGN;
+import core.sys.posix.signal : SIGPIPE;
+import core.memory : GC;
+import json;
+
+import lsp;
+import server;
+import session;
+import worker;
+import complete : extractPrefix;
+
+struct HitCache
+{
+    worker.WAnalysis analysis; // last analysis (lint, for codeAction)
+}
+
+struct App
+{
+    Session session; // open document texts (perm arena inside)
+    HitCache[string] cache; // GC map, cold path only
+    bool shutdownRequested = false;
+    bool labelDetails = false; // client supports CompletionItem.labelDetails
+    string[] pending; // paths with unanalyzed changes (debounced diagnostics)
+    ulong lastMsgMs = 0; // last stdin activity, monotonic ms
+    ulong debounceMs = 300; // idle delay before analyzing pending changes
+    bool debounceSet = false; // true when --debounce-ms= was given (beats file)
+    // Explicit paths: CLI flags, replaced wholesale by editor settings.
+    // Effective lists (explicit ++ file ++ builtin defaults) recomputed by
+    // refreshImports; sent to each worker at spawn.
+    string[] baseImports;
+    string[] baseStringImports;
+    string[] baseFlags; // dmd flags from CLI (--flag=...)
+    string[] importPaths; // effective
+    string[] stringPaths; // effective
+    string[] flags; // effective dmd flags (CLI ++ dls.json)
+    ulong configGen = 0; // bumped on import-path change; invalidates worker
+    FileConfig fileCfg; // project dls.json (see below)
+    worker.Worker wk; // current analysis worker (lazy)
+}
+
+// Project config file (`dls.json` at the workspace root): checked-in
+// project truth used as the defaults layer — explicit CLI/editor paths
+// stay in front, builtin defaults last.
+struct FileConfig
+{
+    bool loaded = false;
+    string root; // workspace root the file was read from
+    string configPath; // <root>/dls.json (reloaded on didSave)
+    string[] imports; // resolved absolute
+    string[] stringImports; // resolved absolute
+    string[] flags; // raw dmd flags from the project file
+    ulong debounceMs;
+    bool hasDebounce = false;
+}
+
+// Monotonic milliseconds (debounce clock; no phobos).
+private ulong nowMs()
+{
+    import core.sys.posix.time : clock_gettime, timespec, CLOCK_MONOTONIC;
+
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return cast(ulong)ts.tv_sec * 1000 + cast(ulong)(ts.tv_nsec / 1000000);
+}
+
+private bool hasPending(App* app, const(char)[] path)
+{
+    foreach (p; app.pending)
+        if (p == path)
+            return true;
+    return false;
+}
+
+private void markPending(App* app, const(char)[] path)
+{
+    if (!hasPending(app, path))
+        app.pending ~= path.idup;
+}
+
+private void clearPending(App* app, const(char)[] path)
+{
+    foreach (i, p; app.pending)
+    {
+        if (p == path)
+        {
+            app.pending[i] = app.pending[$ - 1];
+            app.pending.length--;
+            return;
+        }
+    }
+}
+
+private JsonNode* jpos(Json js, uint l, uint c)
+{
+    auto o = js.create_object();
+    js.add_number_to_object(o, "line", cast(double)l);
+    js.add_number_to_object(o, "character", cast(double)c);
+    return o;
+}
+
+// Optional string field: JSON null when empty (matches old output).
+private void jaddStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
+{
+    if (v.length)
+        js.add_string_to_object(o, k, zstr(v));
+    else
+        js.add_null_to_object(o, k);
+}
+
+private JsonNode* jrange(Json js, uint sl, uint sc, uint el, uint ec)
+{
+    auto o = js.create_object();
+    js.add_item_to_object(o, "start", jpos(js, sl, sc));
+    js.add_item_to_object(o, "end", jpos(js, el, ec));
+    return o;
+}
+
+private JsonNode* buildDiagnostics(Json js, const ref worker.WAnalysis a)
+{
+    auto arr = js.create_array();
+    foreach (ref d; a.diags)
+    {
+        if (d.kind != 'E' && d.kind != 'W' && d.kind != 'D')
+            continue;
+        uint sev = d.kind == 'E' ? 1 : 2;
+        uint l = d.line > 0 ? d.line - 1 : 0;
+        uint c = d.col > 0 ? d.col - 1 : 0;
+        auto r = js.create_object();
+        js.add_item_to_object(r, "range", jrange(js, l, c, l, c + 1));
+        js.add_number_to_object(r, "severity", sev);
+        js.add_string_to_object(r, "source", "dmd");
+        js.add_string_to_object(r, "message", zstr(d.text));
+        js.add_item_to_array(arr, r);
+    }
+    void addHint(uint line1, uint col1, string msg, string code)
+    {
+        uint l = line1 > 0 ? line1 - 1 : 0;
+        uint c = col1 > 0 ? col1 - 1 : 0;
+        auto r = js.create_object();
+        js.add_item_to_object(r, "range", jrange(js, l, c, l, c + 1));
+        js.add_number_to_object(r, "severity", 4);
+        js.add_string_to_object(r, "source", "dmd-lsp");
+        js.add_string_to_object(r, "code", zstr(code));
+        js.add_string_to_object(r, "message", zstr(msg));
+        js.add_item_to_array(arr, r);
+    }
+    foreach (ref h; a.lintImports.hits)
+        addHint(h.line, h.col, "unused import `" ~ h.name ~ "`", "unused-import");
+    foreach (ref h; a.lintParams.hits)
+        addHint(h.line, h.col, "unused parameter `" ~ h.name ~ "`", "unused-param");
+    return arr;
+}
+
+// Run an analyze request against the worker, respawning once if the worker
+// already served its single universe.
+private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text,
+    ref worker.WAnalysis out_)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerAnalyze(app.wk, path, text, out_);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.failed && !app.wk.alive)
+            continue;
+        if (r == worker.ExchangeResult.respawn)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// Run a completion request against the worker, respawning once if needed.
+private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, const(char)[] prefix,
+    ref worker.WItem[] items)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerComplete(app.wk, path, atext, origText, line, col, prefix, items);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// Run a signature-help request against the worker, respawning once if needed.
+private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] atext,
+    const(char)[] origText, uint line, uint col, ref worker.WSig sig)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerSignature(app.wk, path, atext, origText, line, col, sig);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+private void publishFor(App* app, const(char)[] path, const(char)[] text)
+{
+    worker.WAnalysis a;
+    if (!workerAnalyzeRetry(app, path, text, a))
+        return;
+    app.cache[path.idup] = HitCache(a);
+    clearPending(app, path); // published: no longer debounced
+    auto js = jmake();
+    auto diags = buildDiagnostics(js, a);
+    auto params = js.create_object();
+    js.add_string_to_object(params, "uri", zstr("file://" ~ path.idup));
+    js.add_item_to_object(params, "diagnostics", diags);
+    lspNotify(`"textDocument/publishDiagnostics"`, printJsonStr(params));
+}
+
+// Analyze + publish everything with unanalyzed changes (idle flush).
+private void flushPending(App* app)
+{
+    auto paths = app.pending;
+    app.pending = null;
+    foreach (p; paths)
+    {
+        const(char)[] text;
+        auto d = sessionFind(app.session, p);
+        if (d)
+            text = d.text;
+        else
+            text = sessionReadDisk(p);
+        if (text)
+            publishFor(app, p, text);
+    }
+}
+
+// Apply editor config: {"importPaths": [...]} either bare or nested under
+// "dmd-lsp" / "d" / "D" keys. Future universes pick the paths up via reset.
+private string[] jstrArray(JsonNode* n)
+{
+    string[] r;
+    if (n && (n.type & 0xFF) == JsonArray)
+        for (auto v = n.child; v; v = v.next)
+        {
+            auto s = jstr(v);
+            if (s.length)
+                r ~= s.idup;
+        }
+    return r;
+}
+
+private void applyConfig(App* app, JsonNode* node)
+{
+    if (!node || (node.type & 0xFF) != JsonObject)
+        return;
+    JsonNode* obj = node;
+    foreach (key; ["dmd-lsp", "d", "D"])
+    {
+        if (auto sub = jget(obj, key.ptr))
+        {
+            if ((sub.type & 0xFF) == JsonObject)
+            {
+                obj = sub;
+                break;
+            }
+        }
+    }
+    if (auto ip = jget(obj, "importPaths"))
+    {
+        if ((ip.type & 0xFF) == JsonArray)
+        {
+            string[] paths;
+            for (auto v = ip.child; v; v = v.next)
+            {
+                auto s = jstr(v);
+                if (s.length)
+                    paths ~= s.idup;
+            }
+            if (paths.length)
+            {
+                app.baseImports = paths;
+                refreshImports(app);
+            }
+        }
+    }
+    if (auto sp = jget(obj, "stringImportPaths"))
+    {
+        if ((sp.type & 0xFF) == JsonArray)
+        {
+            string[] paths;
+            for (auto v = sp.child; v; v = v.next)
+            {
+                auto s = jstr(v);
+                if (s.length)
+                    paths ~= s.idup;
+            }
+            if (paths.length)
+            {
+                app.baseStringImports = paths;
+                refreshImports(app);
+            }
+        }
+    }
+    if (auto fl = jget(obj, "flags"))
+    {
+        auto flags = jstrArray(fl);
+        if (flags.length)
+        {
+            app.baseFlags = flags;
+            refreshImports(app);
+        }
+    }
+}
+
+// Workspace root from initialize params: first workspace folder, else
+// rootUri, else legacy rootPath. Null when the client gives none.
+private string initRoot(JsonNode* p)
+{
+    if (!p || (p.type & 0xFF) != JsonObject)
+        return null;
+    if (auto wf = jget(p, "workspaceFolders"))
+    {
+        if ((wf.type & 0xFF) == JsonArray && wf.child)
+        {
+            auto s = jstr(jget(wf.child, "uri"));
+            if (s.length)
+                return uriToPath(s);
+        }
+    }
+    if (auto ru = jget(p, "rootUri"))
+    {
+        auto s = jstr(ru);
+        if (s.length)
+            return uriToPath(s);
+    }
+    if (auto rp = jget(p, "rootPath"))
+    {
+        auto s = jstr(rp);
+        if (s.length)
+            return s.idup;
+    }
+    return null;
+}
+
+// Resolve a dls.json path: absolute stays, relative joins the file's dir.
+private string resolveCfgPath(const(char)[] root, const(char)[] p)
+{
+    if (!p.length)
+        return null;
+    if (p[0] == '/' || (p.length > 2 && p[1] == ':'))
+        return p.idup;
+    string r = root.idup;
+    while (r.length && r[$ - 1] == '/')
+        r = r[0 .. $ - 1];
+    return r ~ "/" ~ p.idup;
+}
+
+struct Notice
+{
+    bool have = false;
+    int type = 4; // 1 Error, 4 Log
+    string text;
+}
+
+// ulong -> decimal without phobos (config log lines).
+private string ulongStr(ulong v)
+{
+    if (v == 0)
+        return "0";
+    char[24] buf = void;
+    size_t i = buf.length;
+    while (v > 0)
+    {
+        buf[--i] = cast(char)('0' + v % 10);
+        v /= 10;
+    }
+    return buf[i .. $].idup;
+}
+
+private void notifyNotice(Notice n)
+{
+    if (!n.have)
+        return;
+    auto js = jmake();
+    auto params = js.create_object();
+    js.add_number_to_object(params, "type", cast(double)n.type);
+    js.add_string_to_object(params, "message", zstr(n.text));
+    lspNotify(`"window/showMessage"`, printJsonStr(params));
+}
+
+// Load <root>/dls.json into app.fileCfg (flat schema: "importPaths",
+// "stringImportPaths", "debounceMs"). Silent when absent; Log on success,
+// Error when present but broken. CLI --debounce-ms= always wins.
+private Notice loadFileConfig(App* app, const(char)[] root)
+{
+    Notice n;
+    if (!root.length)
+        return n;
+    string r = root.idup;
+    while (r.length && r[$ - 1] == '/')
+        r = r[0 .. $ - 1];
+    string cfg = r ~ "/dls.json";
+    if (!fileExists(cfg))
+        return n; // no project file: stay quiet
+    string text = sessionReadDisk(cfg);
+    auto doc = text ? jparse(text) : null;
+    if (!doc || (doc.type & 0xFF) != JsonObject)
+    {
+        n.have = true;
+        n.type = 1;
+        n.text = "dls.json: invalid JSON, ignored";
+        return n;
+    }
+    FileConfig fc;
+    fc.loaded = true;
+    fc.root = r;
+    fc.configPath = cfg;
+    if (auto ip = jget(doc, "importPaths"))
+    {
+        if ((ip.type & 0xFF) == JsonArray)
+        {
+            for (auto v = ip.child; v; v = v.next)
+            {
+                auto s = jstr(v);
+                if (auto rp = resolveCfgPath(r, s))
+                    fc.imports ~= rp;
+            }
+        }
+    }
+    if (auto sp = jget(doc, "stringImportPaths"))
+    {
+        if ((sp.type & 0xFF) == JsonArray)
+        {
+            for (auto v = sp.child; v; v = v.next)
+            {
+                auto s = jstr(v);
+                if (auto rp = resolveCfgPath(r, s))
+                    fc.stringImports ~= rp;
+            }
+        }
+    }
+    if (auto dn = jget(doc, "debounceMs"))
+    {
+        if ((dn.type & 0xFF) == JsonNumber)
+        {
+            long v = jint(dn);
+            fc.hasDebounce = true;
+            fc.debounceMs = v < 0 ? 0 : cast(ulong)v;
+        }
+    }
+    // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
+    fc.flags = jstrArray(jget(doc, "flags"));
+    app.fileCfg = fc;
+    if (!app.debounceSet && fc.hasDebounce)
+        app.debounceMs = fc.debounceMs;
+    refreshImports(app);
+    n.have = true;
+    n.type = 4;
+    n.text = "dls.json: " ~ ulongStr(fc.imports.length) ~ " import paths from " ~ r;
+    return n;
+}
+
+// dls.json is config, not D: never analyze it (else JSON gets D squiggles).
+// Basename match also covers creating it after initialize.
+private bool isDlsJson(const(char)[] path)
+{
+    size_t i = path.length;
+    while (i > 0 && path[i - 1] != '/')
+        i--;
+    return path[i .. $] == "dls.json";
+}
+
+private string dirOf(const(char)[] path)
+{
+    size_t i = path.length;
+    while (i > 0 && path[i - 1] != '/')
+        i--;
+    return i > 0 ? path[0 .. i].idup : null;
+}
+// If the char before the cursor is '.' and the char under the cursor
+// cannot continue an identifier, return text with a placeholder call
+// inserted at the cursor (for completion analysis only).
+// The call resolves via an appended unconstrained UFCS template, so the
+// statement survives semantic cleanly. This matters: dmd collapses a
+// whole function body to a lone ErrorStatement on ANY statement error,
+// which would wipe every local's inferred type (notably `auto`) and
+// leave dotted completion on locals with nothing to resolve.
+private string dotPlaceholder(const(char)[] text, uint line, uint col)
+{
+    size_t off = 0;
+    uint l = 1;
+    while (off < text.length && l < line)
+    {
+        if (text[off] == '\n')
+            l++;
+        off++;
+    }
+    // walk col-1 chars on the line
+    for (uint c = 1; c < col && off < text.length && text[off] != '\n'; c++)
+        off++;
+    if (off == 0 || off > text.length)
+        return null;
+    if (text[off - 1] != '.')
+        return null;
+    if (off < text.length)
+    {
+        char n = text[off];
+        if (n == '_' || n == '$' || (n >= 'a' && n <= 'z') ||
+            (n >= 'A' && n <= 'Z') || (n >= '0' && n <= '9'))
+            return null;
+    }
+    // Appended at end: existing lines/positions are untouched. The call
+    // resolves through UFCS for value dots (any type via IFTI); static
+    // dots keep today's behavior (no UFCS on types). Close any expression
+    // delimiters still open before the cursor (e.g. a call argument list,
+    // `f(w, c.`) so the placeholder statement itself parses.
+    auto closers = closerFor(text, off);
+    if (closers.length)
+    {
+        // Inside an argument/element list the inserted expression would
+        // have to type-check against an unknown parameter type; blank the
+        // whole expression statement instead (the LHS type still resolves
+        // from earlier declarations).
+        if (auto sp = statementPlaceholder(text, line, col))
+            return sp;
+    }
+    return (text[0 .. off] ~ "__dmd_lsp_ph()" ~ closers ~ ";" ~
+        text[off .. $] ~ "\nvoid __dmd_lsp_ph(T)(T _t) {}\n").idup;
+}
+
+private size_t lineColToOffset(const(char)[] text, uint line, uint col)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    for (uint c = 1; c < col && i < text.length && text[i] != '\n'; c++)
+        i++;
+    return i;
+}
+
+// Replace the statement containing the cursor (through the end of its
+// line) with an empty `;`, so an incomplete call argument list can't
+// collapse the enclosing function body during semantic.
+private string statementPlaceholder(const(char)[] text, uint line, uint col)
+{
+    size_t cursor = lineColToOffset(text, line, col);
+    if (cursor > text.length)
+        cursor = text.length;
+    size_t start = 0;
+    int depth = 0;
+    size_t i = 0;
+    while (i < cursor)
+    {
+        char c = text[i];
+        if (c == '/' && i + 1 < cursor && text[i + 1] == '/')
+        {
+            while (i < cursor && text[i] != '\n')
+                i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < cursor && text[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < cursor && !(text[i] == '*' && text[i + 1] == '/'))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            char q = c;
+            i++;
+            while (i < cursor && text[i] != q)
+            {
+                if (text[i] == '\\' && q != '`')
+                    i++;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '(' || c == '[')
+            depth++;
+        else if (c == ')' || c == ']')
+        {
+            if (depth > 0)
+                depth--;
+        }
+        else if (depth == 0 && (c == ';' || c == '{' || c == '}'))
+            start = i + 1;
+        i++;
+    }
+    size_t end = cursor;
+    while (end < text.length && text[end] != '\n')
+        end++;
+    if (start >= end)
+        return null;
+    bool content = false;
+    foreach (ch; text[start .. end])
+        if (ch != ' ' && ch != '\t' && ch != '\r')
+        {
+            content = true;
+            break;
+        }
+    if (!content)
+        return null;
+    return (text[0 .. start] ~ ";" ~ text[end .. $]).idup;
+}
+
+// Pick the analysis text for a completion/signature request: make the
+// buffer valid enough that semantic does not collapse the enclosing body
+// (which would drop resolved `auto` types). Originates from `text`.
+private string analysisText(string text, uint line, uint col)
+{
+    if (auto v = dotPlaceholder(text, line, col))
+        return v;
+    if (auto v2 = tokenPlaceholder(text, line, col))
+        return v2;
+    // Plain prefix inside an unclosed call/array: blank the statement.
+    size_t off = lineColToOffset(text, line, col);
+    if (closerFor(text, off).length)
+        if (auto v3 = statementPlaceholder(text, line, col))
+            return v3;
+    return text;
+}
+
+// Closing brackets for unclosed `(`/`[` before offset `off`, innermost
+// first (strings/comments skipped). `{` is a block, left alone.
+private string closerFor(const(char)[] text, size_t off)
+{
+    char[64] stack;
+    size_t sp = 0;
+    size_t i = 0;
+    while (i < off)
+    {
+        char c = text[i];
+        if (c == '/' && i + 1 < off && text[i + 1] == '/')
+        {
+            while (i < off && text[i] != '\n')
+                i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < off && text[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < off && !(text[i] == '*' && text[i + 1] == '/'))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            char q = c;
+            i++;
+            while (i < off && text[i] != q)
+            {
+                if (text[i] == '\\' && q != '`')
+                    i++;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '(' || c == '[')
+        {
+            if (sp < stack.length)
+                stack[sp++] = c;
+        }
+        else if (c == ')')
+        {
+            if (sp && stack[sp - 1] == '(')
+                sp--;
+        }
+        else if (c == ']')
+        {
+            if (sp && stack[sp - 1] == '[')
+                sp--;
+        }
+        i++;
+    }
+    char[] closers;
+    while (sp > 0)
+    {
+        sp--;
+        closers ~= (stack[sp] == '(' ? ')' : ']');
+    }
+    return closers.idup;
+}
+
+private bool isIdentChar(char c) pure nothrow @nogc @safe
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
+// A partial identifier alone on a line (`    st`) is a semantic/parse error
+// that makes dmd replace the whole function body with ErrorStatement, so
+// resolved `auto` local types are lost and completion degrades to "local".
+// Removing the standalone token keeps the line valid (an empty statement)
+// so the body survives semantic; the prefix and positions still come from
+// the original text. Returns null when the token isn't standalone.
+private string tokenPlaceholder(const(char)[] text, uint line, uint col)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    while (i < text.length && text[i] != '\n')
+        i++;
+    auto lt = text[ls .. i];
+    size_t e = col - 1;
+    if (e > lt.length)
+        e = lt.length;
+    size_t s2 = e;
+    while (s2 > 0 && isIdentChar(lt[s2 - 1]))
+        s2--;
+    size_t e2 = e;
+    while (e2 < lt.length && isIdentChar(lt[e2]))
+        e2++;
+    if (e2 == s2)
+        return null; // no identifier at the cursor
+    foreach (c; lt[0 .. s2])
+        if (c != ' ' && c != '\t')
+            return null; // something precedes the token on this line
+    bool semi = false;
+    foreach (c; lt[e2 .. $])
+    {
+        if (c == ' ' || c == '\t')
+            continue;
+        if (c == ';' && !semi)
+        {
+            semi = true;
+            continue;
+        }
+        return null; // trailing code: not a standalone token
+    }
+    return (text[0 .. ls + s2] ~ text[ls + e2 .. $]).idup;
+}
+
+private void handleMessage(App* app, ref RawMsg m)
+{
+    if (!m.ok)
+        return;
+    if (!m.hasId)
+    {
+        // notifications
+        if (m.method == "initialized" || m.method == "$/cancelRequest")
+            return;
+        if (m.method == "exit")
+        {
+            import core.stdc.stdlib : exit;
+            exit(app.shutdownRequested ? 0 : 1);
+        }
+    try
+    {
+        auto p = jparse(m.paramsJson);
+            if (m.method == "textDocument/didOpen")
+            {
+                auto td = jget(p, "textDocument");
+                const(char)[] uri = jstr(jget(td, "uri"));
+                if (uri is null)
+                    return;
+                string path = uriToPath(uri);
+                auto tn = jget(td, "text");
+                if (!tn)
+                    return;
+                const(char)[] text = jstr(tn);
+                if (text is null)
+                    text = "";
+                sessionOpen(app.session, path, text);
+                if (!isDlsJson(path))
+                    publishFor(app, path, text);
+            }
+            else if (m.method == "textDocument/didChange")
+            {
+                auto tdn = jget(p, "textDocument");
+                const(char)[] uri = jstr(jget(tdn, "uri"));
+                if (uri is null)
+                    return;
+                string path = uriToPath(uri);
+                if (isDlsJson(path))
+                    return; // config, not D (reloaded on didSave)
+                auto changes = jget(p, "contentChanges");
+                if (!changes || (changes.type & 0xFF) != JsonArray)
+                    return;
+                // Some clients send incremental changes (with a `range`)
+                // even though we advertise full sync. Composing them onto
+                // the current text is mandatory: treating a range's `text`
+                // as the whole document replaces the buffer with a fragment
+                // (dmd then errors at the top of the "file", e.g. bogus
+                // "must start with BOM or ASCII character, not \xNN").
+                string base;
+                if (auto d = sessionFind(app.session, path))
+                    base = d.text.idup;
+                for (auto c = changes.child; c; c = c.next)
+                {
+                    auto tn = jget(c, "text");
+                    if (!tn)
+                        continue;
+                    const(char)[] insert = jstr(tn);
+                    if (insert is null)
+                        insert = "";
+                    auto range = jget(c, "range");
+                    bool hasRange = range !is null;
+                    uint sl = 0, sc = 0, el = 0, ec = 0;
+                    if (hasRange)
+                    {
+                        auto st = jget(range, "start");
+                        auto en = jget(range, "end");
+                        sl = cast(uint)jint(jget(st, "line"));
+                        sc = cast(uint)jint(jget(st, "character"));
+                        el = cast(uint)jint(jget(en, "line"));
+                        ec = cast(uint)jint(jget(en, "character"));
+                    }
+                    base = applyChange(base, insert, hasRange, sl, sc, el, ec);
+                }
+                // Debounce: update the session, analyze on idle. Always
+                // mark pending, even for identical resends: dep bytes are
+                // fingerprinted at analysis time, so a same-text change is
+                // how on-disk dep edits get noticed (unchanged deps hit
+                // the universe cache for ~free anyway).
+                sessionUpdate(app.session, path, base);
+                markPending(app, path);
+            }
+            else if (m.method == "textDocument/didClose")
+            {
+                const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+                if (uri is null)
+                    return;
+                string path = uriToPath(uri);
+                sessionClose(app.session, path);
+                clearPending(app, path);
+            }
+            else if (m.method == "textDocument/didSave")
+            {
+                const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+                if (uri is null)
+                    return;
+                string path = uriToPath(uri);
+                if (isDlsJson(path))
+                {
+                    // Saving dls.json reloads project config from disk
+                    // (covers creating it after initialize too).
+                    if (auto root = dirOf(path))
+                        notifyNotice(loadFileConfig(app, root));
+                    return;
+                }
+                // Prefer the text the client sends. Otherwise the session
+                // already holds the current buffer: never pass that same
+                // buffer back through sessionUpdate (it would be freed)
+                // and then analyze it — that hands dmd freed garbage.
+                if (auto t = jget(p, "text"))
+                {
+                    const(char)[] text = jstr(t);
+                    if (text)
+                    {
+                        sessionUpdate(app.session, path, text);
+                        publishFor(app, path, text);
+                    }
+                }
+                else if (auto d = sessionFind(app.session, path))
+                {
+                    if (d.text)
+                        publishFor(app, path, d.text);
+                }
+                else if (auto disk = sessionReadDisk(path))
+                {
+                    sessionUpdate(app.session, path, disk);
+                    publishFor(app, path, disk);
+                }
+            }
+        }
+        catch (Exception)
+        {
+        }
+        return;
+    }
+    // requests
+    if (m.method == "initialize")
+    {
+        auto p = jparse(m.paramsJson);
+        if (auto io = jget(p, "initializationOptions"))
+            applyConfig(app, io);
+        // LSP 3.17 labelDetails: only clients that opt in get the split
+        // "(params) / return type" form.
+        if (auto capsIn = jget(p, "capabilities"))
+            if (auto tdc = jget(capsIn, "textDocument"))
+                if (auto compIn = jget(tdc, "completion"))
+                    if (auto ciIn = jget(compIn, "completionItem"))
+                        app.labelDetails = jbool(jget(ciIn, "labelDetailsSupport"), false);
+        Notice note;
+        if (auto root = initRoot(p))
+            note = loadFileConfig(app, root);
+        auto js = jmake();
+        auto trig = js.create_array();
+        js.add_item_to_array(trig, js.create_string("."));
+        js.add_item_to_array(trig, js.create_string("("));
+        auto cp = js.create_object();
+        js.add_item_to_object(cp, "triggerCharacters", trig);
+        auto cpItem = js.create_object();
+        js.add_bool_to_object(cpItem, "labelDetailsSupport", true);
+        js.add_item_to_object(cp, "completionItem", cpItem);
+        auto caps = js.create_object();
+        js.add_number_to_object(caps, "textDocumentSync", 1);
+        js.add_item_to_object(caps, "completionProvider", cp);
+        auto sht = js.create_array();
+        js.add_item_to_array(sht, js.create_string("("));
+        js.add_item_to_array(sht, js.create_string(","));
+        auto sh = js.create_object();
+        js.add_item_to_object(sh, "triggerCharacters", sht);
+        js.add_item_to_object(caps, "signatureHelpProvider", sh);
+        js.add_bool_to_object(caps, "codeActionProvider", true);
+        auto si = js.create_object();
+        js.add_string_to_object(si, "name", "dmd-lsp");
+        js.add_string_to_object(si, "version", dmdLspVersion);
+        auto res = js.create_object();
+        js.add_item_to_object(res, "capabilities", caps);
+        js.add_item_to_object(res, "serverInfo", si);
+        lspRespond(m.idJson, printJsonStr(res));
+        notifyNotice(note); // after respond: strict clients may drop pre-init notices
+        return;
+    }
+    if (m.method == "shutdown")
+    {
+        app.shutdownRequested = true;
+        lspRespond(m.idJson, "null");
+        return;
+    }
+    try
+    {
+        auto p = jparse(m.paramsJson);
+        if (m.method == "workspace/didChangeConfiguration")
+        {
+            if (auto s = jget(p, "settings"))
+                applyConfig(app, s);
+            if (m.hasId)
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/completion")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, `{"isIncomplete":false,"items":[]}`);
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            auto js = jmake();
+            auto items = js.create_array();
+            if (text)
+            {
+                // A dangling dot, a lone partial identifier, or an
+                // unfinished call argument rarely parses; use a placeholder
+                // so semantic survives. Chain/positions come from `text`.
+                string atext = analysisText(text, line, col);
+                auto prefix = extractPrefix(text, line, col);
+                worker.WItem[] witems;
+                if (workerCompleteRetry(app, path, atext, text, line, col, prefix, witems))
+                {
+                    foreach (ref it; witems)
+                    {
+                        auto j = js.create_object();
+                        js.add_string_to_object(j, "label", zstr(it.label));
+                        js.add_number_to_object(j, "kind", it.kind);
+                        bool isFn = it.labelDetail.length > 0 || it.labelDesc.length > 0;
+                        if (isFn && app.labelDetails)
+                        {
+                            // LSP 3.17: label + "(params)" + " " + return type.
+                            auto ld = js.create_object();
+                            if (it.labelDetail.length)
+                                js.add_string_to_object(ld, "detail", zstr(it.labelDetail));
+                            if (it.labelDesc.length)
+                                js.add_string_to_object(ld, "description", zstr(it.labelDesc));
+                            js.add_item_to_object(j, "labelDetails", ld);
+                        }
+                        else
+                            jaddStrOpt(js, j, "detail", it.detail);
+                        jaddStrOpt(js, j, "documentation", it.documentation);
+                        jaddStrOpt(js, j, "sortText", it.sortText);
+                        js.add_item_to_array(items, j);
+                    }
+                }
+            }
+            auto res = js.create_object();
+            js.add_bool_to_object(res, "isIncomplete", false);
+            js.add_item_to_object(res, "items", items);
+            lspRespond(m.idJson, printJsonStr(res));
+            return;
+        }
+        if (m.method == "textDocument/signatureHelp")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, `{"signatures":[]}`);
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, `{"signatures":[]}`);
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            worker.WSig sig;
+            auto js = jmake();
+            if (workerSignatureRetry(app, path, atext, text, line, col, sig) && sig.found)
+            {
+                auto sigs = js.create_array();
+                auto sg = js.create_object();
+                js.add_string_to_object(sg, "label", zstr(sig.label));
+                if (sig.doc.length)
+                    js.add_string_to_object(sg, "documentation", zstr(sig.doc));
+                auto pars = js.create_array();
+                foreach (sp; sig.params)
+                {
+                    auto po = js.create_object();
+                    js.add_string_to_object(po, "label", zstr(sp.label));
+                    js.add_item_to_array(pars, po);
+                }
+                js.add_item_to_object(sg, "parameters", pars);
+                js.add_item_to_array(sigs, sg);
+                auto res = js.create_object();
+                js.add_item_to_object(res, "signatures", sigs);
+                js.add_number_to_object(res, "activeSignature", 0);
+                js.add_number_to_object(res, "activeParameter", sig.activeParameter);
+                lspRespond(m.idJson, printJsonStr(res));
+            }
+            else
+                lspRespond(m.idJson, `{"signatures":[]}`);
+            return;
+        }
+        if (m.method == "textDocument/codeAction")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            string path = uri is null ? null : uriToPath(uri);
+            auto js = jmake();
+            auto actions = js.create_array();
+            if (path !is null)
+            {
+                if (hasPending(app, path))
+                {
+                    // Actions carry edit ranges: refresh so they match the
+                    // current text. No notify here (that stays debounced);
+                    // pending is kept, the idle flush then hits.
+                    const(char)[] text;
+                    auto d = sessionFind(app.session, path);
+                    if (d)
+                        text = d.text;
+                    else
+                        text = sessionReadDisk(path);
+                    if (text)
+                    {
+                        worker.WAnalysis a;
+                        if (workerAnalyzeRetry(app, path, text, a))
+                            app.cache[path.idup] = HitCache(a);
+                    }
+                }
+                if (auto hc = path.idup in app.cache)
+                {
+                    auto li = (*hc).analysis.lintImports;
+                    JsonNode* mkEdit(uint sl, uint el)
+                    {
+                        auto e = js.create_object();
+                        js.add_item_to_object(e, "range", jrange(js, sl - 1, 0, el, 0));
+                        js.add_string_to_object(e, "newText", "");
+                        return e;
+                    }
+                    // per-hit quickfixes
+                    for (size_t i = 0; i < li.hits.length; i++)
+                    {
+                        auto h = li.hits[i];
+                        auto edits = js.create_array();
+                        js.add_item_to_array(edits, mkEdit(h.line, h.endLine));
+                        auto changes = js.create_object();
+                        js.add_item_to_object(changes, zstr(uri), edits);
+                        auto a = js.create_object();
+                        js.add_string_to_object(a, "title",
+                            zstr("Remove unused import `" ~ h.name ~ "`"));
+                        js.add_string_to_object(a, "kind", "quickfix");
+                        auto w = js.create_object();
+                        js.add_item_to_object(w, "changes", changes);
+                        js.add_item_to_object(a, "edit", w);
+                        js.add_item_to_array(actions, a);
+                    }
+                    if (li.hits.length > 1)
+                    {
+                        auto edits = js.create_array();
+                        for (size_t i = 0; i < li.hits.length; i++)
+                        {
+                            auto h = li.hits[i];
+                            js.add_item_to_array(edits, mkEdit(h.line, h.endLine));
+                        }
+                        auto changes = js.create_object();
+                        js.add_item_to_object(changes, zstr(uri), edits);
+                        auto a = js.create_object();
+                        js.add_string_to_object(a, "title", "Remove all unused imports");
+                        js.add_string_to_object(a, "kind", "quickfix");
+                        auto w = js.create_object();
+                        js.add_item_to_object(w, "changes", changes);
+                        js.add_item_to_object(a, "edit", w);
+                        js.add_item_to_array(actions, a);
+                    }
+                }
+            }
+            lspRespond(m.idJson, printJsonStr(actions));
+            return;
+        }
+    }
+    catch (Exception e)
+    {
+        lspRespondError(m.idJson, -32603, "internal error");
+        return;
+    }
+    lspRespondError(m.idJson, -32601, "method not found: " ~ m.method);
+}
+
+private int runCheck(string[] files, string[] imports, string[] stringImports = null,
+    string[] flags = null)
+{
+    // One-shot batch mode: single process, no worker needed.
+    App app;
+    app.baseImports = imports;
+    app.baseStringImports = stringImports;
+    app.baseFlags = flags;
+    refreshImports(&app);
+    ServerState srv;
+    serverInit(srv, app.importPaths, app.stringPaths, app.flags);
+    scope (exit)
+        serverShutdown(srv);
+    int code = 0;
+    foreach (f; files)
+    {
+        string text = sessionReadDisk(f);
+        if (!text)
+        {
+            fprintf(stderr, "%.*s: cannot read file\n", cast(int)f.length, f.ptr);
+            code = 2;
+            continue;
+        }
+        auto a = serverAnalyze(srv, f, text);
+        foreach (ref d; a.diags)
+        {
+            if (d.kind == 'S' || d.kind == 'M')
+                continue;
+            const(char)* k = d.kind == 'E' ? "Error" : d.kind == 'W' ? "Warning" : "Deprecation";
+            const(char)[] df = d.file.length ? d.file : f;
+            printf("%.*s(%u:%u): %s: %.*s\n", cast(int)df.length, df.ptr, d.line, d.col, k,
+                cast(int)d.text.length, d.text.ptr);
+            if (d.kind == 'E')
+                code = 1;
+        }
+        for (size_t i = 0; i < a.lintImports.nhits; i++)
+        {
+            auto h = a.lintImports.hits[i];
+            printf("%.*s(%u:%u): Hint: unused import `%.*s`\n", cast(int)f.length, f.ptr,
+                h.line, h.col, cast(int)h.name.length, h.name.ptr);
+        }
+        for (size_t i = 0; i < a.lintParams.nhits; i++)
+        {
+            auto h = a.lintParams.hits[i];
+            printf("%.*s(%u:%u): Hint: unused parameter `%.*s`\n", cast(int)f.length, f.ptr,
+                h.line, h.col, cast(int)h.name.length, h.name.ptr);
+        }
+        if (a.lintImports.skipped)
+            printf("%.*s: import lint skipped (%.*s)\n", cast(int)f.length, f.ptr,
+                cast(int)a.lintImports.skipReason.length, a.lintImports.skipReason.ptr);
+    }
+    return code;
+}
+
+// Effective import lists: explicit (CLI, replaced by editor settings) ++
+// project file ++ builtin defaults, order-preserving dedup. Bumps
+// configGen only on actual change (universe invalidation is expensive).
+private void refreshImports(App* app)
+{
+    string[] eff = app.baseImports.dup;
+    foreach (p; app.fileCfg.imports)
+    {
+        bool have = false;
+        foreach (q; eff)
+            if (q == p)
+            {
+                have = true;
+                break;
+            }
+        if (!have)
+            eff ~= p;
+    }
+    foreach (d; defaultImports())
+    {
+        bool have = false;
+        foreach (q; eff)
+            if (q == d)
+            {
+                have = true;
+                break;
+            }
+        if (!have)
+            eff ~= d;
+    }
+    string[] seff = app.baseStringImports.dup;
+    foreach (p; app.fileCfg.stringImports)
+    {
+        bool have = false;
+        foreach (q; seff)
+            if (q == p)
+            {
+                have = true;
+                break;
+            }
+        if (!have)
+            seff ~= p;
+    }
+    string[] feff = app.baseFlags.dup;
+    foreach (f; app.fileCfg.flags)
+    {
+        bool have = false;
+        foreach (q; feff)
+            if (q == f)
+            {
+                have = true;
+                break;
+            }
+        if (!have)
+            feff ~= f;
+    }
+    if (eff != app.importPaths || seff != app.stringPaths || feff != app.flags)
+    {
+        app.importPaths = eff;
+        app.stringPaths = seff;
+        app.flags = feff;
+        app.configGen++;
+        // Worker bakes paths in at spawn; drop it so the next request
+        // respawns with the new configuration.
+        workerKill(app.wk);
+    }
+}
+
+private string[] defaultImports()
+{
+    string[] found;
+    static immutable string[] candidates = [
+        // repo druntime first: matches the frontend under development
+        "/home/ryuukk/dev/dmd/druntime/src",
+        "/home/ryuukk/dlang/dmd-2.113.0/src/phobos",
+        "/home/ryuukk/dlang/dmd-2.113.0/src/druntime/import",
+    ];
+    foreach (c; candidates)
+    {
+        if (fileExists(c))
+            found ~= c.idup;
+    }
+    return found;
+}
+
+enum dmdLspVersion = "0.3.0";
+
+int main(string[] args)
+{
+    string[] imports;
+    string[] stringImports;
+    string[] flags;
+    string[] files;
+    bool check = false;
+    bool stdio_ = false;
+    ulong debounceMs = 300;
+    bool debounceSet = false;
+    foreach (a; args[1 .. $])
+    {
+        if (a == "--version")
+        {
+            printf("dmd-lsp %s\n", dmdLspVersion.ptr);
+            return 0;
+        }
+        else if (a == "--check")
+            check = true;
+        else if (a == "--stdio")
+            stdio_ = true;
+        else if (a.length > 9 && a[0 .. 9] == "--import=")
+            imports ~= a[9 .. $].idup;
+        else if (a.length > 16 && a[0 .. 16] == "--string-import=")
+            stringImports ~= a[16 .. $].idup;
+        else if (a.length > 7 && a[0 .. 7] == "--flag=")
+            flags ~= a[7 .. $].idup;
+        else if (a.length > 14 && a[0 .. 14] == "--debounce-ms=")
+        {
+            ulong v = 0;
+            foreach (c; a[14 .. $])
+            {
+                if (c < '0' || c > '9')
+                {
+                    v = 300;
+                    break;
+                }
+                v = v * 10 + cast(ulong)(c - '0');
+            }
+            debounceMs = v;
+            debounceSet = true;
+        }
+        else if (a == "--help" || a == "-h")
+        {
+            printf("usage: dmd-lsp [--stdio] [--check FILE...] [--import=DIR]... [--string-import=DIR]... [--flag=FLAG]... [--debounce-ms=N]\n");
+            return 0;
+        }
+        else
+            files ~= a;
+    }
+    if (check)
+        return runCheck(files, imports, stringImports, flags);
+
+    // default: stdio LSP loop with debounced diagnostics.
+    // didChange only marks docs pending; analysis runs after `debounceMs`
+    // of stdin idle, so a keystroke burst costs one analysis, not N.
+    // All dmd work happens in a forked worker (see worker.d); the parent
+    // holds no dmd state, so nothing accumulates across rebuilds.
+    App app;
+    app.debounceMs = debounceMs;
+    app.debounceSet = debounceSet;
+    app.baseImports = imports;
+    app.baseStringImports = stringImports;
+    app.baseFlags = flags;
+    refreshImports(&app);
+    signal(SIGPIPE, SIG_IGN); // worker pipe may close on respawn
+    scope (exit)
+        workerKill(app.wk);
+    app.lastMsgMs = nowMs();
+    version (Posix)
+    {
+        import core.sys.posix.poll : poll, pollfd, POLLIN;
+        import core.stdc.stdio : setvbuf, _IONBF, stdin;
+
+        // Unbuffered stdin: poll() observes kernel pipe state, but stdio
+        // fgetc/fread would otherwise hoard messages in a userspace buffer
+        // (poll blocks on an "empty" pipe while input sits buffered).
+        setvbuf(stdin, null, _IONBF, 0);
+
+        RawMsg m;
+        string body_;
+        for (;;)
+        {
+            int timeout = -1;
+            if (app.pending.length)
+            {
+                ulong idle = nowMs() - app.lastMsgMs;
+                if (idle >= app.debounceMs)
+                    timeout = 0;
+                else
+                {
+                    ulong wait = app.debounceMs - idle;
+                    timeout = wait > int.max ? int.max : cast(int)wait;
+                }
+            }
+            pollfd pfd;
+            pfd.fd = 0; // stdin
+            pfd.events = POLLIN;
+            int r = poll(&pfd, 1, timeout);
+            if (r < 0)
+                break;
+            if (r == 0)
+            {
+                flushPending(&app);
+                continue;
+            }
+            if (!lspRead(&m, body_))
+                break;
+            app.lastMsgMs = nowMs();
+            handleMessage(&app, m);
+            // Parent heap is tiny (session + cached lint); collect so the
+            // per-message JSON/text garbage never accumulates.
+            GC.collect();
+        }
+    }
+    else
+    {
+        RawMsg m;
+        string body_;
+        while (lspRead(&m, body_))
+            handleMessage(&app, m);
+    }
+    return 0;
+}

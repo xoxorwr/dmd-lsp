@@ -1,0 +1,19 @@
+# Build artifacts (see Makefile `clean`)
+/dmd-lsp
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+
+# Python test cache
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.DS_Store
+*~
+.vscode/
+.idea/

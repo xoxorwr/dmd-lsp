@@ -1,0 +1,2 @@
+import nosuchmod;
+void main(){}

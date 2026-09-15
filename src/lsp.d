@@ -1,0 +1,297 @@
+module lsp;
+
+// Minimal LSP/JSON-RPC structs + stdio transport. Struct-only.
+// JSON via vendored `json` (no phobos).
+
+import arena;
+import json;
+import core.stdc.stdio : stdin, stdout, fread, fwrite, fflush, fgetc, EOF;
+import core.stdc.string : strlen;
+
+struct LspCompletionItem
+{
+    const(char)[] label; // Arena slice
+    ubyte kind = 0;      // LSP CompletionItemKind
+    const(char)[] detail;
+    const(char)[] documentation;
+    const(char)[] sortText;
+    const(char)[] labelDetail; // labelDetails.detail (e.g. "()")
+    const(char)[] labelDesc;   // labelDetails.description (e.g. return type)
+}
+
+struct RawMsg
+{
+    string idJson; // raw JSON id ("1", "\"abc\"", or null="")
+    bool hasId = false;
+    string method;
+    string paramsJson;
+    bool ok = false;
+}
+
+// ---------- transport (single API: C stdio) ----------
+private bool readLine(ref char[] buf)
+{
+    buf.length = 0;
+    while (true)
+    {
+        int c = fgetc(stdin);
+        if (c == EOF)
+            return buf.length > 0;
+        if (c == '\n')
+            return true;
+        if (c != '\r')
+            buf ~= cast(char)c;
+    }
+}
+
+bool lspRead(RawMsg* outm, ref string body_)
+{
+    char[] line;
+    uint contentLength = 0;
+    bool gotLen = false;
+    while (readLine(line))
+    {
+        if (line.length == 0)
+            break; // end of headers
+        // Content-Length: N (case-insensitive prefix)
+        if (line.length > 15)
+        {
+            bool match = true;
+            static immutable char[] want = "content-length:";
+            for (size_t i = 0; i < want.length; i++)
+            {
+                char a = line[i];
+                if (a >= 'A' && a <= 'Z')
+                    a = cast(char)(a + 32);
+                if (a != want[i])
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match)
+            {
+                size_t j = want.length;
+                while (j < line.length && (line[j] == ' ' || line[j] == '\t'))
+                    j++;
+                uint v = 0;
+                while (j < line.length && line[j] >= '0' && line[j] <= '9')
+                {
+                    v = v * 10 + cast(uint)(line[j] - '0');
+                    j++;
+                }
+                contentLength = v;
+                gotLen = true;
+            }
+        }
+    }
+    if (!gotLen || contentLength == 0 || contentLength > 64 * 1024 * 1024)
+        return false;
+    char[] bodyArr = new char[contentLength];
+    size_t got = 0;
+    while (got < contentLength)
+    {
+        size_t n = fread(bodyArr.ptr + got, 1, contentLength - got, stdin);
+        if (n == 0)
+            return false;
+        got += n;
+    }
+    body_ = bodyArr.idup;
+    jtmp.reset();
+    auto js = jmake();
+    JsonNode* root = js.parse(body_);
+    if (!root || !js.is_object(root))
+        return false;
+    RawMsg m;
+    if (auto id = jget(root, "id"))
+    {
+        m.hasId = true;
+        m.idJson = printJsonStr(id);
+    }
+    if (auto mt = jget(root, "method"))
+    {
+        if ((mt.type & 0xFF) != JsonString || !mt.value_string)
+            return false;
+        auto sl = strlen(mt.value_string);
+        m.method = mt.value_string[0 .. sl].idup;
+    }
+    else
+        m.method = "";
+    if (auto pr = jget(root, "params"))
+        m.paramsJson = printJsonStr(pr);
+    else
+        m.paramsJson = "{}";
+    m.ok = true;
+    *outm = m;
+    return true;
+}
+
+// ---------- transient message arena + JSON conveniences ----------
+// Single-threaded daemon: one scratch arena per message, reset on read.
+// Parsed trees and built responses live here; extracting code must dup
+// anything that outlives the current message (session perm arena / idup).
+__gshared Arena jtmp;
+
+Json jmake()
+{
+    return Json.create(Allocator(&jtmp));
+}
+
+// Parse a JSON document into jtmp (appends; null on failure).
+JsonNode* jparse(const(char)[] text)
+{
+    if (!text.length)
+        return null;
+    auto js = jmake();
+    return js.parse(text);
+}
+
+// NUL-terminated arena copy for C-string JSON APIs.
+const(char)* zstr(const(char)[] s)
+{
+    char* p = cast(char*)jtmp.alloc(s.length + 1);
+    if (!p)
+        return null;
+    if (s.length)
+        p[0 .. s.length] = s[];
+    p[s.length] = 0;
+    return p;
+}
+
+// Exact-match child lookup (null unless object with that key).
+JsonNode* jget(JsonNode* o, const(char)* key)
+{
+    if (!o || (o.type & 0xFF) != JsonObject || !key)
+        return null;
+    for (auto c = o.child; c; c = c.next)
+    {
+        if (!c.key)
+            continue;
+        const(char)* a = c.key;
+        const(char)* b = key;
+        while (*a && *a == *b)
+        {
+            a++;
+            b++;
+        }
+        if (*a == *b)
+            return c;
+    }
+    return null;
+}
+
+// String value as slice (null iff missing/non-string; empty string is
+// a non-null empty slice). Aliases jtmp: dup before next reset if kept.
+const(char)[] jstr(JsonNode* n)
+{
+    if (!n || (n.type & 0xFF) != JsonString || !n.value_string)
+        return null;
+    auto sl = strlen(n.value_string);
+    return n.value_string[0 .. sl];
+}
+
+long jint(JsonNode* n, long def = 0)
+{
+    if (!n || (n.type & 0xFF) != JsonNumber)
+        return def;
+    return n.value_integer;
+}
+
+bool jbool(JsonNode* n, bool def = false)
+{
+    if (!n)
+        return def;
+    if ((n.type & 0xFF) == JsonTrue)
+        return true;
+    if ((n.type & 0xFF) == JsonFalse)
+        return false;
+    return def;
+}
+
+size_t jlen(JsonNode* arr)
+{
+    if (!arr || (arr.type & 0xFF) != JsonArray)
+        return 0;
+    size_t n = 0;
+    for (auto c = arr.child; c; c = c.next)
+        n++;
+    return n;
+}
+
+JsonNode* jat(JsonNode* arr, size_t i)
+{
+    if (!arr || (arr.type & 0xFF) != JsonArray)
+        return null;
+    auto c = arr.child;
+    while (c && i > 0)
+    {
+        c = c.next;
+        i--;
+    }
+    return c;
+}
+
+void lspWrite(string jsonBody)
+{
+    import core.stdc.stdio : fprintf;
+    fprintf(stdout, "Content-Length: %u\r\n\r\n", cast(uint)jsonBody.length);
+    if (jsonBody.length)
+        fwrite(jsonBody.ptr, 1, jsonBody.length, stdout);
+    fflush(stdout);
+}
+
+void lspRespond(string idJson, string resultJson)
+{
+    lspWrite(`{"jsonrpc":"2.0","id":` ~ idJson ~ `,"result":` ~ resultJson ~ `}`);
+}
+
+void lspRespondError(string idJson, int code, string message)
+{
+    auto js = jmake();
+    auto e = js.create_object();
+    js.add_number_to_object(e, "code", cast(double)code);
+    js.add_string_to_object(e, "message", zstr(message));
+    lspWrite(`{"jsonrpc":"2.0","id":` ~ idJson ~ `,"error":` ~ printJsonStr(e) ~ `}`);
+}
+
+void lspNotify(string method, string paramsJson)
+{
+    lspWrite(`{"jsonrpc":"2.0","method":` ~ method ~ `,"params":` ~ paramsJson ~ `}`);
+}
+
+// ---------- URI helpers ----------
+string uriToPath(const(char)[] uri)
+{
+    string u = uri.idup;
+    static immutable string pre = "file://";
+    if (u.length > pre.length && u[0 .. pre.length] == pre)
+        u = u[pre.length .. $];
+    // percent-decode minimal (%XX)
+    char[] out_;
+    out_.reserve(u.length);
+    for (size_t i = 0; i < u.length; i++)
+    {
+        if (u[i] == '%' && i + 2 < u.length && isHex(u[i + 1]) && isHex(u[i + 2]))
+        {
+            out_ ~= cast(char)(hexVal(u[i + 1]) * 16 + hexVal(u[i + 2]));
+            i += 2;
+        }
+        else
+            out_ ~= u[i];
+    }
+    return out_.idup;
+}
+
+private bool isHex(char c) pure nothrow @nogc @safe
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+private uint hexVal(char c) pure nothrow @nogc @safe
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return c - 'A' + 10;
+}

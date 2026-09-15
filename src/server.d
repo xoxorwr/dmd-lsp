@@ -1,0 +1,289 @@
+module server;
+
+// Daemon state + analysis pipeline. Struct-only, no classes.
+
+import arena;
+import session;
+import dmdwrap;
+import lint;
+import complete;
+
+import dmd.dmodule : Module;
+import core.memory : GC;
+
+struct ServerState
+{
+    Arena scratch;   // per-request (diagnostics, lint hits, completions)
+    Session session; // perm arena inside
+    DmdState dmd;
+    DiagSink sink;
+    Universe uni; // live-universe cache (see below)
+}
+
+// dmd's message-kind diagnostics bypass DiagnosticHandler and write to
+// stdout directly (errors.d emit). During analysis, reroute fd 1 to
+// stderr so LSP framing / --check stdout stay machine-clean.
+struct StdoutGuard
+{
+    int saved = -1;
+    bool active = false;
+}
+
+private void stdoutToStderr(ref StdoutGuard g)
+{
+    version (Posix)
+    {
+        import core.stdc.stdio : fflush, stdout;
+        import core.sys.posix.unistd : dup, dup2;
+
+        fflush(stdout);
+        g.saved = dup(1);
+        if (g.saved >= 0)
+        {
+            dup2(2, 1);
+            g.active = true;
+        }
+    }
+}
+
+private void stdoutRestore(ref StdoutGuard g)
+{
+    version (Posix)
+    {
+        import core.stdc.stdio : fflush, stdout;
+        import core.sys.posix.unistd : dup2, close;
+
+        if (!g.active)
+            return;
+        fflush(stdout);
+        dup2(g.saved, 1);
+        close(g.saved);
+        g.saved = -1;
+        g.active = false;
+    }
+}
+
+void serverInit(ref ServerState s, string[] imports, string[] stringImports = null,
+    string[] flags = null)
+{
+    s.dmd.importPaths = imports;
+    s.dmd.stringPaths = stringImports;
+    s.dmd.flags = flags;
+    dmdInit(s.dmd);
+}
+
+void serverShutdown(ref ServerState s)
+{
+    dmdDeinit(s.dmd);
+    s.scratch.freeAll();
+    s.session.perm.freeAll();
+}
+
+struct Analysis
+{
+    void* module_ = null; // opaque dmd Module* (post-semantic)
+    bool ok = false;
+    uint errors = 0;
+    DiagMsg[] diags;
+    LintOut lintImports;
+    LintOut lintParams;
+    SynMod syn; // pre-semantic structure snapshot (see dmdwrap)
+}
+
+// Pin lint hits into the long-lived perm arena: scratch is reset per
+// request and dmd-owned strings die with their universe + GC.collect().
+private void pinLint(ref Session session, ref LintOut o)
+{
+    if (!o.nhits)
+        return;
+    UnusedHit* p = cast(UnusedHit*)session.perm.alloc(o.nhits * UnusedHit.sizeof);
+    if (!p)
+    {
+        o.nhits = 0;
+        return;
+    }
+    for (size_t i = 0; i < o.nhits; i++)
+    {
+        p[i] = o.hits[i];
+        p[i].path = permDup(session, o.hits[i].path);
+        p[i].name = permDup(session, o.hits[i].name);
+    }
+    o.hits = p;
+    o.capHits = o.nhits;
+}
+
+private string permDup(ref Session session, const(char)[] s)
+{
+    char* p = cast(char*)session.perm.alloc(s.length + 1);
+    if (!p)
+        return null;
+    p[0 .. s.length] = s[];
+    p[s.length] = 0;
+    return cast(string)(p[0 .. s.length]);
+}
+
+// Live-universe cache: the last analysis whose dmd state is still alive.
+// A hit (same root text, same dep bytes, same config) returns the cached
+// analysis with zero dmd work — completions/codeActions after a change
+// analysis are ~free. Anything else rebuilds via dmdResetRequest.
+// NOTE: there is deliberately no "re-parse only the changed root" path:
+// dmd interns canonical types by mangled deco (typesem merge), so a fresh
+// declaration with the same FQN as a live one collides ("already exists"),
+// and template instantiations over root-local types would silently reuse
+// stale instances (or leak). Module-level eviction is unsound without
+// dmd-side type-table support; full reset on dirty is the sound granularity.
+struct Universe
+{
+    bool valid = false;
+    string rootPath;
+    ulong rootHash; // fnv1a64 of the document (identity) text
+    // The text actually parsed. Equals rootHash's text normally; differs
+    // when a completion built the universe from a trailing-dot placeholder
+    // while still keying on the real document text (so the debounced
+    // analyze for that same text is a hit, not a second worker build).
+    ulong analysisHash;
+    DepRec[] deps; // disk fingerprints of loaded deps (root excluded)
+    ulong configGen; // DmdState.configGen at record time
+    Arena.Mark mark; // scratch high-water after analysis
+    Analysis analysis; // module_/syn live while no reset happened since
+}
+
+// True when serverAnalyze would serve `path`/`text` from the live universe
+// without any dmd work. Used by the worker to decide whether a request can
+// be served in-process or requires a fresh worker.
+bool serverWouldHit(ref ServerState s, const(char)[] path, const(char)[] text)
+{
+    import session : fnv1a64;
+
+    ulong h = fnv1a64(cast(const(ubyte)[])text);
+    return s.uni.valid && s.uni.configGen == s.dmd.configGen &&
+        s.uni.rootPath == path && s.uni.rootHash == h &&
+        !universeDepsChanged(s.uni.deps);
+}
+
+// Hit check for a request that needs a specific *analysis* text (completion
+// parses a trailing-dot placeholder, keyed on the real document text).
+bool serverWouldHitAnalysis(ref ServerState s, const(char)[] path,
+    const(char)[] identity, const(char)[] analysis)
+{
+    import session : fnv1a64;
+
+    return serverWouldHit(s, path, identity) &&
+        s.uni.analysisHash == fnv1a64(cast(const(ubyte)[])analysis);
+}
+
+// Full pipeline for one root file. Two levels:
+//   hit:  inputs identical to the live universe — return cached analysis.
+//   full: anything else — fresh universe via dmdResetRequest.
+// Structure is snapshotted between parse and semantic because semantic
+// rewrites bodies in place (failed statements propagate ErrorStatement
+// up to fbody).
+// `identity` is the document text the universe is keyed on; `text` is what
+// is actually parsed. They differ only for a trailing-dot completion, where
+// `text` is the placeholder variant. Defaults to identity == text.
+Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text,
+    const(char)[] identity = null)
+{
+    import session : fnv1a64;
+
+    auto id = identity is null ? text : identity;
+    ulong h = fnv1a64(cast(const(ubyte)[])id);
+    if (s.uni.valid && s.uni.configGen == s.dmd.configGen &&
+        s.uni.rootPath == path && s.uni.rootHash == h &&
+        !universeDepsChanged(s.uni.deps))
+    {
+        s.scratch.rewind(s.uni.mark);
+        return s.uni.analysis;
+    }
+    Analysis a;
+    s.scratch.reset();
+    dmdResetRequest(s.dmd, &s.sink);
+    StdoutGuard og;
+    stdoutToStderr(og);
+    auto pr = dmdParseOnly(path, text);
+    if (pr.ok && pr.module_)
+        a.syn = snapshotModule(cast(Module)pr.module_);
+    auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
+    stdoutRestore(og);
+    a.module_ = pr.module_;
+    a.ok = pr.ok;
+    a.errors = errs;
+    a.diags = s.sink.msgs;
+    if (pr.ok && pr.module_)
+    {
+        auto mod = cast(Module)pr.module_;
+        lintUnusedImports(&s.scratch, mod, path, text, errs != 0, a.lintImports);
+        lintUnusedParams(&s.scratch, mod, path, text, errs != 0, a.lintParams);
+        pinLint(s.session, a.lintImports);
+        pinLint(s.session, a.lintParams);
+    }
+    if (id !is text)
+        mapFixDiags(a.diags, id, text);
+    // Record the live universe for hit requests.
+    s.uni.valid = true;
+    s.uni.rootPath = path.idup;
+    s.uni.rootHash = h;
+    s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
+    universeRecord(s.uni.deps, path);
+    s.uni.configGen = s.dmd.configGen;
+    s.uni.mark = s.scratch.mark();
+    s.uni.analysis = a;
+    // Reclaim dmd GC garbage so the daemon stays flat.
+    GC.collect();
+    return a;
+}
+
+// The placeholder is a pure insertion at the cursor. Diagnostics it
+// produces beyond that point carry shifted columns on the fix line (the
+// inserted text has no newline, so line numbers are unaffected). Rewrite
+// the diagnostics in place to document coordinates.
+private void mapFixDiags(ref DiagMsg[] diags, const(char)[] doc, const(char)[] parsed)
+{
+    if (parsed.length <= doc.length)
+        return; // only a pure insertion is expected here
+    size_t p = 0;
+    while (p < doc.length && doc[p] == parsed[p])
+        p++;
+    if (p == doc.length)
+        return; // insertion is at the very end: no positions shift
+    size_t insLen = parsed.length - doc.length;
+    uint fixLine = 1;
+    uint fixCol = 1;
+    for (size_t i = 0; i < p; i++)
+    {
+        if (doc[i] == '\n')
+        {
+            fixLine++;
+            fixCol = 1;
+        }
+        else
+            fixCol++;
+    }
+    size_t w = 0;
+    foreach (ref d; diags)
+    {
+        if (d.line == fixLine && d.col >= fixCol)
+        {
+            if (d.col < fixCol + insLen)
+                continue; // diagnostic inside the inserted placeholder
+            d.col -= cast(uint)insLen;
+        }
+        diags[w++] = d;
+    }
+    diags.length = w;
+}
+
+void serverOnOpen(ref ServerState s, const(char)[] path, const(char)[] text)
+{
+    sessionOpen(s.session, path, text);
+}
+
+void serverOnChange(ref ServerState s, const(char)[] path, const(char)[] text)
+{
+    sessionUpdate(s.session, path, text);
+}
+
+void serverOnClose(ref ServerState s, const(char)[] path)
+{
+    sessionClose(s.session, path);
+}
