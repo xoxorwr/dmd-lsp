@@ -51,6 +51,20 @@ void on_value()
         type:
     };
 }
+
+void on_shadow()
+{
+    if (true)
+    {
+        Event e1;
+        e1.
+    }
+    if (true)
+    {
+        Vec2 e1;
+        e1.width = 1;
+    }
+}
 '''
 
 os.makedirs(SRC)
@@ -154,6 +168,12 @@ check('struct-init-fields', labels == ['consumed'], str(labels))
 vl = line_of('type:')
 labels = complete(vl, len(lines[vl]))
 check('struct-init-value-normal', 'Event' in labels and 'consumed' not in labels,
+      str(sorted(set(labels))[:8]))
+
+# 6) a sibling block's same-named variable must not shadow the cursor's own.
+sl = line_of('e1.')
+labels = complete(sl, len(lines[sl]))
+check('scope-shadowing', 'resize' in labels and 'width' not in labels,
       str(sorted(set(labels))[:8]))
 
 proc.stdin.close()

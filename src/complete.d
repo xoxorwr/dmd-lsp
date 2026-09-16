@@ -792,6 +792,21 @@ const(SynFunc)* synFuncAt(const ref SynMod m, uint line)
     return best;
 }
 
+// Update an already-listed item's type in place. Used when a later local
+// declaration shadows an earlier same-named one: the nearer type must win.
+private void replaceLocalType(Arena* a, ref CompleteOut o, const(char)[] nm,
+    const(char)[] typeText)
+{
+    for (size_t i = 0; i < o.nitems; i++)
+        if (o.items[i].label == nm)
+        {
+            o.items[i].detail = arenaDupStr(a, typeText);
+            o.items[i].labelDesc = arenaDupStr(a, typeText);
+            o.items[i].labelDetail = null;
+            return;
+        }
+}
+
 private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
     VarDeclaration vd, uint cursorLine, const(char)[] prefix)
 {
@@ -804,6 +819,11 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
         return;
     if (nm == "this" || nm == "super" || nm == "_")
         return;
+    if (nm in seen)
+    {
+        replaceLocalType(a, o, nm, typeDetail(vd.type));
+        return;
+    }
     pushItem(a, o, nm, 6, typeDetail(vd.type), docOf(vd), "0", seen, vd);
 }
 
@@ -850,9 +870,15 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         walkStmt(ss.statement, cur, cursorLine, prefix, a, o, seen);
         return;
     }
+    // Descend only into the branch/body that contains the cursor, so a
+    // sibling block's same-named variable isn't listed as in scope.
     if (auto is_ = s.isIfStatement())
     {
-        if (is_.param && is_.param.ident)
+        uint end = is_.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
+        if (is_.param && is_.param.ident && is_.ifbody &&
+            cursorLine >= is_.ifbody.loc.linnum())
         {
             const(char)[] inm = is_.param.ident.toString();
             if (hasPrefix(inm, prefix))
@@ -860,12 +886,18 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         }
         if (is_.match)
             addLocal(a, o, seen, is_.match, cursorLine, prefix);
-        walkStmt(is_.ifbody, cur, cursorLine, prefix, a, o, seen);
-        walkStmt(is_.elsebody, cur, cursorLine, prefix, a, o, seen);
+        uint elseStart = is_.elsebody ? is_.elsebody.loc.linnum() : 0;
+        if (elseStart != 0 && cursorLine >= elseStart)
+            walkStmt(is_.elsebody, cur, cursorLine, prefix, a, o, seen);
+        else
+            walkStmt(is_.ifbody, cur, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto ws = s.isWhileStatement())
     {
+        uint end = ws.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (ws.param && ws.param.ident)
         {
             const(char)[] wnm = ws.param.ident.toString();
@@ -877,17 +909,25 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
     }
     if (auto ds = s.isDoStatement())
     {
-        walkStmt(ds._body, cur, cursorLine, prefix, a, o, seen);
+        uint end = ds.endloc.linnum();
+        if (end == 0 || cursorLine <= end)
+            walkStmt(ds._body, cur, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto fs = s.isForStatement())
     {
+        uint end = fs.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         walkStmt(fs._init, cur, cursorLine, prefix, a, o, seen);
         walkStmt(fs._body, cur, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto fes = s.isForeachStatement())
     {
+        uint end = fes.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (fes.parameters)
             foreach (i; 0 .. fes.parameters.length)
             {
@@ -908,6 +948,9 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
     }
     if (auto sw = s.isSwitchStatement())
     {
+        uint end = sw.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (sw.param && sw.param.ident)
         {
             const(char)[] snm = sw.param.ident.toString();
@@ -934,11 +977,19 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
     }
     if (auto tc = s.isTryCatchStatement())
     {
-        walkStmt(tc._body, cur, cursorLine, prefix, a, o, seen);
+        uint bodyEnd = tc.catches && (*tc.catches).length
+            ? (*tc.catches)[0].handler.loc.linnum() : 0;
+        if (bodyEnd == 0 || cursorLine < bodyEnd)
+            walkStmt(tc._body, cur, cursorLine, prefix, a, o, seen);
         if (tc.catches)
             foreach (i; 0 .. (*tc.catches).length)
             {
                 auto c = (*tc.catches)[i];
+                uint hs = c.handler ? c.handler.loc.linnum() : 0;
+                uint he = i + 1 < (*tc.catches).length
+                    ? (*tc.catches)[i + 1].handler.loc.linnum() : 0;
+                if (hs == 0 || cursorLine < hs || (he != 0 && cursorLine >= he))
+                    continue;
                 if (c.var)
                     addLocal(a, o, seen, c.var, cursorLine, prefix);
                 walkStmt(c.handler, cur, cursorLine, prefix, a, o, seen);
@@ -953,6 +1004,9 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
     }
     if (auto w = s.isWithStatement())
     {
+        uint end = w.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (w.prm && w.prm.ident)
         {
             const(char)[] wnm = w.prm.ident.toString();
@@ -1122,18 +1176,20 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
     {
         if (v.name == baseName(segs[0]))
         {
+            // A later declaration with the same name shadows an earlier one;
+            // slots are in source order, so keep the last match.
             shadowed = true;
-            curMembers = followTypeDepth(v.type, root, rootMembers, depth + 1);
-            if (!curMembers.length && v.typeName.length)
+            auto cm = followTypeDepth(v.type, root, rootMembers, depth + 1);
+            if (!cm.length && v.typeName.length)
             {
                 // Unresolved (pre-semantic) type name: scope lookup.
                 auto m = findMember(rootMembers, v.typeName);
                 if (!m)
                     m = findImportMember(root, v.typeName);
                 if (m)
-                    curMembers = stepInto(m, depth + 1, root, rootMembers);
+                    cm = stepInto(m, depth + 1, root, rootMembers);
             }
-            break;
+            curMembers = cm;
         }
     }
     if (!shadowed)
@@ -1348,16 +1404,30 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
         collectSemSlots(ss.statement, cursorLine, r);
         return;
     }
+    // For all of the following, descend only into the branch/body that
+    // contains the cursor (by line range), so a sibling block's variable
+    // with the same name is not offered as if it were in scope.
     if (auto is_ = s.isIfStatement())
     {
-        if (is_.param && is_.param.ident)
+        uint end = is_.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return; // past the whole if/else
+        // The condition variable is in scope in both arms.
+        if (is_.param && is_.param.ident && is_.ifbody &&
+            cursorLine >= is_.ifbody.loc.linnum())
             r ~= NameType(is_.param.ident.toString(), is_.param.type, null, null);
-        collectSemSlots(is_.ifbody, cursorLine, r);
-        collectSemSlots(is_.elsebody, cursorLine, r);
+        uint elseStart = is_.elsebody ? is_.elsebody.loc.linnum() : 0;
+        if (elseStart != 0 && cursorLine >= elseStart)
+            collectSemSlots(is_.elsebody, cursorLine, r);
+        else
+            collectSemSlots(is_.ifbody, cursorLine, r);
         return;
     }
     if (auto ws = s.isWhileStatement())
     {
+        uint end = ws.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (ws.param && ws.param.ident)
             r ~= NameType(ws.param.ident.toString(), ws.param.type, null, null);
         collectSemSlots(ws._body, cursorLine, r);
@@ -1365,17 +1435,25 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     }
     if (auto ds = s.isDoStatement())
     {
-        collectSemSlots(ds._body, cursorLine, r);
+        uint end = ds.endloc.linnum();
+        if (end == 0 || cursorLine <= end)
+            collectSemSlots(ds._body, cursorLine, r);
         return;
     }
     if (auto fs = s.isForStatement())
     {
+        uint end = fs.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         collectSemSlots(fs._init, cursorLine, r);
         collectSemSlots(fs._body, cursorLine, r);
         return;
     }
     if (auto fes = s.isForeachStatement())
     {
+        uint end = fes.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (fes.parameters)
             foreach (i; 0 .. fes.parameters.length)
             {
@@ -1392,6 +1470,9 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     }
     if (auto sw = s.isSwitchStatement())
     {
+        uint end = sw.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (sw.param && sw.param.ident)
             r ~= NameType(sw.param.ident.toString(), sw.param.type, null, null);
         collectSemSlots(sw._body, cursorLine, r);
@@ -1405,11 +1486,19 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     }
     if (auto tc = s.isTryCatchStatement())
     {
-        collectSemSlots(tc._body, cursorLine, r);
+        uint bodyEnd = tc.catches && (*tc.catches).length
+            ? (*tc.catches)[0].handler.loc.linnum() : 0;
+        if (bodyEnd == 0 || cursorLine < bodyEnd)
+            collectSemSlots(tc._body, cursorLine, r);
         if (tc.catches)
             foreach (i; 0 .. (*tc.catches).length)
             {
                 auto c = (*tc.catches)[i];
+                uint hs = c.handler ? c.handler.loc.linnum() : 0;
+                uint he = i + 1 < (*tc.catches).length
+                    ? (*tc.catches)[i + 1].handler.loc.linnum() : 0;
+                if (hs == 0 || cursorLine < hs || (he != 0 && cursorLine >= he))
+                    continue;
                 if (c.var && c.var.ident)
                     r ~= NameType(c.var.ident.toString(), c.var.type, null, c.var);
                 collectSemSlots(c.handler, cursorLine, r);
@@ -1418,6 +1507,9 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
     }
     if (auto w = s.isWithStatement())
     {
+        uint end = w.endloc.linnum();
+        if (end != 0 && cursorLine > end)
+            return;
         if (w.prm && w.prm.ident)
             r ~= NameType(w.prm.ident.toString(), w.prm.type, null, null);
         collectSemSlots(w._body, cursorLine, r);
@@ -1476,12 +1568,23 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             string tn = pi < sfn.paramTypes.length ? sfn.paramTypes[pi] : null;
             slots ~= NameType(pn, null, tn, null);
         }
+        // Snapshot has no block scopes (body collapsed), so keep the nearest
+        // declaration per name (line <= cursor).
+        string[const(char)[]] synType;
+        uint[const(char)[]] synLine;
         foreach (ref vl; sfn.vars)
         {
-            if (vl.line > line || has(vl.name))
+            if (vl.line > line)
                 continue;
-            slots ~= NameType(vl.name, null, vl.typeName, null);
+            if (auto p = vl.name in synLine)
+                if (*p >= vl.line)
+                    continue;
+            synLine[vl.name] = vl.line;
+            synType[vl.name] = vl.typeName;
         }
+        foreach (name, tn; synType)
+            if (!has(name))
+                slots ~= NameType(name, null, tn, null);
     }
 }
 
@@ -1882,10 +1985,7 @@ private Dsymbol resolveChain(Module mod, const(char)[] chain, Dsymbol[] rootMemb
     {
         foreach (v; locals)
             if (v.sym && v.name == segs[0])
-            {
-                sym = v.sym;
-                break;
-            }
+                sym = v.sym; // last (nearest) declaration shadows earlier ones
         if (!sym && fd && fd.ident && fd.ident.toString() == segs[0])
             sym = fd; // recursive call
         if (!sym)
@@ -2573,14 +2673,17 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     tn = i < sfn.paramTypes.length ? sfn.paramTypes[i] : null;
                 pushItem(arena, out_, pn, 6, "parameter", null, "0", seen, null, tn);
             }
+            // Snapshot vars are in source order; a later same-named one
+            // shadows an earlier one, so keep the nearest per name.
+            string[const(char)[]] nearest;
             foreach (ref vl; sfn.vars)
+                if (vl.line <= ctx.line)
+                    nearest[vl.name] = vl.typeText.length ? vl.typeText : vl.typeName;
+            foreach (name, tn; nearest)
             {
-                if (vl.line > ctx.line || vl.name in seen)
+                if (name in seen || !hasPrefix(name, prefix))
                     continue;
-                if (!hasPrefix(vl.name, prefix))
-                    continue;
-                pushItem(arena, out_, vl.name, 6, "local", null, "0", seen, null,
-                    vl.typeText.length ? vl.typeText : vl.typeName);
+                pushItem(arena, out_, name, 6, "local", null, "0", seen, null, tn);
             }
         }
     }
