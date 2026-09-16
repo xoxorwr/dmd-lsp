@@ -165,6 +165,104 @@ uint dmdSemantic(void* modp)
     return global.errors;
 }
 
+// Reset the error counters (and nothing else) so an incremental re-analysis
+// can be measured the same way dmdResetRequest measures a full one. Does not
+// touch the live universe.
+void dmdResetCounters()
+{
+    import dmd.globals : global;
+
+    global.errors = 0;
+    global.warnings = 0;
+    global.gaggedErrors = 0;
+    global.gag = 0;
+}
+
+private bool containsSlice(const(char)[] hay, const(char)[] needle) pure nothrow @nogc @safe
+{
+    if (needle.length == 0 || hay.length < needle.length)
+        return false;
+    foreach (i; 0 .. hay.length - needle.length + 1)
+        if (hay[i .. i + needle.length] == needle)
+            return true;
+    return false;
+}
+
+// Evict a module from the live universe so the same module name can be
+// parsed again without collisions (incremental root re-analysis). Removes
+// the module from its package symbol table and the global registries, and
+// drops every interned type whose deco mentions the module's length-prefixed
+// FQN token (`dmd.a` -> `3dmd1a`) — that covers types declared inside
+// function bodies, which walking the members would miss. The dependency
+// closure is left untouched.
+void dmdEvictRoot(void* modp)
+{
+    import dmd.dmodule : Module, Package;
+    import dmd.dsymbol : Dsymbol;
+    import dmd.mtype : Type;
+    import dmd.root.stringtable : StringValue;
+    import dmd.root.aav : AssocArray;
+
+    if (!modp)
+        return;
+    auto m = cast(Module)modp;
+
+    // Build the mangled FQN token: each component as decimal length + bytes.
+    auto fqn = m.toPrettyChars();
+    size_t flen = 0;
+    while (fqn[flen])
+        flen++;
+    char[] tok;
+    for (size_t start = 0; start <= flen;)
+    {
+        size_t dot = start;
+        while (dot < flen && fqn[dot] != '.')
+            dot++;
+        size_t v = dot - start;
+        char[24] nb = void;
+        size_t ni = nb.length;
+        if (v == 0)
+            nb[--ni] = '0';
+        while (v)
+        {
+            nb[--ni] = cast(char)('0' + v % 10);
+            v /= 10;
+        }
+        tok ~= nb[ni .. $];
+        tok ~= fqn[start .. dot];
+        if (dot == flen)
+            break;
+        start = dot + 1;
+    }
+
+    // Null the symbol table entry that holds the module (package.d uses a
+    // wrapping Package; a package-less module lives in Module.modules).
+    if (auto par = m.parent)
+    {
+        if (auto p = par.isPackage())
+        {
+            if (p.symtab)
+            {
+                auto pv = p.symtab.tab.getLvalue(m.ident);
+                if (pv && *pv is m)
+                    *pv = null;
+            }
+        }
+    }
+    if (auto pv = Module.modules.tab.getLvalue(m.ident))
+        if (pv && *pv is m)
+            *pv = null;
+    foreach (i, mm; Module.amodules)
+        if (mm is m)
+        {
+            Module.amodules.remove(i);
+            break;
+        }
+
+    Type.stringtable.removeWhere((const(StringValue!Type)* sv)
+        => containsSlice(sv.toString(), tok));
+}
+
 // Apply a supported subset of dmd command-line flags so analysis matches
 // the project's real build (previews/versions change overload resolution,
 // version blocks and template constraints). Unknown flags are ignored.

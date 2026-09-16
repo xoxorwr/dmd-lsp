@@ -82,10 +82,14 @@ loads at `initialize` and on save; the VS Code extension can write one via
 
 ## How it works
 
-Analysis runs in a **forked worker, one dmd universe per worker**: the front
-end holds no dmd state, a worker does exactly one full build and serves cache
-hits from it, and on any input change it respawns, so nothing accumulates
-(dmd's process globals cannot be reset in-process). Inside a worker,
+Analysis runs in a **forked worker that keeps one dmd universe warm**: the
+front end holds no dmd state, and the OS reclaims a discarded universe
+wholesale (dmd's process globals cannot be reset in-process). On an edit the
+worker forks a child over its warm universe (copy-on-write); the child evicts
+the old root module and its types and re-analyzes only the new root — the
+~330 ms dependency closure is not rebuilt — then answers and exits, so its
+mutations never reach the warm process. Any change that touches the closure
+(dependency/config/root) respawns the worker instead. Inside a worker,
 identical inputs (root text + dep disk bytes + config) hit the universe cache
 for free; diagnostics are debounced, and completion/signature help reuse the
 live universe. While you type broken code, completion analyses a neutralised

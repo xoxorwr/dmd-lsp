@@ -126,12 +126,14 @@ private string permDup(ref Session session, const(char)[] s)
 // A hit (same root text, same dep bytes, same config) returns the cached
 // analysis with zero dmd work — completions/codeActions after a change
 // analysis are ~free. Anything else rebuilds via dmdResetRequest.
-// NOTE: there is deliberately no "re-parse only the changed root" path:
-// dmd interns canonical types by mangled deco (typesem merge), so a fresh
-// declaration with the same FQN as a live one collides ("already exists"),
-// and template instantiations over root-local types would silently reuse
-// stale instances (or leak). Module-level eviction is unsound without
-// dmd-side type-table support; full reset on dirty is the sound granularity.
+// The "re-parse only the changed root" path exists but is deliberately kept
+// in a disposable fork child (serverAnalyzeIncremental): it evicts the old
+// root module and every interned type whose deco mentions the module's
+// mangled FQN token, which is what avoids the "module specified twice" /
+// "already exists" collisions a plain re-parse would hit. It mutates and
+// leaks the universe (the conservative GC cannot reclaim the evicted root),
+// so it must never run in the long-lived warm process — only in a child that
+// exits. A dependency/config/root change always takes the full-reset path.
 struct Universe
 {
     bool valid = false;
@@ -177,6 +179,92 @@ bool serverWouldHitAnalysis(ref ServerState s, const(char)[] path,
         s.uni.rootPath == path &&
         s.uni.analysisHash == fnv1a64(cast(const(ubyte)[])analysis) &&
         !universeDepsChanged(s.uni.deps);
+}
+
+enum UniState : ubyte
+{
+    miss,        // different root/config/deps: needs a fresh universe
+    reuse,       // identical inputs: serve the warm analysis
+    incremental, // same root/config/deps, root text moved: fork a child
+}
+
+// Classify a request against the live universe. `identity` is the document
+// text the universe must be rooted on (matches rootHash); `analysis` is the
+// exact buffer that must have been parsed (matches analysisHash), or null to
+// ignore it. Passing null for identity (completion) avoids a false reuse when
+// only the neutralised text, not the document, is unchanged. The dependency
+// fingerprint is checked at most once per request.
+UniState serverUniState(ref ServerState s, const(char)[] path,
+    const(char)[] identity, const(char)[] analysis)
+{
+    import session : fnv1a64;
+
+    if (!s.uni.valid || s.uni.configGen != s.dmd.configGen ||
+        s.uni.rootPath != path)
+        return UniState.miss;
+    // A dependency change on disk invalidates the closure even when the root
+    // text is identical, so it must be checked before declaring reuse.
+    if (universeDepsChanged(s.uni.deps))
+        return UniState.miss;
+    if (analysis !is null &&
+        s.uni.analysisHash == fnv1a64(cast(const(ubyte)[])analysis))
+        return UniState.reuse;
+    if (identity !is null &&
+        s.uni.rootHash == fnv1a64(cast(const(ubyte)[])identity))
+        return UniState.reuse;
+    // Same root, config and deps: only the root's text moved, which the fork
+    // child can re-analyze on the warm closure.
+    return UniState.incremental;
+}
+
+// Re-analyse only the root on top of the live dependency closure: evict the
+// previous root module (and its interned types) so re-parsing the same module
+// name cannot collide, then parse/semantic the new text without a universe
+// reset. This is ~10x cheaper than a full build (only the root is processed)
+// and is meant to run in a disposable fork child: it mutates the universe
+// (leaking the evicted root), so the changes must not reach the parent.
+Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
+    const(char)[] text, const(char)[] identity)
+{
+    import session : fnv1a64;
+
+    auto id = identity is null ? text : identity;
+    dmdEvictRoot(s.uni.analysis.module_);
+    s.scratch.reset();
+    s.sink.reset();
+    dmdResetCounters();
+    Analysis a;
+    StdoutGuard og;
+    stdoutToStderr(og);
+    auto pr = dmdParseOnly(path, text);
+    if (pr.ok && pr.module_)
+        a.syn = snapshotModule(cast(Module)pr.module_);
+    auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
+    stdoutRestore(og);
+    a.module_ = pr.module_;
+    a.ok = pr.ok;
+    a.errors = errs;
+    a.diags = s.sink.msgs;
+    if (pr.ok && pr.module_)
+    {
+        auto mod = cast(Module)pr.module_;
+        lintUnusedImports(&s.scratch, mod, path, text, errs != 0, a.lintImports);
+        lintUnusedParams(&s.scratch, mod, path, text, errs != 0, a.lintParams);
+        pinLint(s.session, a.lintImports);
+        pinLint(s.session, a.lintParams);
+    }
+    if (id !is text)
+        mapFixDiags(a.diags, id, text);
+    s.uni.valid = true;
+    s.uni.rootPath = path.idup;
+    s.uni.rootHash = fnv1a64(cast(const(ubyte)[])id);
+    s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
+    universeRecord(s.uni.deps, path);
+    s.uni.configGen = s.dmd.configGen;
+    s.uni.mark = s.scratch.mark();
+    s.uni.analysis = a;
+    // Deliberately no GC.collect(): the caller is a fork child that exits.
+    return a;
 }
 
 // Full pipeline for one root file. Two levels:

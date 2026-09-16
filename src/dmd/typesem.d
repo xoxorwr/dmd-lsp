@@ -4933,10 +4933,12 @@ Type merge2(Type type)
     {
         t = sv.value;
         assert(t.deco);
+        return t;
     }
-    else
-        assert(0);
-    return t;
+    // The table entry is gone (an incremental re-analysis evicted it) while
+    // `t` still carries its deco. Clear it and merge anew instead of aborting.
+    t.deco = null;
+    return t.merge();
 }
 
 private enum LOGDEFAULTINIT = 0;

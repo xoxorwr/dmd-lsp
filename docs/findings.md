@@ -169,15 +169,27 @@ That last one is the real blocker: a correct implementation must satisfy
 druntime's full array **and** AA block contract, which is a proper GC port,
 not a bump allocator with a header.
 
-## 6. Current solution: worker isolation
+## 6. Current solution: warm worker + fork per root edit
 
 Process isolation avoids the whole class of problems: the parent holds no
-dmd state, and a forked worker does exactly one universe (then serves cache
-hits). On invalidation it replies `needRespawn`; the parent kills it and the
-OS reclaims everything. Results crossing the boundary are plain data.
+dmd state, and the OS reclaims a discarded universe wholesale. The worker
+builds one universe (dependency closure + root) and keeps it warm. On a
+**root-text-only** edit it forks a child over the warm universe: the child
+evicts the previous root module and its interned types, re-analyzes only the
+new root, answers and exits. The eviction leak (§4.3) and the mutations die
+with the child; the warm universe is untouched. On any other invalidation
+(dependency/config/root change) the worker replies `needRespawn` and is
+replaced. Results crossing the boundary are plain data.
 
-- Parent RSS flat (~16 MB) across dozens of rebuilds; 40 rebuilds leak-free.
-- Hit latency preserved (worker keeps its universe).
+- Per-edit cost on the dmd frontend: ~420 ms full build → ~43 ms incremental
+  re-analysis in-process (~110 ms once fork/COW and the completion work are
+  included). The closure (`importAll` + `dsymbolSemantic` over ~200 modules,
+  ~330 ms) is never re-run.
+- Parent RSS flat; the worker keeps exactly one warm universe; children are
+  short-lived (reaped by `waitpid`).
+- Eviction works only because `removeWhere` keeps the string pools alive
+  (§7 patch 4): `Type.deco` points into the pool, so rebuilding the strings
+  would dangle every surviving type.
 - Portability caveat: `fork`/`socketpair` are POSIX-only; WASM has no
   processes (its cheap isolation primitive is a fresh module instance).
 
@@ -189,6 +201,12 @@ OS reclaims everything. Results crossing the boundary are plain data.
    struct; `string[]` import paths). Consumer std closure 58 → ~13 modules.
 3. `identifier.d` + `tokens.d` + `frontend.d`: reset the identifier pool in
    `deinitializeDMD` (§3).
+4. `root/stringtable.d`: `removeWhere` — compact the hash slots of a
+   `StringTable` without freeing its pools (a plain null-out would break
+   quadratic probing; rebuilding the strings would dangle `Type.deco`, which
+   points into the pool). Enables type eviction for incremental re-analysis.
+5. `typesem.d`: `merge2` fallback — when a type still carries `deco` but its
+   table entry was evicted, clear `deco` and `merge()` instead of `assert(0)`.
 
 Until these land, `dmd-lsp` vendors the exact frontend closure under
 `src/dmd/` (refresh with `make vendor`), so the shipped build is

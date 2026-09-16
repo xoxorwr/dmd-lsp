@@ -1,10 +1,10 @@
 import json, subprocess, sys, time, os
 
-# Completion parses a neutralised buffer that can't share the main
-# (real-text) universe, so it runs in its own worker. A version that needs a
-# placeholder therefore costs one build per worker: didOpen's main build,
-# the completion worker's build, and the debounced main build for the real
-# text. The regression this guards against is a per-keystroke rebuild loop.
+# The worker is spawned once and keeps the dependency closure warm. A root
+# edit is re-analysed in a fork child (copy-on-write, exits after answering),
+# so completions, the debounced analyze, hover and definition after an edit
+# must never spawn another worker. The regression guarded here is a
+# per-edit worker rebuild (and a stale warm universe that ignores the edit).
 
 BIN = './dmd-lsp'
 URI = 'file:///tmp/spawntest.d'
@@ -84,6 +84,21 @@ dfn = read_msg()['result']
 check('definition-reuses',
       dfn is not None and dfn[0]['range']['start']['line'] == 1, str(dfn))
 
+# A semantic root edit must be picked up by the fork child (the warm parent
+# still holds the pre-edit root): the added field has to show up.
+v2 = v1.replace('int y; }', 'int y; int z; }')
+send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+      "params": {"textDocument": {"uri": URI, "version": 3},
+                 "contentChanges": [{"text": v2}]}})
+send({"jsonrpc": "2.0", "id": 6, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": URI}, "position": {"line": 5, "character": 6}}})
+while True:
+    msg = read_msg()
+    if msg.get('id') == 6:
+        break
+labels = [i['label'] for i in msg['result']['items']]
+check('edit-reflected', labels == ['x', 'y', 'z'], str(labels))
+
 send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
@@ -92,9 +107,9 @@ proc.wait(timeout=5)
 errf.close()
 
 spawns = sum(1 for line in open(TRACE) if 'spawn' in line)
-# didOpen's main build + the completion worker's build + the debounced main
-# build for the real v1. More than this means a rebuild loop.
-check('builds-not-ping-pong', spawns <= 3, 'spawns=%d' % spawns)
+# Exactly one worker: didOpen's build warms it, and everything after runs in
+# fork children. More than one means the edit path still rebuilds a worker.
+check('warm-worker-reused', spawns == 1, 'spawns=%d' % spawns)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

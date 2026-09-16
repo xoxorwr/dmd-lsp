@@ -20,28 +20,38 @@ How `dmd-lsp` works and the conventions it is built on.
 - Toolchain targets the 2.113.0 line (never system dmd). LDC's `ldmd2` is
   supported (`make DC=ldmd2`) and is what CI/nightlies use.
 
-## Memory model: one universe per worker
+## Memory model: a warm worker, fork per edit
 
 The LSP front end holds no dmd state — only session docs, config and the
-debounce bookkeeping. **Analysis runs in a forked worker process, one
+debounce bookkeeping. **Analysis runs in a forked worker process, one warm
 universe per worker** (`worker.d`).
 
 dmd's process-global state is never fully reset by `deinitializeDMD` (it is
 written for one-shot compiler runs): reusing one universe across rebuilds
 retained a whole module graph per rebuild (~140 MB/request, growing without
-bound). A worker performs exactly **one** full build and then serves cache
-hits from it; on any invalidation it replies `needRespawn` and the parent
-kills it and forks a fresh one, so nothing accumulates and the OS reclaims
-everything on exit. Bounded to ~one universe.
+bound). So the process is the isolation boundary: a worker builds one
+universe and the OS reclaims it wholesale when it is discarded.
+
+The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
+~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies), and it is identical
+on every keystroke. The worker keeps it warm. A root edit then does not
+rebuild: the worker `fork`s a child over the warm universe (copy-on-write),
+the child **evicts the previous root module and its interned types** and
+re-analyzes only the new root (~43 ms for the same frontend), writes its
+response and exits. Its mutations, and the memory that eviction cannot
+reclaim under the conservative GC, die with it — the warm process is never
+touched. A dependency, config or root-path change still replies `needRespawn`
+and the parent forks a fresh worker. Bounded to ~one warm universe plus one
+short-lived child per request.
 
 One worker serves everything. A neutralised (completion) parse and a real
 (diagnostics/semantic) parse cannot coexist in one process's dmd globals, so
 the universe records which buffer it parsed (`analysisHash`) and which
-document version it was keyed to (`rootHash`). Completion reuses it when the
-neutralised text matches and **refreshes `rootHash` to the current document
-version**; the debounced analyze and the symbol/token requests then hit the
-same universe by identity instead of evicting it. That keeps a typing burst
-on one universe (see *Neutralised variants*).
+document version it was keyed to (`rootHash`). Because the warm process is
+never mutated, the hash bookkeeping cannot make a post-edit request cheap by
+rebuilding in place — it only decides whether a request is served from the
+warm universe without a fork at all (e.g. repeated symbol requests on the
+same neutralised text). See *Neutralised variants*.
 
 The isolation decision (measurements, the identifier-pool bug, eviction
 experiments, a region-GC spike) is written up in
@@ -99,17 +109,20 @@ experiments, a region-GC spike) is written up in
 
 ## Universe cache
 
-Inside a worker the universe stays alive (`server.Universe`): a request with
-identical inputs — same root text (`fnv1a64`), same dep disk bytes (hashes
-recorded from `Module.src`), same config generation — is served with zero
-dmd work. Completions/codeActions after an analysis are cheap (measured
-13×: 33 ms vs 427 ms on the 378 KB stress file); the residual cost is piping
-the document to the worker. Anything else is a miss and triggers a respawn.
+The warm universe (`server.Universe`) is reused while inputs are identical —
+same root text (`fnv1a64`), same dep disk bytes (hashes recorded from
+`Module.src`), same config generation. A request the warm universe can answer
+is served with zero dmd work; the residual cost is piping the document in. A
+**root-text-only** miss is handled by `serverCanIncremental` →
+`serverAnalyzeIncremental` in a fork child (evict root, re-analyze it on the
+warm closure), see *Memory model*. A miss for any other reason (different
+root, config generation, dep bytes) replies `needRespawn`.
 
-Deps are fingerprinted from disk bytes, so unsaved dep edits disable the
-cache until save — same cost as before, never stale results. Dep changes are
-noticed on the dependent's next analysis (no file watching); a same-text
-`didChange` still marks pending for exactly that reason.
+Deps are fingerprinted from disk bytes, so unsaved dep edits are not seen
+until save — never stale results, but a dep edit in an open doc does not
+invalidate the closure until it is saved. Dep changes are noticed on the
+dependent's next analysis (no file watching); a same-text `didChange` still
+marks pending for exactly that reason.
 
 ### Neutralised variants
 
@@ -160,7 +173,7 @@ build precomputes the new set before its `workspace/semanticTokens/refresh`.
 
 ## Status
 
-Verified by `make check` (140 assertions across the LSP, semantic-token,
+Verified by `make check` (141 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):

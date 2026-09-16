@@ -1,12 +1,16 @@
 module worker;
 
-// Process-isolated analysis. The LSP front end (parent) holds no dmd state:
-// dmd's process-global state is never fully reset by `deinitializeDMD`, so
-// reusing one universe across rebuilds leaks. Instead a worker process is
-// forked per universe; it performs exactly one full dmd build and then serves
-// cache hits, so nothing accumulates. On invalidation the worker is discarded
-// and the OS reclaims everything. All results crossing the boundary are plain
-// data. Struct-only, no phobos. Requires Posix (fork/socketpair).
+// Process-isolated analysis. The LSP front end (parent) holds no dmd state.
+// One worker process is spawned per universe; it performs a single full dmd
+// build (dependency closure + root) and keeps that universe warm. A root edit
+// is answered by forking a child over the warm universe (copy-on-write): the
+// child evicts the old root module and its interned types, re-analyzes only
+// the new root (~10x cheaper than a full build), sends its response and
+// exits — so its mutations, and the memory the eviction cannot reclaim under
+// the conservative GC, never reach the warm process. A dependency, config or
+// root-path change still discards the worker (`needRespawn`) and the OS
+// reclaims everything. All results crossing the boundary are plain data.
+// Struct-only, no phobos. Requires Posix (fork/socketpair).
 
 import arena;
 import json;
@@ -23,7 +27,8 @@ version (Posix):
 import core.stdc.stdio : fprintf, stderr;
 import core.sys.posix.unistd : read, write, close, fork, dup2, pid_t;
 import core.sys.posix.sys.socket : socketpair, AF_UNIX, SOCK_STREAM;
-import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG;
+import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
+    WEXITSTATUS;
 import core.sys.posix.unistd : _exit;
 
 // ---------- framing (length-prefixed, like LSP) ----------
@@ -247,6 +252,77 @@ version (Posix)
         writeFrame(fd, printJsonStr(root));
     }
 
+    // Run `work` in a fork child over the inherited (copy-on-write) universe:
+    // the child answers on `fd` and exits, so its mutations and any leak from
+    // the incremental re-analysis die with it and the warm universe in this
+    // process is never touched. Returns true only if the child exited 0 (i.e.
+    // it produced its response); false means the caller must respawn.
+    private bool forkRun(scope void delegate() work)
+    {
+        auto pid = fork();
+        if (pid < 0)
+            return false;
+        if (pid == 0)
+        {
+            try
+                work();
+            catch (Throwable)
+                _exit(1);
+            _exit(0);
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0)
+            return false;
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+
+    // Per-op tail shared by the in-process (hit/first-build) path and the
+    // fork-child (incremental) path.
+    private void completeAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] orig, uint line, uint col, const(char)[] prefix, int fd)
+    {
+        CompleteCtx ctx;
+        ctx.line = line;
+        ctx.character = col;
+        ctx.prefix = prefix;
+        CompleteOut out_;
+        completeAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, out_);
+        sendComplete(fd, out_);
+    }
+
+    private void signatureAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] orig, uint line, uint col, int fd)
+    {
+        CompleteCtx ctx;
+        ctx.line = line;
+        ctx.character = col;
+        SignatureInfo si;
+        signatureAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, si);
+        sendSignature(fd, si);
+    }
+
+    private void definitionAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] orig, uint line, uint col, int fd)
+    {
+        CompleteCtx ctx;
+        ctx.line = line;
+        ctx.character = col;
+        DefLoc def;
+        definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        sendDefinition(fd, def);
+    }
+
+    private void hoverAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] orig, uint line, uint col, int fd)
+    {
+        CompleteCtx ctx;
+        ctx.line = line;
+        ctx.character = col;
+        HoverInfo h;
+        hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
+        sendHover(fd, h);
+    }
+
     private void workerLoop(int fd)
     {
         ServerState s;
@@ -309,14 +385,27 @@ version (Posix)
                 // the live universe by identity when it can, which is the
                 // cheap path; otherwise it rebuilds anyway.
                 bool realOnly = jbool(jget(p, "realOnly"), false);
-                bool hit = realOnly ? serverWouldHitAnalysis(s, path, text)
-                                    : serverWouldHit(s, path, text);
-                if (built && !hit)
+                // realOnly needs a universe built from the real text, so it
+                // matches on the analysis text; the keypress analyze matches
+                // the document identity.
+                auto st = built ? serverUniState(s, path, realOnly ? null : text,
+                    realOnly ? text : null) : UniState.miss;
+                // Only the root text changed: re-analyze it in a fork child on
+                // the warm dependency closure. A root switch, dependency edit
+                // or config change needs a fresh universe.
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, text, null);
+                    sendAnalyze(fd, a);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
                 {
                     sendNeedRespawn(fd);
                     continue;
                 }
-                auto a = serverAnalyze(s, path, text);
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
                 sendAnalyze(fd, a);
                 built = true;
                 continue;
@@ -335,23 +424,28 @@ version (Posix)
                 auto prefix = jstr(jget(p, "prefix"));
                 if (prefix is null)
                     prefix = "";
-                // Key on the analysis text, not the document identity: while
-                // the user grows a member name the neutralised buffer is
-                // unchanged, so reuse the live universe instead of rebuilding.
-                // (The debounced analyze deliberately does *not* reuse this
-                // placeholder: see its op — diagnostics need the real text.)
+                // Keyed on the analysis text only, never the document
+                // identity: while a member name grows, the neutralised buffer
+                // is unchanged and the warm universe already answers it, so
+                // matching on the document (which did move) would be a false
+                // reuse of the wrong analysis.
+                auto st = built ? serverUniState(s, path, null, atext) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a2 = serverAnalyzeIncremental(s, path, atext, orig);
+                    completeAndSend(s, a2, orig, line, col, prefix, fd);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn(fd);
+                    continue;
+                }
                 Analysis a;
                 if (built)
                 {
-                    if (!serverWouldHitAnalysis(s, path, atext))
-                    {
-                        sendNeedRespawn(fd);
-                        continue;
-                    }
-                    // Record the current document version as this universe's
-                    // identity, so the debounced keypress analyze reuses it
-                    // (cheap) instead of rebuilding. open/save pass realOnly
-                    // and get the real text regardless.
+                    // Record the current document version so the debounced
+                    // keypress analyze reuses this universe (cheap) instead of
+                    // forking. open/save pass realOnly and get the real text.
                     import session : fnv1a64;
                     s.uni.rootHash = fnv1a64(cast(const(ubyte)[])orig);
                     s.scratch.rewind(s.uni.mark);
@@ -361,13 +455,7 @@ version (Posix)
                 {
                     a = serverAnalyze(s, path, atext, orig);
                 }
-                CompleteCtx ctx;
-                ctx.line = line;
-                ctx.character = col;
-                ctx.prefix = prefix;
-                CompleteOut out_;
-                completeAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, out_);
-                sendComplete(fd, out_);
+                completeAndSend(s, a, orig, line, col, prefix, fd);
                 built = true;
                 continue;
             }
@@ -382,18 +470,21 @@ version (Posix)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                if (built && !serverWouldHit(s, path, orig))
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    signatureAndSend(s, a, orig, line, col, fd);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
                 {
                     sendNeedRespawn(fd);
                     continue;
                 }
-                auto a = serverAnalyze(s, path, atext, orig);
-                CompleteCtx ctx;
-                ctx.line = line;
-                ctx.character = col;
-                SignatureInfo si;
-                signatureAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, si);
-                sendSignature(fd, si);
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                signatureAndSend(s, a, orig, line, col, fd);
                 built = true;
                 continue;
             }
@@ -408,18 +499,21 @@ version (Posix)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                if (built && !serverWouldHit(s, path, orig))
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    definitionAndSend(s, a, orig, line, col, fd);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
                 {
                     sendNeedRespawn(fd);
                     continue;
                 }
-                auto a = serverAnalyze(s, path, atext, orig);
-                CompleteCtx ctx;
-                ctx.line = line;
-                ctx.character = col;
-                DefLoc def;
-                definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
-                sendDefinition(fd, def);
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                definitionAndSend(s, a, orig, line, col, fd);
                 built = true;
                 continue;
             }
@@ -434,18 +528,21 @@ version (Posix)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                if (built && !serverWouldHit(s, path, orig))
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    hoverAndSend(s, a, orig, line, col, fd);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
                 {
                     sendNeedRespawn(fd);
                     continue;
                 }
-                auto a = serverAnalyze(s, path, atext, orig);
-                CompleteCtx ctx;
-                ctx.line = line;
-                ctx.character = col;
-                HoverInfo h;
-                hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
-                sendHover(fd, h);
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                hoverAndSend(s, a, orig, line, col, fd);
                 built = true;
                 continue;
             }
@@ -460,12 +557,22 @@ version (Posix)
                 // requests on the same buffer instead of evicting each other.
                 // A neutralised universe is fine — the classifier is
                 // position-safe and falls back to the pre-semantic snapshot.
-                if (built && !serverWouldHit(s, path, text))
+                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, text, null);
+                    SemTok[] toks;
+                    semanticTokens(cast(Module)a.module_, a.syn, text, toks);
+                    sendSemantic(fd, toks);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
                 {
                     sendNeedRespawn(fd);
                     continue;
                 }
-                auto a = serverAnalyze(s, path, text);
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
                 SemTok[] toks;
                 semanticTokens(cast(Module)a.module_, a.syn, text, toks);
                 sendSemantic(fd, toks);
