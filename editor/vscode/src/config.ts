@@ -27,7 +27,7 @@ export async function createDlsJson(): Promise<boolean> {
   const settingImports = config.get<string[]>('importPaths', []);
   const stringImports = config.get<string[]>('stringImportPaths', []);
   const flags = config.get<string[]>('flags', []);
-  const debounceMs = config.get<number>('debounceMs', 300);
+  const debounceMs = config.get<number>('debounceMs', 500);
 
   const cfg: Record<string, unknown> = {
     importPaths: settingImports.length ? settingImports : detectImports(root),
@@ -38,7 +38,7 @@ export async function createDlsJson(): Promise<boolean> {
   if (flags.length) {
     cfg.flags = flags;
   }
-  if (debounceMs !== 300) {
+  if (debounceMs !== 500) {
     cfg.debounceMs = debounceMs;
   }
 

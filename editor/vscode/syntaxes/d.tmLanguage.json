@@ -9,6 +9,7 @@
     { "include": "#char" },
     { "include": "#numbers" },
     { "include": "#attributes" },
+    { "include": "#manifest-constant" },
     { "include": "#keywords" },
     { "include": "#storage" },
     { "include": "#constants" },
@@ -88,6 +89,18 @@
         { "name": "storage.modifier.attribute.d", "match": "@[a-zA-Z_][a-zA-Z0-9_]*" }
       ]
     },
+    "manifest-constant": {
+      "patterns": [
+        {
+          "match": "\\b(enum)\\s+(?:[A-Za-z_][A-Za-z0-9_.!]*\\s+)?([A-Za-z_][A-Za-z0-9_]*)\\s*(=)",
+          "captures": {
+            "1": { "name": "keyword.other.d" },
+            "2": { "name": "variable.other.constant.d" },
+            "3": { "name": "keyword.operator.d" }
+          }
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
@@ -123,7 +136,7 @@
     },
     "types": {
       "patterns": [
-        { "name": "entity.name.type.d", "match": "\\b[A-Z][a-zA-Z0-9_]*\\b" }
+        { "name": "entity.name.type.d", "match": "\\b(?![A-Z0-9_]*_[A-Z0-9_]*\\b)[A-Z][a-zA-Z0-9_]*\\b" }
       ]
     },
     "operators": {

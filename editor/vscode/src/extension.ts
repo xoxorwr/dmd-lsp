@@ -44,7 +44,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   for (const f of config.get<string[]>('flags', [])) {
     args.push(`--flag=${f}`);
   }
-  args.push(`--debounce-ms=${config.get<number>('debounceMs', 300)}`);
+  args.push(`--debounce-ms=${config.get<number>('debounceMs', 500)}`);
 
   // Run the server in the workspace root so relative import paths (and the
   // dep paths dmd reports for goto-definition) resolve correctly.

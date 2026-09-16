@@ -86,7 +86,7 @@
         },
         "dmdLsp.debounceMs": {
           "type": "number",
-          "default": 300,
+          "default": 500,
           "description": "Diagnostics idle delay in milliseconds."
         }
       }
