@@ -13,6 +13,8 @@ MOD = '''module mod;
 enum EventType { GFX_RESIZE, INPUT_KEY_DOWN }
 struct Event { EventType type; int consumed; Vec2 resize; }
 struct Vec2 { int width; int height; }
+
+Event make_event() { return Event.init; }
 '''
 
 MAIN = '''module main;
@@ -64,6 +66,11 @@ void on_shadow()
         Vec2 e1;
         e1.width = 1;
     }
+}
+
+void on_factory()
+{
+    auto ev = make_event().
 }
 '''
 
@@ -174,6 +181,12 @@ check('struct-init-value-normal', 'Event' in labels and 'consumed' not in labels
 sl = line_of('e1.')
 labels = complete(sl, len(lines[sl]))
 check('scope-shadowing', 'resize' in labels and 'width' not in labels,
+      str(sorted(set(labels))[:8]))
+
+# 7) a member on a call result: `make_event().` -> Event's members.
+cl = line_of('make_event().')
+labels = complete(cl, len(lines[cl]))
+check('call-result-members', 'resize' in labels and 'type' in labels,
       str(sorted(set(labels))[:8]))
 
 proc.stdin.close()

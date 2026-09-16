@@ -2019,6 +2019,129 @@ private Dsymbol resolveChain(Module mod, const(char)[] chain, Dsymbol[] rootMemb
 // Resolve the symbol under the cursor: locals/params, module members,
 // imported names (incl. public re-exports), or members of a dotted chain.
 // Aliases are followed to their target.
+private void lineColOfOffset(const(char)[] text, size_t off, out uint line,
+    out uint col)
+{
+    line = 1;
+    col = 1;
+    size_t n = off < text.length ? off : text.length;
+    for (size_t i = 0; i < n; i++)
+    {
+        if (text[i] == '\n')
+        {
+            line++;
+            col = 1;
+        }
+        else
+            col++;
+    }
+}
+
+private const(char)[] lastSeg(const(char)[] chain)
+{
+    size_t s = chain.length;
+    while (s > 0 && chain[s - 1] != '.')
+        s--;
+    return baseName(chain[s .. $]);
+}
+
+// Members of the value a *call* returns, for `expr(...).member`: a text
+// chain stops at the `)`, so locate the call before the cursor's `.`, resolve
+// its callee, and use the callee's return-type members. Null when the cursor
+// is not a member of a call result.
+private Dsymbol[] callLhsMembers(Module mod, const ref SynMod syn,
+    const(char)[] text, uint line, uint col)
+{
+    size_t off = lineColToOffset(text, line, col);
+    if (off > text.length)
+        off = text.length;
+    size_t p = off;
+    while (p > 0 && isPc(text[p - 1]))
+        p--;
+    if (p == 0 || text[p - 1] != '.')
+        return null;
+    size_t q = p - 1; // index of '.'
+    while (q > 0 && (text[q - 1] == ' ' || text[q - 1] == '\t'))
+        q--;
+    if (q == 0 || text[q - 1] != ')')
+        return null;
+    size_t closePos = q - 1;
+    // Matching '(' for closePos, from a forward scan (strings/comments off).
+    size_t[256] opens;
+    size_t sp = 0;
+    size_t i = 0;
+    while (i < closePos)
+    {
+        char c = text[i];
+        if (c == '/' && i + 1 < closePos && text[i + 1] == '/')
+        {
+            while (i < closePos && text[i] != '\n')
+                i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < closePos && text[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < closePos && !(text[i] == '*' && text[i + 1] == '/'))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            char qc = c;
+            i++;
+            while (i < closePos && text[i] != qc)
+            {
+                if (text[i] == '\\' && qc != '`')
+                    i++;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '(')
+        {
+            if (sp < opens.length)
+                opens[sp++] = i;
+        }
+        else if (c == ')')
+        {
+            if (sp)
+                sp--;
+        }
+        i++;
+    }
+    if (sp == 0)
+        return null;
+    size_t open = opens[sp - 1];
+    size_t e = open;
+    while (e > 0 && (text[e - 1] == ' ' || text[e - 1] == '\t'))
+        e--;
+    size_t s = e;
+    while (s > 0 && (isPc(text[s - 1]) || text[s - 1] == '.' || text[s - 1] == '!'))
+        s--;
+    if (s == e)
+        return null;
+    uint cl, cc;
+    lineColOfOffset(text, e - 1, cl, cc);
+    auto sym = resolveSymbolAt(mod, syn, cl, cc, text);
+    if (!sym)
+        return null;
+    Dsymbol[] rootMembers;
+    flattenMembers(mod.members, rootMembers);
+    if (auto fd = sym.isFuncDeclaration())
+    {
+        auto tf = fd.type ? fd.type.isTypeFunction() : null;
+        if (tf && tf.next)
+            return followTypeDepth(tf.next, mod, rootMembers, 0);
+        return null;
+    }
+    if (sym.isAggregateDeclaration() || sym.isEnumDeclaration())
+        return scopeMembers(sym);
+    return null;
+}
+
 private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
     uint character, const(char)[] text)
 {
@@ -2039,7 +2162,23 @@ private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
     NameType[] locals;
     auto fd = findEnclosingFunc(mod, line);
     collectSlots(mod, syn, line, fd, locals);
-    return resolveChain(mod, chain, rootMembers, rootByName, importByName, locals, fd);
+    auto sym = resolveChain(mod, chain, rootMembers, rootByName, importByName,
+        locals, fd);
+    if (sym)
+        return sym;
+    // `expr(...).name`: text resolution stops at the ')'; fall back to the
+    // call's return type.
+    if (auto members = callLhsMembers(mod, syn, text, line, character))
+    {
+        auto nm = lastSeg(chain);
+        foreach (m; members)
+            if (m.ident && m.ident.toString() == nm)
+            {
+                auto t = m.toAlias();
+                return (t && t !is m) ? t : m;
+            }
+    }
+    return null;
 }
 
 // Batch resolution for semantic highlighting: one Dsymbol per 1-based
@@ -2611,6 +2750,28 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     auto fd = findEnclosingFunc(mod, ctx.line);
     // Snapshot function (pre-semantic names; survives error rewrites).
     auto sfn = synFuncAt(syn, ctx.line);
+
+    // `expr(...).` / `expr(...).pre` — a member of a call result. Handled
+    // before the line-based chain split, because a bare trailing dot yields
+    // no chain at all.
+    if (auto members = callLhsMembers(mod, syn, text, ctx.line, ctx.character))
+    {
+        foreach (m; members)
+        {
+            if (!m.ident)
+                continue;
+            if (m.visible().kind == Visibility.Kind.private_)
+                continue;
+            const(char)[] nm = m.ident.toString();
+            if (!hasPrefix(nm, prefix))
+                continue;
+            pushItem(arena, out_, nm, kindOf(m), typeDetail(symType(m)),
+                docOf(m), "1", seen, m);
+            if (out_.nitems >= 500)
+                break;
+        }
+        return;
+    }
 
     NameType[] slots;
     collectSlots(mod, syn, ctx.line, fd, slots);
