@@ -37,6 +37,20 @@ void on_resize(Event* ev)
 {
     ev.
 }
+
+void on_make()
+{
+    Event e = {
+        c
+    };
+}
+
+void on_value()
+{
+    Event e2 = {
+        type:
+    };
+}
 '''
 
 os.makedirs(SRC)
@@ -129,6 +143,18 @@ pl = next(i for i, l in enumerate(lines) if i > rl and l.strip() == 'ev.')
 labels = complete(pl, len(lines[pl]))
 check('param-pointer-members',
       'type' in labels and 'consumed' in labels, str(labels[:6]))
+
+# 4) designated struct initializer (`Event e = { ... }`) offers field names
+il = line_of('Event e = {') + 1  # the `        c` line
+labels = complete(il, len(lines[il]))
+check('struct-init-fields', labels == ['consumed'], str(labels))
+
+# 5) the value position (`field:`) must NOT scope to the type's fields; it
+# uses normal completion (imported types, scope, ...).
+vl = line_of('type:')
+labels = complete(vl, len(lines[vl]))
+check('struct-init-value-normal', 'Event' in labels and 'consumed' not in labels,
+      str(sorted(set(labels))[:8]))
 
 proc.stdin.close()
 proc.wait(timeout=5)

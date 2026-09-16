@@ -160,7 +160,7 @@ build precomputes the new set before its `workspace/semanticTokens/refresh`.
 
 ## Status
 
-Verified by `make check` (136 assertions across the LSP, semantic-token,
+Verified by `make check` (138 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):

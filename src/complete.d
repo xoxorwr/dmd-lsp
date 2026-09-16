@@ -2298,6 +2298,163 @@ private bool importPathCompletion(Arena* a, Module root, const(char)[][] segs,
     return matched;
 }
 
+// Within an initializer's braces [from, off), true when the cursor is in the
+// *value* part of the current element (a top-level `:` precedes it). Only the
+// field-name part scopes to the type's members; values use normal completion.
+private bool inInitializerValue(const(char)[] text, size_t from, size_t off)
+{
+    int depth = 0;
+    bool value = false;
+    size_t k = from;
+    while (k < off)
+    {
+        char c = text[k];
+        if (c == '/' && k + 1 < off && text[k + 1] == '/')
+        {
+            while (k < off && text[k] != '\n')
+                k++;
+            continue;
+        }
+        if (c == '/' && k + 1 < off && text[k + 1] == '*')
+        {
+            k += 2;
+            while (k + 1 < off && !(text[k] == '*' && text[k + 1] == '/'))
+                k++;
+            k += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            char q = c;
+            k++;
+            while (k < off && text[k] != q)
+            {
+                if (text[k] == '\\' && q != '`')
+                    k++;
+                k++;
+            }
+            k++;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{')
+            depth++;
+        else if (c == ')' || c == ']' || c == '}')
+        {
+            if (depth > 0)
+                depth--;
+        }
+        else if (depth == 0)
+        {
+            if (c == ',')
+                value = false; // next element starts
+            else if (c == ':')
+                value = true;
+        }
+        k++;
+    }
+    return value;
+}
+
+// If the cursor sits directly inside a `Type name = { ... }` struct
+// initializer (D's designated initializer form), return the type name (a
+// slice of `text`); null otherwise.
+private const(char)[] structInitializerType(const(char)[] text, uint line,
+    uint col)
+{
+    size_t off = lineColToOffset(text, line, col);
+    if (off > text.length)
+        off = text.length;
+    char[128] kinds;
+    size_t[128] poses;
+    size_t sp = 0;
+    size_t i = 0;
+    bool isSpace(char c) pure nothrow @nogc @safe
+    {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+    while (i < off)
+    {
+        char c = text[i];
+        if (c == '/' && i + 1 < off && text[i + 1] == '/')
+        {
+            while (i < off && text[i] != '\n')
+                i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < off && text[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < off && !(text[i] == '*' && text[i + 1] == '/'))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`')
+        {
+            char q = c;
+            i++;
+            while (i < off && text[i] != q)
+            {
+                if (text[i] == '\\' && q != '`')
+                    i++;
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '{' || c == '(' || c == '[')
+        {
+            if (sp < kinds.length)
+            {
+                kinds[sp] = c;
+                poses[sp] = i;
+                sp++;
+            }
+            i++;
+            continue;
+        }
+        if (c == '}' || c == ')' || c == ']')
+        {
+            if (sp)
+                sp--;
+            i++;
+            continue;
+        }
+        i++;
+    }
+    // Innermost open bracket must be the initializer's `{` (a cursor inside a
+    // nested call/paren/array is a different completion context).
+    if (sp == 0 || kinds[sp - 1] != '{')
+        return null;
+    size_t b = poses[sp - 1];
+    size_t j = b;
+    while (j > 0 && isSpace(text[j - 1]))
+        j--;
+    if (j == 0 || text[j - 1] != '=')
+        return null;
+    j--;
+    while (j > 0 && isSpace(text[j - 1]))
+        j--;
+    size_t nameEnd = j;
+    while (j > 0 && isPc(text[j - 1]))
+        j--;
+    if (j == nameEnd)
+        return null; // no declared name before '='
+    while (j > 0 && isSpace(text[j - 1]))
+        j--;
+    size_t typeEnd = j;
+    while (j > 0 && (isPc(text[j - 1]) || text[j - 1] == '.'))
+        j--;
+    if (j == typeEnd)
+        return null;
+    auto tn = text[j .. typeEnd];
+    if (tn == "auto")
+        return null; // no type to resolve fields from
+    if (inInitializerValue(text, b + 1, off))
+        return null; // cursor is in a value, not a field name
+    return tn;
+}
+
 void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref CompleteOut out_)
 {
@@ -2357,6 +2514,46 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
 
     NameType[] slots;
     collectSlots(mod, syn, ctx.line, fd, slots);
+
+    // Struct initializer `Type name = { ... }`: offer the type's fields by
+    // name (D designated initializers), not the enclosing scope.
+    if (auto tn = structInitializerType(text, ctx.line, ctx.character))
+    {
+        const(char)[][] tsegs;
+        size_t ts = 0;
+        foreach (k; 0 .. tn.length + 1)
+        {
+            if (k == tn.length || tn[k] == '.')
+            {
+                if (k > ts)
+                    tsegs ~= tn[ts .. k];
+                ts = k + 1;
+            }
+        }
+        Dsymbol[] smembers;
+        flattenMembers(mod.members, smembers);
+        auto fields = resolveLhs(mod, tsegs, smembers, slots);
+        if (fields.length)
+        {
+            foreach (m; fields)
+            {
+                if (!m.ident || !m.isVarDeclaration()) // fields only
+                    continue;
+                if (m.visible().kind == Visibility.Kind.private_)
+                    continue;
+                const(char)[] nm = m.ident.toString();
+                if (!hasPrefix(nm, prefix))
+                    continue;
+                pushItem(arena, out_, nm, kindOf(m), typeDetail(symType(m)),
+                    docOf(m), "0", seen, m);
+                if (out_.nitems >= 500)
+                    break;
+            }
+        }
+        else
+            out_.incomplete = true;
+        return;
+    }
 
     if (!hasDot)
     {
