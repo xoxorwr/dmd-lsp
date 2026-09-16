@@ -453,6 +453,73 @@ send({"jsonrpc": "2.0", "id": 124, "method": "textDocument/completion",
 labels = [i['label'] for i in read_msg()['result']['items']]
 check('module-members', labels == ['nm_a_symbol'], str(labels))
 
+# Semantic tokens: whole-file identifier classification (legend + delta data).
+leg = init['result']['capabilities']['semanticTokensProvider']['legend']
+stypes = leg['tokenTypes']
+def sem_tokens(uri):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0],
+          "method": "textDocument/semanticTokens/full",
+          "params": {"textDocument": {"uri": uri}}})
+    data = read_msg()['result']['data']
+    toks = {}
+    line = 0
+    col = 0
+    for k in range(0, len(data), 5):
+        dl, dc, ln, tt, tm = data[k:k + 5]
+        line += dl
+        col = dc if dl else col + dc
+        toks[(line, col)] = (ln, stypes[tt], tm)
+    return toks
+
+semtext = ('module semh;\n'
+           'struct Point { int x; int y; void function(int) fp; }\n'
+           'enum Color { red, green }\n'
+           'int add(int a, int b) { int sum = a + b; return sum; }\n'
+           'void main()\n{\n'
+           '    auto p = Point(1, 2);\n'
+           '    int z = add(p.x, Color.red);\n'
+           '    p.fp(z);\n'
+           '}\n')
+semuri = open_doctype('semh.d', semtext)
+sl = semtext.split('\n')
+stoks = sem_tokens(semuri)
+def sem_at(line, col):
+    return stoks.get((line, col))
+
+pt = sl[1].index('Point')
+check('sem-struct', sem_at(1, pt) == (5, 'struct', 0), str(sem_at(1, pt)))
+fx = sl[1].index('x;')
+check('sem-field', sem_at(1, fx) == (1, 'property', 0), str(sem_at(1, fx)))
+rd = sl[2].index('red')
+check('sem-enum-member', sem_at(2, rd) == (3, 'enumMember', 0), str(sem_at(2, rd)))
+ad = sl[3].index('add')
+check('sem-function', sem_at(3, ad) == (3, 'function', 0), str(sem_at(3, ad)))
+pa = sl[3].index('a,')
+check('sem-parameter', sem_at(3, pa) == (1, 'parameter', 0), str(sem_at(3, pa)))
+sm = sl[3].index('sum')
+check('sem-local', sem_at(3, sm) == (3, 'variable', 0), str(sem_at(3, sm)))
+# Use site: p.x field access and Color.red enum member.
+last = 7
+px = sl[last].index('p.x') + 2
+check('sem-field-use', sem_at(last, px) == (1, 'property', 0), str(sem_at(last, px)))
+cr = sl[last].index('Color.red')
+check('sem-enum-use', sem_at(last, cr) == (5, 'enum', 0), str(sem_at(last, cr)))
+check('sem-enummember-use', sem_at(last, cr + 6) == (3, 'enumMember', 0),
+      str(sem_at(last, cr + 6)))
+# A function-pointer field: `property` where it is declared/read, `method`
+# where it is called.
+fdecl = sl[1].index('fp;')
+check('sem-fnptr-decl', sem_at(1, fdecl) == (2, 'property', 0),
+      str(sem_at(1, fdecl)))
+call_line = 8
+fpc = sl[call_line].index('fp(')
+check('sem-fnptr-call', sem_at(call_line, fpc) == (2, 'method', 0),
+      str(sem_at(call_line, fpc)))
+# Tokens must be sorted and non-overlapping (LSP requirement).
+ordered = sorted(stoks)
+check('sem-sorted', list(stoks) == ordered, 'unsorted')
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})

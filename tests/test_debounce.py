@@ -1,6 +1,6 @@
 import json, os, select, subprocess, sys, tempfile, time
 
-# Debounce regression (default 300ms idle delay):
+# Debounce regression (default 500ms idle delay):
 #  - didChange publishes nothing promptly; diagnostics arrive after idle
 #  - a rapid burst of changes coalesces into exactly one publish
 #  - completion during pending serves fresh results without publishing

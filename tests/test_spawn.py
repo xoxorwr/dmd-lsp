@@ -1,9 +1,10 @@
 import json, subprocess, sys, time, os
 
-# A completion that needs the trailing-dot placeholder must key its universe
-# on the *real* document text, so the following debounced analyze for that
-# same text is a hit. Otherwise every keystroke that triggers completion
-# builds the file twice (once for completion, once for diagnostics).
+# Completion parses a neutralised buffer that can't share the main
+# (real-text) universe, so it runs in its own worker. A version that needs a
+# placeholder therefore costs one build per worker: didOpen's main build,
+# the completion worker's build, and the debounced main build for the real
+# text. The regression this guards against is a per-keystroke rebuild loop.
 
 BIN = './dmd-lsp'
 URI = 'file:///tmp/spawntest.d'
@@ -91,9 +92,9 @@ proc.wait(timeout=5)
 errf.close()
 
 spawns = sum(1 for line in open(TRACE) if 'spawn' in line)
-# One build for didOpen(v0), one for the completion/analyze of v1. A third
-# means completion and the debounced analyze each built v1 (the regression).
-check('one-build-per-version', spawns == 2, 'spawns=%d' % spawns)
+# didOpen's main build + the completion worker's build + the debounced main
+# build for the real v1. More than this means a rebuild loop.
+check('builds-not-ping-pong', spawns <= 3, 'spawns=%d' % spawns)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

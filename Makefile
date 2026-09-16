@@ -20,7 +20,7 @@ PLATFORM_EXTRA = root/strtold.d
 
 SRC = src/main.d src/arena.d src/lsp.d src/session.d \
       src/dmdwrap.d src/lexutil.d src/lint.d src/complete.d src/server.d \
-      src/worker.d src/json.d
+      src/semantic.d src/worker.d src/json.d
 
 # Same versions as dmd's own `frontend` dub package, plus DMDLIB for the
 # tooling-oriented lexer API. -preview=dip1000 matches the dmd build.
@@ -32,10 +32,24 @@ DFLAGS = -I$(DMD_SRC) -i \
 
 BIN = dmd-lsp
 
+# VS Code extension (TypeScript + esbuild); built with npm, not dmd.
+VSCODE_DIR = editor/vscode
+
 all: $(BIN)
 
 $(BIN): $(SRC) Makefile stringimp/SYSCONFDIR.imp
 	$(DC) $(DFLAGS) $(SRC) -of$(BIN)
+
+# Compile the extension (tsc --noEmit + esbuild bundle -> dist/extension.js).
+vscode: $(VSCODE_DIR)/node_modules
+	cd $(VSCODE_DIR) && npm run compile
+
+# Package the extension -> editor/vscode/dmd-lsp.vsix (compiles first).
+vsix: vscode
+	cd $(VSCODE_DIR) && npm run package
+
+$(VSCODE_DIR)/node_modules: $(VSCODE_DIR)/package.json $(VSCODE_DIR)/package-lock.json
+	cd $(VSCODE_DIR) && npm ci
 
 # Guard: our sources must stay struct-only (vendored dmd is excluded).
 check-no-oop:
@@ -71,6 +85,12 @@ check: $(BIN) check-no-oop
 	./$(BIN) --check --import=tests tests/u2.d
 	./$(BIN) --check tests/ok.d || true
 	python3 tests/test_lsp.py
+	python3 tests/test_semantic.py
+	python3 tests/test_completion_burst.py
+	python3 tests/test_completion_prefix.py
+	python3 tests/test_completion_scope.py
+	python3 tests/test_realworld.py
+	python3 tests/test_broken_body.py
 	python3 tests/test_cache.py
 	python3 tests/test_debounce.py
 	python3 tests/test_config.py
@@ -81,4 +101,4 @@ check: $(BIN) check-no-oop
 clean:
 	rm -f $(BIN) *.o
 
-.PHONY: all clean check-no-oop deps vendor
+.PHONY: all clean check-no-oop deps vendor vscode vsix

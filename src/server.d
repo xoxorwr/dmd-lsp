@@ -161,15 +161,22 @@ bool serverWouldHit(ref ServerState s, const(char)[] path, const(char)[] text)
         !universeDepsChanged(s.uni.deps);
 }
 
-// Hit check for a request that needs a specific *analysis* text (completion
-// parses a trailing-dot placeholder, keyed on the real document text).
+// Hit check keyed on the *analysis* text (what was actually parsed), not the
+// document identity. Completion neutralises the partial member
+// (`s.ab` -> `s.__dmd_lsp_ph()`), so growing a name keeps the analysis text
+// the same and reuses the universe; the cursor/prefix still come from the
+// real text. Semantic tokens use it to require a universe built from the real
+// text (never a completion placeholder). The root path must match, or the
+// universe is another file's.
 bool serverWouldHitAnalysis(ref ServerState s, const(char)[] path,
-    const(char)[] identity, const(char)[] analysis)
+    const(char)[] analysis)
 {
     import session : fnv1a64;
 
-    return serverWouldHit(s, path, identity) &&
-        s.uni.analysisHash == fnv1a64(cast(const(ubyte)[])analysis);
+    return s.uni.valid && s.uni.configGen == s.dmd.configGen &&
+        s.uni.rootPath == path &&
+        s.uni.analysisHash == fnv1a64(cast(const(ubyte)[])analysis) &&
+        !universeDepsChanged(s.uni.deps);
 }
 
 // Full pipeline for one root file. Two levels:

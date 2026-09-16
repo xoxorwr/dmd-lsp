@@ -15,6 +15,7 @@ import server;
 import session;
 import worker;
 import complete : extractPrefix;
+import semantic : tokenTypes, tokenModifiers;
 
 struct HitCache
 {
@@ -27,9 +28,9 @@ struct App
     HitCache[string] cache; // GC map, cold path only
     bool shutdownRequested = false;
     bool labelDetails = false; // client supports CompletionItem.labelDetails
-    string[] pending; // paths with unanalyzed changes (debounced diagnostics)
+    string[] pending; // paths with unanalyzed changes (debounced analysis)
     ulong lastMsgMs = 0; // last stdin activity, monotonic ms
-    ulong debounceMs = 300; // idle delay before analyzing pending changes
+    ulong debounceMs = 500; // idle delay before analyzing pending changes
     bool debounceSet = false; // true when --debounce-ms= was given (beats file)
     // Explicit paths: CLI flags, replaced wholesale by editor settings.
     // Effective lists (explicit ++ file ++ builtin defaults) recomputed by
@@ -42,7 +43,15 @@ struct App
     string[] flags; // effective dmd flags (CLI ++ dls.json)
     ulong configGen = 0; // bumped on import-path change; invalidates worker
     FileConfig fileCfg; // project dls.json (see below)
-    worker.Worker wk; // current analysis worker (lazy)
+    worker.Worker wk; // analysis worker (lazy)
+    // Semantic tokens: last result per path and the text hash it was computed
+    // from, so a pull that arrives mid-edit is served from cache instead of
+    // forcing a synchronous rebuild per keystroke.
+    worker.WToken[][string] tokCache;
+    ulong[string] tokHash;
+    bool wantSemantic = false; // client supports textDocument/semanticTokens
+    bool semanticRefresh = false; // client supports workspace/semanticTokens/refresh
+    ulong nextReqId = 0; // ids for our own server->client requests
 }
 
 // Project config file (`dls.json` at the workspace root): checked-in
@@ -160,9 +169,12 @@ private JsonNode* buildDiagnostics(Json js, const ref worker.WAnalysis a)
 }
 
 // Run an analyze request against the worker, respawning once if the worker
-// already served its single universe.
+// already served its single universe. `realOnly` forces the universe to have
+// parsed the real text (open/save, where diagnostics must be exact); false
+// lets the analyze reuse a live completion placeholder by identity, which is
+// the cheap path while typing.
 private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text,
-    ref worker.WAnalysis out_)
+    ref worker.WAnalysis out_, bool realOnly = false)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -171,7 +183,7 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
             if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
                 return false;
         }
-        auto r = workerAnalyze(app.wk, path, text, out_);
+        auto r = workerAnalyze(app.wk, path, text, out_, realOnly);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.failed || r == worker.ExchangeResult.respawn)
@@ -293,28 +305,132 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     return false;
 }
 
-private void publishFor(App* app, const(char)[] path, const(char)[] text)
+// Run a semantic-tokens request against the worker, respawning once if needed.
+private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] text,
+    ref worker.WToken[] toks)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerSemantic(app.wk, path, text, toks);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// Semantic tokens for `text`, cached by text hash. Called after every build
+// (so the client's post-refresh pull is an instant hit) and by the token
+// request itself. Returns null only when the text is empty.
+private worker.WToken[] refreshTokens(App* app, const(char)[] path,
+    const(char)[] text)
+{
+    if (!text.length)
+        return null;
+    ulong h = fnv1a64(cast(const(ubyte)[])text);
+    if (auto hp = path.idup in app.tokHash)
+        if (*hp == h)
+            return app.tokCache[path.idup];
+    worker.WToken[] toks;
+    if (workerSemanticRetry(app, path, text, toks))
+    {
+        app.tokCache[path.idup] = toks;
+        app.tokHash[path.idup] = h;
+    }
+    return toks;
+}
+
+// Ask the client to re-pull semantic tokens once a build has landed
+// (LSP workspace/semanticTokens/refresh). Gated on the client capability;
+// the client's response (id, no method) is ignored in handleMessage.
+private void sendSemanticRefresh(App* app)
+{
+    if (!app.semanticRefresh)
+        return;
+    app.nextReqId++;
+    lspWrite(`{"jsonrpc":"2.0","id":` ~ ulongStr(app.nextReqId) ~
+        `,"method":"workspace/semanticTokens/refresh","params":null}`);
+}
+
+// LSP SemanticTokens result (delta-encoded data) for a token list.
+private string tokensResultJson(worker.WToken[] toks)
+{
+    auto js = jmake();
+    auto res = js.create_object();
+    if (toks.length)
+    {
+        int[] data;
+        data.reserve(toks.length * 5);
+        uint prevLine = 0;
+        uint prevCol = 0;
+        foreach (ref t; toks)
+        {
+            uint dl = t.line - prevLine;
+            uint dc = dl == 0 ? t.col - prevCol : t.col;
+            data ~= cast(int)dl;
+            data ~= cast(int)dc;
+            data ~= cast(int)t.len;
+            data ~= cast(int)t.type;
+            data ~= cast(int)t.mods;
+            prevLine = t.line;
+            prevCol = t.col;
+        }
+        js.add_item_to_object(res, "data",
+            js.create_int_array(data.ptr, cast(int)data.length));
+    }
+    else
+        js.add_item_to_object(res, "data", js.create_array());
+    return printJsonStr(res);
+}
+
+// Analyze + publish diagnostics + precompute tokens for one document.
+// `realOnly` is true for open/save (diagnostics must be exact) and false for
+// the debounced keypress analyze (reuse a live universe when possible).
+private void publishFor(App* app, const(char)[] path, const(char)[] text,
+    bool realOnly = false)
 {
     worker.WAnalysis a;
-    if (!workerAnalyzeRetry(app, path, text, a))
+    if (!workerAnalyzeRetry(app, path, text, a, realOnly))
         return;
     app.cache[path.idup] = HitCache(a);
-    clearPending(app, path); // published: no longer debounced
+    clearPending(app, path);
     auto js = jmake();
     auto diags = buildDiagnostics(js, a);
     auto params = js.create_object();
     js.add_string_to_object(params, "uri", zstr("file://" ~ path.idup));
     js.add_item_to_object(params, "diagnostics", diags);
     lspNotify(`"textDocument/publishDiagnostics"`, printJsonStr(params));
+    // Precompute tokens from the fresh build *before* the refresh, so the
+    // client's re-pull is an instant cache hit (no scan/resolve gap).
+    if (app.wantSemantic)
+    {
+        refreshTokens(app, path, text);
+        sendSemanticRefresh(app);
+    }
 }
 
-// Analyze + publish everything with unanalyzed changes (idle flush).
+// Analyze every document with unanalyzed changes (idle debounce). Reuses a
+// live universe when possible; always unmarks each path, even on failure, so
+// a failed build can't make the idle loop retry it in a hot loop.
 private void flushPending(App* app)
 {
-    auto paths = app.pending;
-    app.pending = null;
+    auto paths = app.pending.dup;
     foreach (p; paths)
     {
+        if (!hasPending(app, p))
+            continue;
         const(char)[] text;
         auto d = sessionFind(app.session, p);
         if (d)
@@ -322,7 +438,8 @@ private void flushPending(App* app)
         else
             text = sessionReadDisk(p);
         if (text)
-            publishFor(app, p, text);
+            publishFor(app, p, text, false);
+        clearPending(app, p);
     }
 }
 
@@ -481,8 +598,8 @@ private void notifyNotice(Notice n)
 }
 
 // Load <root>/dls.json into app.fileCfg (flat schema: "importPaths",
-// "stringImportPaths", "debounceMs"). Silent when absent; Log on success,
-// Error when present but broken. CLI --debounce-ms= always wins.
+// "stringImportPaths", "flags"). Silent when absent; Log on success, Error
+// when present but broken.
 private Notice loadFileConfig(App* app, const(char)[] root)
 {
     Notice n;
@@ -569,14 +686,18 @@ private string dirOf(const(char)[] path)
         i--;
     return i > 0 ? path[0 .. i].idup : null;
 }
-// If the char before the cursor is '.' and the char under the cursor
-// cannot continue an identifier, return text with a placeholder call
-// inserted at the cursor (for completion analysis only).
-// The call resolves via an appended unconstrained UFCS template, so the
-// statement survives semantic cleanly. This matters: dmd collapses a
-// whole function body to a lone ErrorStatement on ANY statement error,
-// which would wipe every local's inferred type (notably `auto`) and
-// leave dotted completion on locals with nothing to resolve.
+// After a dot, replace the partial member ending at the cursor (empty for a
+// bare `s.`) with a placeholder call (for completion analysis only). The
+// call resolves via an appended unconstrained UFCS template, so the
+// statement survives semantic cleanly — dmd collapses a whole function body
+// to a lone ErrorStatement on ANY statement error, wiping every local's
+// inferred type (notably `auto`) and leaving dotted completion on locals
+// with nothing to resolve.
+//
+// Replacing the whole partial segment (not just inserting at the cursor)
+// also makes the analysis text *identical* for `s.a`, `s.ab`, `s.abc`, so
+// completion reuses one universe while the user grows the name instead of
+// rebuilding per keystroke (see serverWouldHitAnalysis).
 private string dotPlaceholder(const(char)[] text, uint line, uint col)
 {
     size_t off = 0;
@@ -592,21 +713,21 @@ private string dotPlaceholder(const(char)[] text, uint line, uint col)
         off++;
     if (off == 0 || off > text.length)
         return null;
-    if (text[off - 1] != '.')
+    // Identifier segment ending at the cursor (empty when right after the dot).
+    size_t segStart = off;
+    while (segStart > 0 && isIdentChar(text[segStart - 1]))
+        segStart--;
+    if (segStart == 0 || text[segStart - 1] != '.')
         return null;
-    if (off < text.length)
-    {
-        char n = text[off];
-        if (n == '_' || n == '$' || (n >= 'a' && n <= 'z') ||
-            (n >= 'A' && n <= 'Z') || (n >= '0' && n <= '9'))
-            return null;
-    }
+    // Cursor mid-identifier: not a segment end, leave it to other passes.
+    if (off < text.length && isIdentChar(text[off]))
+        return null;
     // Appended at end: existing lines/positions are untouched. The call
     // resolves through UFCS for value dots (any type via IFTI); static
     // dots keep today's behavior (no UFCS on types). Close any expression
-    // delimiters still open before the cursor (e.g. a call argument list,
-    // `f(w, c.`) so the placeholder statement itself parses.
-    auto closers = closerFor(text, off);
+    // delimiters still open before the insertion (e.g. a call argument
+    // list, `f(w, c.`) so the placeholder statement itself parses.
+    auto closers = closerFor(text, segStart);
     if (closers.length)
     {
         // Inside an argument/element list the inserted expression would
@@ -616,7 +737,7 @@ private string dotPlaceholder(const(char)[] text, uint line, uint col)
         if (auto sp = statementPlaceholder(text, line, col))
             return sp;
     }
-    return (text[0 .. off] ~ "__dmd_lsp_ph()" ~ closers ~ ";" ~
+    return (text[0 .. segStart] ~ "__dmd_lsp_ph()" ~ closers ~ ";" ~
         text[off .. $] ~ "\nvoid __dmd_lsp_ph(T)(T _t) {}\n").idup;
 }
 
@@ -713,9 +834,19 @@ private string analysisText(string text, uint line, uint col)
         return v;
     if (auto v2 = tokenPlaceholder(text, line, col))
         return v2;
-    // Plain prefix inside an unclosed call/array: blank the statement.
+    // A partial identifier after other code (`auto x = st`), or a plain
+    // prefix inside an unclosed call/array: blank the whole statement. That
+    // removes the growing token, so the analysis text is identical for every
+    // prefix length and completion reuses one universe for the whole word
+    // (otherwise each keystroke rebuilds). The scope the completion needs is
+    // declared in earlier statements and survives.
     size_t off = lineColToOffset(text, line, col);
-    if (closerFor(text, off).length)
+    bool partialIdent = off > 0 && isIdentChar(text[off - 1]) &&
+        (off >= text.length || !isIdentChar(text[off]));
+    // Import/module declarations drive completion from their own AST node
+    // (module paths, selective symbol lists), so never blank them.
+    if ((partialIdent && !lineHasImportModule(text, off)) ||
+        closerFor(text, off).length)
         if (auto v3 = statementPlaceholder(text, line, col))
             return v3;
     return text;
@@ -782,6 +913,27 @@ private string closerFor(const(char)[] text, size_t off)
         closers ~= (stack[sp] == '(' ? ')' : ']');
     }
     return closers.idup;
+}
+
+// True when `import` or `module` appears as a word on the cursor's line
+// before `off`.
+private bool lineHasImportModule(const(char)[] text, size_t off) pure nothrow @nogc @safe
+{
+    size_t ls = off;
+    while (ls > 0 && text[ls - 1] != '\n')
+        ls--;
+    auto line = text[ls .. off];
+    static immutable string[] kw = ["import", "module"];
+    foreach (k; kw)
+        foreach (i; 0 .. line.length)
+        {
+            if (i + k.length > line.length || line[i .. i + k.length] != k)
+                continue;
+            if ((i == 0 || !isIdentChar(line[i - 1])) &&
+                (i + k.length == line.length || !isIdentChar(line[i + k.length])))
+                return true;
+        }
+    return false;
 }
 
 private bool isIdentChar(char c) pure nothrow @nogc @safe
@@ -928,7 +1080,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     text = "";
                 sessionOpen(app.session, path, text);
                 if (!isDlsJson(path))
-                    publishFor(app, path, text);
+                    publishFor(app, path, text, true);
             }
             else if (m.method == "textDocument/didChange")
             {
@@ -973,11 +1125,10 @@ private void handleMessage(App* app, ref RawMsg m)
                     }
                     base = applyChange(base, insert, hasRange, sl, sc, el, ec);
                 }
-                // Debounce: update the session, analyze on idle. Always
-                // mark pending, even for identical resends: dep bytes are
-                // fingerprinted at analysis time, so a same-text change is
-                // how on-disk dep edits get noticed (unchanged deps hit
-                // the universe cache for ~free anyway).
+                // A keystroke is a delta patch to the in-memory buffer. The
+                // analysis runs after the debounce idle (cheap reuse when a
+                // completion already built the current buffer), so the doc is
+                // analyzed without saving, without a rebuild per key.
                 sessionUpdate(app.session, path, base);
                 markPending(app, path);
             }
@@ -989,6 +1140,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 string path = uriToPath(uri);
                 sessionClose(app.session, path);
                 clearPending(app, path);
+                app.tokCache.remove(path.idup);
+                app.tokHash.remove(path.idup);
             }
             else if (m.method == "textDocument/didSave")
             {
@@ -1014,18 +1167,18 @@ private void handleMessage(App* app, ref RawMsg m)
                     if (text)
                     {
                         sessionUpdate(app.session, path, text);
-                        publishFor(app, path, text);
+                        publishFor(app, path, text, true);
                     }
                 }
                 else if (auto d = sessionFind(app.session, path))
                 {
                     if (d.text)
-                        publishFor(app, path, d.text);
+                        publishFor(app, path, d.text, true);
                 }
                 else if (auto disk = sessionReadDisk(path))
                 {
                     sessionUpdate(app.session, path, disk);
-                    publishFor(app, path, disk);
+                    publishFor(app, path, disk, true);
                 }
             }
         }
@@ -1034,6 +1187,10 @@ private void handleMessage(App* app, ref RawMsg m)
         }
         return;
     }
+    // A message with an id but no method is the client answering one of our
+    // server->client requests (e.g. workspace/semanticTokens/refresh).
+    if (m.method.length == 0)
+        return;
     // requests
     if (m.method == "initialize")
     {
@@ -1043,10 +1200,20 @@ private void handleMessage(App* app, ref RawMsg m)
         // LSP 3.17 labelDetails: only clients that opt in get the split
         // "(params) / return type" form.
         if (auto capsIn = jget(p, "capabilities"))
+        {
             if (auto tdc = jget(capsIn, "textDocument"))
+            {
                 if (auto compIn = jget(tdc, "completion"))
                     if (auto ciIn = jget(compIn, "completionItem"))
                         app.labelDetails = jbool(jget(ciIn, "labelDetailsSupport"), false);
+                app.wantSemantic = jget(tdc, "semanticTokens") !is null;
+            }
+            // workspace/semanticTokens/refresh: lets us defer token pulls to
+            // the debounced build instead of rebuilding on every keystroke.
+            if (auto ws = jget(capsIn, "workspace"))
+                if (auto st = jget(ws, "semanticTokens"))
+                    app.semanticRefresh = jbool(jget(st, "refreshSupport"), false);
+        }
         Notice note;
         if (auto root = initRoot(p))
             note = loadFileConfig(app, root);
@@ -1071,6 +1238,19 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "definitionProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "codeActionProvider", true);
+        auto legend = js.create_object();
+        auto tt = js.create_array();
+        foreach (t; tokenTypes)
+            js.add_item_to_array(tt, js.create_string(zstr(t)));
+        js.add_item_to_object(legend, "tokenTypes", tt);
+        auto tm = js.create_array();
+        foreach (t; tokenModifiers)
+            js.add_item_to_array(tm, js.create_string(zstr(t)));
+        js.add_item_to_object(legend, "tokenModifiers", tm);
+        auto stp = js.create_object();
+        js.add_item_to_object(stp, "legend", legend);
+        js.add_bool_to_object(stp, "full", true);
+        js.add_item_to_object(caps, "semanticTokensProvider", stp);
         auto si = js.create_object();
         js.add_string_to_object(si, "name", "dmd-lsp");
         js.add_string_to_object(si, "version", dmdLspVersion);
@@ -1309,6 +1489,44 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
             return;
         }
+        if (m.method == "textDocument/semanticTokens/full")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, `{"data":[]}`);
+                return;
+            }
+            string path = uriToPath(uri);
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+
+            ulong h = text.length ? fnv1a64(cast(const(ubyte)[])text) : 0;
+            // Already tokenized this exact text: answer from cache (repeated
+            // pulls, and the refresh round-trip after a build).
+            if (h && (path.idup in app.tokHash) && app.tokHash[path.idup] == h)
+            {
+                lspRespond(m.idJson, tokensResultJson(app.tokCache[path.idup]));
+                return;
+            }
+            // Mid-edit (analysis still queued): keep the previous tokens
+            // instead of forcing a build per keystroke. The debounce build
+            // then refreshes them.
+            if (hasPending(app, path) && app.debounceMs > 0)
+            {
+                worker.WToken[] cached;
+                if (auto c = path.idup in app.tokCache)
+                    cached = *c;
+                lspRespond(m.idJson, tokensResultJson(cached));
+                return;
+            }
+            lspRespond(m.idJson, tokensResultJson(refreshTokens(app, path, text)));
+            return;
+        }
         if (m.method == "textDocument/codeAction")
         {
             const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
@@ -1320,8 +1538,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 if (hasPending(app, path))
                 {
                     // Actions carry edit ranges: refresh so they match the
-                    // current text. No notify here (that stays debounced);
-                    // pending is kept, the idle flush then hits.
+                    // current text.
                     const(char)[] text;
                     auto d = sessionFind(app.session, path);
                     if (d)
@@ -1511,7 +1728,10 @@ private void refreshImports(App* app)
         app.flags = feff;
         app.configGen++;
         // Worker bakes paths in at spawn; drop it so the next request
-        // respawns with the new configuration.
+        // respawns with the new configuration. Tokens may resolve
+        // differently under the new paths, so drop the cache too.
+        app.tokCache = null;
+        app.tokHash = null;
         workerKill(app.wk);
     }
 }
@@ -1543,7 +1763,7 @@ int main(string[] args)
     string[] files;
     bool check = false;
     bool stdio_ = false;
-    ulong debounceMs = 300;
+    ulong debounceMs = 500;
     bool debounceSet = false;
     foreach (a; args[1 .. $])
     {
@@ -1569,7 +1789,7 @@ int main(string[] args)
             {
                 if (c < '0' || c > '9')
                 {
-                    v = 300;
+                    v = 500;
                     break;
                 }
                 v = v * 10 + cast(ulong)(c - '0');
@@ -1588,11 +1808,12 @@ int main(string[] args)
     if (check)
         return runCheck(files, imports, stringImports, flags);
 
-    // default: stdio LSP loop with debounced diagnostics.
-    // didChange only marks docs pending; analysis runs after `debounceMs`
-    // of stdin idle, so a keystroke burst costs one analysis, not N.
-    // All dmd work happens in a forked worker (see worker.d); the parent
-    // holds no dmd state, so nothing accumulates across rebuilds.
+    // stdio LSP loop. `didChange` is a delta patch to the in-memory buffer;
+    // the analysis runs on the debounce idle (so the unsaved doc is analysed
+    // without a save), reusing the live universe when the text is unchanged
+    // since the last build. open/save force a real rebuild for exact
+    // diagnostics. All dmd work happens in a forked worker (worker.d); the
+    // parent holds no dmd state, so nothing accumulates across rebuilds.
     App app;
     app.debounceMs = debounceMs;
     app.debounceSet = debounceSet;
@@ -1644,10 +1865,10 @@ int main(string[] args)
             }
             if (!lspRead(&m, body_))
                 break;
-            app.lastMsgMs = nowMs();
             handleMessage(&app, m);
-            // Parent heap is tiny (session + cached lint); collect so the
-            // per-message JSON/text garbage never accumulates.
+            // Restart the idle clock after handling so a slow build doesn't
+            // make the debounce look elapsed the moment it returns.
+            app.lastMsgMs = nowMs();
             GC.collect();
         }
     }

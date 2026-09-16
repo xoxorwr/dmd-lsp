@@ -15,6 +15,7 @@ import session;
 import server;
 import complete;
 import lint;
+import semantic : SemTok, semanticTokens;
 
 import dmd.dmodule : Module;
 
@@ -212,6 +213,26 @@ version (Posix)
         writeFrame(fd, printJsonStr(root));
     }
 
+    private void sendSemantic(int fd, const(SemTok)[] toks)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        foreach (t; toks)
+        {
+            auto o = js.create_object();
+            js.add_number_to_object(o, "line", t.line);
+            js.add_number_to_object(o, "col", t.col);
+            js.add_number_to_object(o, "len", t.len);
+            js.add_number_to_object(o, "type", t.type);
+            js.add_number_to_object(o, "mods", t.mods);
+            js.add_item_to_array(arr, o);
+        }
+        js.add_item_to_object(root, "tokens", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(fd, printJsonStr(root));
+    }
+
     private void sendHover(int fd, const ref HoverInfo h)
     {
         auto js = jmake();
@@ -282,7 +303,15 @@ version (Posix)
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                if (built && !serverWouldHit(s, path, text))
+                // open/save (realOnly) require a universe built from the real
+                // text, so a completion placeholder can't hide an error in the
+                // statement it blanked. The debounced keypress analyze reuses
+                // the live universe by identity when it can, which is the
+                // cheap path; otherwise it rebuilds anyway.
+                bool realOnly = jbool(jget(p, "realOnly"), false);
+                bool hit = realOnly ? serverWouldHitAnalysis(s, path, text)
+                                    : serverWouldHit(s, path, text);
+                if (built && !hit)
                 {
                     sendNeedRespawn(fd);
                     continue;
@@ -306,12 +335,32 @@ version (Posix)
                 auto prefix = jstr(jget(p, "prefix"));
                 if (prefix is null)
                     prefix = "";
-                if (built && !serverWouldHitAnalysis(s, path, orig, atext))
+                // Key on the analysis text, not the document identity: while
+                // the user grows a member name the neutralised buffer is
+                // unchanged, so reuse the live universe instead of rebuilding.
+                // (The debounced analyze deliberately does *not* reuse this
+                // placeholder: see its op — diagnostics need the real text.)
+                Analysis a;
+                if (built)
                 {
-                    sendNeedRespawn(fd);
-                    continue;
+                    if (!serverWouldHitAnalysis(s, path, atext))
+                    {
+                        sendNeedRespawn(fd);
+                        continue;
+                    }
+                    // Record the current document version as this universe's
+                    // identity, so the debounced keypress analyze reuses it
+                    // (cheap) instead of rebuilding. open/save pass realOnly
+                    // and get the real text regardless.
+                    import session : fnv1a64;
+                    s.uni.rootHash = fnv1a64(cast(const(ubyte)[])orig);
+                    s.scratch.rewind(s.uni.mark);
+                    a = s.uni.analysis;
                 }
-                auto a = serverAnalyze(s, path, atext, orig);
+                else
+                {
+                    a = serverAnalyze(s, path, atext, orig);
+                }
                 CompleteCtx ctx;
                 ctx.line = line;
                 ctx.character = col;
@@ -397,6 +446,29 @@ version (Posix)
                 HoverInfo h;
                 hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
                 sendHover(fd, h);
+                built = true;
+                continue;
+            }
+            if (ops == "semantic")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto text = jstr(jget(p, "text"));
+                if (text is null)
+                    text = "";
+                // Reuse the live universe by document identity, like
+                // diagnostics: this is what keeps completion/token/analyze
+                // requests on the same buffer instead of evicting each other.
+                // A neutralised universe is fine — the classifier is
+                // position-safe and falls back to the pre-semantic snapshot.
+                if (built && !serverWouldHit(s, path, text))
+                {
+                    sendNeedRespawn(fd);
+                    continue;
+                }
+                auto a = serverAnalyze(s, path, text);
+                SemTok[] toks;
+                semanticTokens(cast(Module)a.module_, a.syn, text, toks);
+                sendSemantic(fd, toks);
                 built = true;
                 continue;
             }
@@ -586,6 +658,15 @@ struct WHover
     string doc;
 }
 
+struct WToken
+{
+    uint line = 0; // 0-based
+    uint col = 0;  // 0-based
+    uint len = 0;
+    ubyte type = 0;
+    uint mods = 0;
+}
+
 enum ExchangeResult
 {
     ok,
@@ -636,13 +717,15 @@ private void parseAnalysis(JsonNode* root, ref WAnalysis out_)
 }
 
 ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] text,
-    ref WAnalysis out_)
+    ref WAnalysis out_, bool realOnly = false)
 {
     auto js = jmake();
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("analyze"));
     js.add_string_to_object(root, "path", zstr(path));
     js.add_string_to_object(root, "text", zstr(text));
+    if (realOnly)
+        js.add_bool_to_object(root, "realOnly", true);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -787,6 +870,38 @@ ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext
     {
         out_.detail = dupOrEmpty(jstr(jget(r, "detail")));
         out_.doc = dupOrEmpty(jstr(jget(r, "doc")));
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerSemantic(ref Worker w, const(char)[] path, const(char)[] text,
+    ref WToken[] toks)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("semantic"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "text", zstr(text));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "tokens"))
+    {
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WToken t;
+            t.line = cast(uint)jint(jget(c, "line"));
+            t.col = cast(uint)jint(jget(c, "col"));
+            t.len = cast(uint)jint(jget(c, "len"));
+            t.type = cast(ubyte)jint(jget(c, "type"));
+            t.mods = cast(uint)jint(jget(c, "mods"));
+            toks ~= t;
+        }
     }
     return ExchangeResult.ok;
 }

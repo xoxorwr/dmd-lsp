@@ -34,6 +34,15 @@ hits from it; on any invalidation it replies `needRespawn` and the parent
 kills it and forks a fresh one, so nothing accumulates and the OS reclaims
 everything on exit. Bounded to ~one universe.
 
+One worker serves everything. A neutralised (completion) parse and a real
+(diagnostics/semantic) parse cannot coexist in one process's dmd globals, so
+the universe records which buffer it parsed (`analysisHash`) and which
+document version it was keyed to (`rootHash`). Completion reuses it when the
+neutralised text matches and **refreshes `rootHash` to the current document
+version**; the debounced analyze and the symbol/token requests then hit the
+same universe by identity instead of evicting it. That keeps a typing burst
+on one universe (see *Neutralised variants*).
+
 The isolation decision (measurements, the identifier-pool bug, eviction
 experiments, a region-GC spike) is written up in
 [findings.md](findings.md).
@@ -51,6 +60,37 @@ experiments, a region-GC spike) is written up in
 - Completion merges a pre-semantic structure snapshot (function ranges,
   local names — immune to `ErrorStatement` rewrites) with semantic types;
   unresolved identifier types resolve via scope lookup.
+- Semantic tokens (`semanticTokens/full`) lex identifiers, resolve each
+  through the same symbol machinery as goto-definition, and walk the symbol
+  tree for declaration names the use-pass can't reach (fields, enum
+  members, template parameters). Batch resolution hoists module
+  member/import-name indexes and function ranges so a whole file costs one
+  pass, not one walk per token. A lexical hint layer covers what resolution
+  can't: `import std.conv;` path segments render `namespace`, `@safe`/`@nogc`
+  render `modifier`, other `@uda`s `decorator`, and references to template
+  parameters (from the AST) render `typeParameter`. Template functions test
+  their member so `save`/`empty`/`popFront` render `function`, not `type`. A
+  function-pointer/delegate variable renders `function`/`method` where it is
+  called (`state.fn_on_tick()`) and `property`/`variable` where it is only
+  read. On real Phobos this lifts identifier coverage from ~45% to ~55-78%.
+  A pull that arrives while an edit is still debounced is answered from the
+  cached token set (keyed on the buffer hash) instead of forcing a build.
+  The idle flush computes and caches the token set for the fresh buffer
+  *before* it sends `workspace/semanticTokens/refresh`, so the client's
+  re-pull is a pure cache hit — the editor never waits on a scan/resolve.
+  So the debounce governs analysis even though tokens are pulled eagerly.
+  Token resolution requires a universe built from the real text
+  (`serverWouldHitAnalysis`), never a completion placeholder: the
+  placeholder is a neutralised buffer with synthetic `__dmd_lsp_ph` code,
+  and resolving against it would make highlighting depend on completion
+  request order. The cost is one extra build when a placeholder completion
+  precedes a token pull; the precompute above absorbs it during the idle
+  flush. Locals the pre-semantic snapshot knows but semantic dropped (a
+  body collapsed by a syntax error) are classified from the snapshot, so
+  the real, potentially-invalid buffer still highlights. The snapshot also
+  recovers an `auto` local's constructed type from its initializer
+  (`auto q = Point(...)`, `new Point(...)`, `auto s = factory!(State)()`),
+  so member access above the error keeps its `property`/`method` colour.
 - The worker's stdout is rerouted to stderr: dmd message-kind output
   bypasses `DiagnosticHandler` straight to stdout, which would corrupt LSP
   framing. `initDMD` leaves the lexer identifier tables unset (stock sets
@@ -75,38 +115,55 @@ noticed on the dependent's next analysis (no file watching); a same-text
 
 dmd collapses a whole function body to one `ErrorStatement` on any statement
 error, wiping every local's inferred `auto` type. To keep completion working
-while typing, the request is analysed against a **neutralised variant** of
-the buffer (keyed on the *real* document text): a dangling dot becomes
-`x.__dmd_lsp_ph()` plus an appended unconstrained UFCS template; a lone
-partial identifier is dropped; an unfinished call/array argument blanks its
-expression statement.
+while typing, the request is analysed against a **neutralised variant** of the
+buffer: a partial member after a dot has its whole segment replaced with
+`__dmd_lsp_ph()` plus an appended unconstrained UFCS template; a lone partial
+identifier is dropped; a partial identifier after other code (`auto x = st`)
+or an unfinished call/array argument blanks its statement. The last two make
+the parsed text identical for every prefix length, so a whole word costs one
+build, not one per keystroke. Import/module lines are never blanked — their
+path/selective lists drive completion from the AST.
 
-The universe records both hashes (`Universe.rootHash` = document,
-`Universe.analysisHash` = what was parsed, `serverWouldHitAnalysis`), so the
-debounced analyze for that same document text is a hit: one build per
-document version, not one per request. Only **completion** needs the exact
-analysis text (it walks the AST at the cursor); **hover, definition and
-signature help** match on document identity alone (`serverWouldHit`), since
-neutralisation rewrites only the incomplete statement, never declarations —
-so a symbol request after a placeholder completion reuses that universe
-instead of rebuilding. Placeholder diagnostics are rewritten back to document
-columns (`mapFixDiags`). `tests/test_spawn.py` locks the spawn accounting in
-by counting worker spawns.
+The universe records both hashes (`Universe.rootHash` = document identity,
+`Universe.analysisHash` = what was parsed). `serverWouldHit` matches on
+identity (diagnostics, hover, definition, signature, semantic);
+`serverWouldHitAnalysis` matches on the analysis text (completion). Because
+`s.a`, `s.ab`, `s.abc` all neutralise to the same buffer, completion reuses
+one universe while a member name grows; it also refreshes `rootHash` to the
+current document version, so the debounced analyze for the same text hits
+that universe instead of rebuilding the real one. The cursor and prefix still
+come from the real text, so filtering is live. Placeholder diagnostics are
+rewritten back to document columns (`mapFixDiags`). `tests/test_spawn.py`,
+`test_completion_prefix.py`, `test_completion_burst.py` and
+`test_realworld.py` lock the spawn accounting in.
 
 ## Request loop
 
-The stdio loop is poll-gated (single-threaded, no preemption): pending docs
-are analysed after the debounce idle timeout, so superseded work is never
-started — that coalescing is the cancellation story, since dmd offers no safe
-mid-analysis abort point. stdin runs unbuffered so kernel pipe state (what
-`poll` observes) and stdio agree; mixing `poll` with buffered stdio silently
-strands messages in the userspace buffer.
+The stdio loop is poll-gated (single-threaded, no preemption): a document is
+analysed after `debounceMs` of stdin idle — dmd offers no safe mid-analysis
+abort point, so debouncing is the cancellation story. The default is 500 ms
+(`--debounce-ms`, `dls.json`, editor setting): a fixed debounce only coalesces
+keystrokes whose gap is *below* it, and a realistic typing cadence has
+300–500 ms thinking pauses, so 300 ms analysed most characters individually.
+The idle clock is restarted *after* each message is handled, so a slow request
+(a completion's worker build) can't make the debounce look elapsed the instant
+it returns and trigger a flush between keystrokes. Typing with the suggest
+widget open never relies on the debounce at all: completion neutralises the
+partial token, so the flush hits the same universe (see *Neutralised
+variants*). Each pending path is always unmarked by
+the flush, even on failure — a pending path that survives makes the idle loop
+retry it immediately (timeout 0), forking a worker per iteration. stdin runs
+unbuffered so kernel pipe state (what `poll` observes) and stdio agree; mixing
+`poll` with buffered stdio silently strands messages in the userspace buffer.
+Semantic pulls during an edit are served from the token cache; the debounced
+build precomputes the new set before its `workspace/semanticTokens/refresh`.
 
 ## Status
 
-Verified by `make check` (94 assertions across the LSP, universe-cache,
-debounce, config and memory suites) plus stress runs against real dmd
-sources (378 KB file, full frontend semantic):
+Verified by `make check` (136 assertions across the LSP, semantic-token,
+completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
+debounce, config and memory suites) plus stress runs against real dmd sources
+(378 KB full frontend semantic, and the kdom game):
 
 - Diagnostics (compiler errors as you type, incl. broken code), unused
   import/parameter hints, remove-import quickfixes.

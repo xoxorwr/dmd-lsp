@@ -26,6 +26,8 @@ More in [docs/releases.md](docs/releases.md).
 make            # -> ./dmd-lsp, from the vendored src/dmd/
 make DC=ldmd2   # same, with LDC's dmd-compatible driver (smaller binary)
 make check      # struct-only guard + batch fixtures + LSP regression suite
+make vscode     # compile the VS Code extension (tsc + esbuild)
+make vsix       # package it -> editor/vscode/dmd-lsp.vsix
 ```
 
 Needs a D compiler (DMD 2.113 line, or LDC ≥ 1.42 whose frontend covers it).
@@ -43,7 +45,7 @@ CLI:
 ./dmd-lsp --import=DIR...          # module import paths (-I)
 ./dmd-lsp --string-import=DIR...   # string import paths (-J, import("..."))
 ./dmd-lsp --flag=-preview=NAME     # pass a supported dmd flag
-./dmd-lsp --debounce-ms=N          # diagnostics idle delay (default 300)
+./dmd-lsp --debounce-ms=N          # diagnostics idle delay (default 500)
 ./dmd-lsp --version
 ```
 
@@ -51,7 +53,8 @@ Editor: point any LSP client at `dmd-lsp` for `.d`/`.di`. Supported:
 `initialize`, `textDocument/{didOpen,didChange,didClose,didSave}`,
 `completion` (LSP 3.17 `labelDetails` when the client opts in),
 `signatureHelp`, `definition` (goto), `hover` (type + docs), `codeAction`
-(remove unused import), `publishDiagnostics`.
+(remove unused import), `semanticTokens/full` (identifier-level semantic
+highlighting), `publishDiagnostics`.
 
 Configuration (precedence: editor settings → CLI → `dls.json` → builtin
 stdlib defaults):
@@ -62,7 +65,7 @@ stdlib defaults):
   "importPaths": ["src/", "sandbox/"],
   "stringImportPaths": ["views/"],   // for import("...") files (-J)
   "flags": ["-preview=rvaluerefparam", "-preview=bitfields", "-betterC"],
-  "debounceMs": 300
+  "debounceMs": 500
 }
 ```
 

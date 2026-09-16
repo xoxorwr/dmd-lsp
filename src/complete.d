@@ -16,7 +16,7 @@ import dmd.dsymbol : Dsymbol, Visibility;
 import dmd.func : FuncDeclaration;
 import dmd.declaration : VarDeclaration;
 import dmd.aggregate : AggregateDeclaration;
-import dmd.dtemplate : TemplateDeclaration;
+import dmd.dtemplate : TemplateDeclaration, TemplateInstance;
 import dmd.statement : Statement;
 import dmd.arraytypes : Dsymbols;
 import dmd.attrib : ConditionalDeclaration;
@@ -25,6 +25,10 @@ import dmd.mtype : Type, TypePointer, TypeFunction;
 import dmd.astenums : TY, VarArg;
 import dmd.typesem : nextOf, toBasetype;
 import dmd.dsymbolsem : toAlias;
+import dmd.init : Initializer;
+import dmd.expression : Expression, CallExp, NewExp, IdentifierExp, TypeExp,
+    DotIdExp, DotTemplateInstanceExp, ScopeExp, TemplateExp;
+import dmd.rootobject : DYNCAST;
 
 struct CompleteCtx
 {
@@ -280,7 +284,8 @@ private Dsymbol[] scopeMembers(Dsymbol scope_)
 // Child scopes to descend when walking members. Attribute blocks
 // (`private:`, `@safe:`, `extern(C++):`, ...) hide declarations inside
 // them in real-world code — missing this drops most members.
-private void appendScopeSubs(Dsymbol s, ref Dsymbol[] out_)
+// Public so semantic highlighting can walk declarations too.
+void appendScopeSubs(Dsymbol s, ref Dsymbol[] out_)
 {
     if (auto ad = s.isAggregateDeclaration())
     {
@@ -367,6 +372,46 @@ private void findFuncRec(Dsymbol s, uint line, ref FuncDeclaration best, ref uin
     }
 }
 
+// One pass collection of function ranges (mirrors findEnclosingFunc's
+// selection) so batch callers don't re-walk the whole symbol tree per line.
+private struct FuncRange
+{
+    uint start = 0;
+    uint end = 0;
+    uint depth = 0;
+    FuncDeclaration fd;
+}
+
+private void collectFuncRanges(Dsymbol s, uint depth, ref FuncRange[] out_)
+{
+    Dsymbol[] subs;
+    appendScopeSubs(s, subs);
+    foreach (m; subs)
+    {
+        if (auto fd = m.isFuncDeclaration())
+        {
+            uint sl = fd.loc.linnum();
+            if (sl >= 1)
+                out_ ~= FuncRange(sl, fd.endloc.linnum(), depth, fd);
+        }
+        collectFuncRanges(m, depth + 1, out_);
+    }
+}
+
+private FuncDeclaration enclosingFunc(FuncRange[] rs, uint line)
+{
+    FuncDeclaration best = null;
+    uint bestDepth = 0;
+    foreach (ref r; rs)
+        if (r.start >= 1 && r.start <= line && (r.end == 0 || line <= r.end) &&
+            r.depth >= bestDepth)
+        {
+            best = r.fd;
+            bestDepth = r.depth;
+        }
+    return best;
+}
+
 private FuncDeclaration findEnclosingFunc(Module mod, uint line)
 {
     FuncDeclaration best = null;
@@ -401,9 +446,30 @@ struct SynLocal
     string name;
     uint line = 0;
     string typeName; // unresolved (pre-semantic) type ident, if simple
+    string typeText; // full pre-semantic type spelling for display (`Event*`)
 }
 
-// Best-effort pre-semantic type ident (TypeIdentifier only).
+// Full pre-semantic type spelling, for describing a local in completion.
+private string typeTextOf(Type t)
+{
+    if (!t)
+        return null;
+    const(char)* p = t.toChars();
+    if (!p)
+        return null;
+    import core.stdc.string : strlen;
+    return p[0 .. strlen(p)].idup;
+}
+
+// SynLocal with both the resolution ident and the display spelling.
+private SynLocal synVar(const(char)[] name, uint line, Type t)
+{
+    return SynLocal(name.idup, line, identTypeName(t), typeTextOf(t));
+}
+
+// Best-effort pre-semantic type ident from a declaration's type: a
+// TypeIdentifier, or a pointer/qualifier over one (`Event* ev` -> `Event`),
+// so member access survives a collapsed body.
 private string identTypeName(Type t)
 {
     if (!t)
@@ -413,6 +479,82 @@ private string identTypeName(Type t)
         if (ti.ident)
             return ti.ident.toString().idup;
     }
+    if (auto tp = t.isTypePointer())
+        return identTypeName(tp.nextOf());
+    return null;
+}
+
+// First template argument as a type name (`create!(State)` -> `State`), a
+// common factory shape whose result type is the argument.
+private string firstTemplateArgName(TemplateInstance ti)
+{
+    if (!ti || !ti.tiargs || (*ti.tiargs).length == 0)
+        return null;
+    auto ro = (*ti.tiargs)[0];
+    if (!ro)
+        return null;
+    if (ro.dyncast() == DYNCAST.type)
+        return identTypeName(cast(Type)ro);
+    if (ro.dyncast() == DYNCAST.expression)
+    {
+        auto ex = cast(Expression)ro;
+        if (auto ie = ex.isIdentifierExp())
+        {
+            if (ie.ident)
+                return ie.ident.toString().idup;
+        }
+        else if (auto te = ex.isTypeExp())
+            return identTypeName(te.type);
+    }
+    return null;
+}
+
+// Pre-semantic type name of what an `auto` initializer constructs:
+// `Type(...)`, `new Type(...)`, `pkg.Type(...)`, `factory!(Type)(...)`. When
+// an unrelated error collapses a body, this is all that is left to resolve
+// members on the local (`auto q = Point(...); q.x`).
+private string initTypeName(Initializer init)
+{
+    if (!init)
+        return null;
+    auto ei = init.isExpInitializer();
+    if (!ei || !ei.exp)
+        return null;
+    auto e = ei.exp;
+    if (auto ce = e.isCallExp())
+    {
+        auto callee = ce.e1;
+        if (auto ie = callee.isIdentifierExp())
+        {
+            if (ie.ident)
+                return ie.ident.toString().idup;
+        }
+        else if (auto te = callee.isTypeExp())
+            return identTypeName(te.type);
+        else if (auto de = callee.isDotIdExp())
+        {
+            if (de.ident)
+                return de.ident.toString().idup;
+        }
+        else if (auto dti = callee.isDotTemplateInstanceExp())
+            return firstTemplateArgName(dti.ti);
+        else if (auto se = callee.isScopeExp())
+        {
+            if (auto ti = se.sds.isTemplateInstance())
+                return firstTemplateArgName(ti);
+        }
+        else if (auto te = callee.isTemplateExp())
+        {
+            if (te.td && te.td.onemember)
+                if (auto ti = te.td.onemember.isTemplateInstance())
+                    return firstTemplateArgName(ti);
+        }
+        return null;
+    }
+    if (auto ne = e.isNewExp())
+        return identTypeName(ne.newtype);
+    if (auto te = e.isTypeExp())
+        return identTypeName(te.type);
     return null;
 }
 
@@ -425,6 +567,7 @@ struct SynFunc
     SynLocal[] vars;   // body vars (names + decl lines + type idents)
     string[] params;   // param names from the type (no locs)
     string[] paramTypes; // parallel unresolved type idents (may be null)
+    string[] paramTypeTexts; // parallel full type spelling for display
 }
 
 struct SynMod
@@ -445,8 +588,13 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
                 if (auto vd = de.declaration.isVarDeclaration())
                 {
                     if (vd.ident)
+                    {
+                        auto tn = identTypeName(vd.type);
+                        if (!tn.length)
+                            tn = initTypeName(vd._init);
                         fn.vars ~= SynLocal(vd.ident.toString().idup,
-                            vd.loc.linnum(), identTypeName(vd.type));
+                            vd.loc.linnum(), tn, typeTextOf(vd.type));
+                    }
                 }
                 else if (auto nfd = de.declaration.isFuncDeclaration())
                     synFunc(nfd, fn.depth + 1);
@@ -468,8 +616,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
     if (auto is_ = s.isIfStatement())
     {
         if (is_.param && is_.param.ident)
-            fn.vars ~= SynLocal(is_.param.ident.toString().idup,
-                is_.loc.linnum(), identTypeName(is_.param.type));
+            fn.vars ~= synVar(is_.param.ident.toString(), is_.loc.linnum(), is_.param.type);
         synWalkBody(is_.ifbody, funcEnd, fn);
         synWalkBody(is_.elsebody, funcEnd, fn);
         return;
@@ -477,8 +624,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
     if (auto ws = s.isWhileStatement())
     {
         if (ws.param && ws.param.ident)
-            fn.vars ~= SynLocal(ws.param.ident.toString().idup,
-                ws.loc.linnum(), identTypeName(ws.param.type));
+            fn.vars ~= synVar(ws.param.ident.toString(), ws.loc.linnum(), ws.param.type);
         synWalkBody(ws._body, funcEnd, fn);
         return;
     }
@@ -500,23 +646,19 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
             {
                 auto p = (*fes.parameters)[i];
                 if (p && p.ident)
-                    fn.vars ~= SynLocal(p.ident.toString().idup,
-                        fes.loc.linnum(), identTypeName(p.type));
+                    fn.vars ~= synVar(p.ident.toString(), fes.loc.linnum(), p.type);
             }
         if (fes.key && fes.key.ident)
-            fn.vars ~= SynLocal(fes.key.ident.toString().idup,
-                fes.key.loc.linnum(), identTypeName(fes.key.type));
+            fn.vars ~= synVar(fes.key.ident.toString(), fes.key.loc.linnum(), fes.key.type);
         if (fes.value && fes.value.ident)
-            fn.vars ~= SynLocal(fes.value.ident.toString().idup,
-                fes.value.loc.linnum(), identTypeName(fes.value.type));
+            fn.vars ~= synVar(fes.value.ident.toString(), fes.value.loc.linnum(), fes.value.type);
         synWalkBody(fes._body, funcEnd, fn);
         return;
     }
     if (auto sw = s.isSwitchStatement())
     {
         if (sw.param && sw.param.ident)
-            fn.vars ~= SynLocal(sw.param.ident.toString().idup,
-                sw.loc.linnum(), identTypeName(sw.param.type));
+            fn.vars ~= synVar(sw.param.ident.toString(), sw.loc.linnum(), sw.param.type);
         synWalkBody(sw._body, funcEnd, fn);
         return;
     }
@@ -543,8 +685,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
             {
                 auto c = (*tc.catches)[i];
                 if (c.ident)
-                    fn.vars ~= SynLocal(c.ident.toString().idup,
-                        c.loc.linnum, identTypeName(c.type));
+                    fn.vars ~= synVar(c.ident.toString(), c.loc.linnum, c.type);
                 synWalkBody(c.handler, funcEnd, fn);
             }
         return;
@@ -558,8 +699,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
     if (auto w = s.isWithStatement())
     {
         if (w.prm && w.prm.ident)
-            fn.vars ~= SynLocal(w.prm.ident.toString().idup,
-                w.loc.linnum(), identTypeName(w.prm.type));
+            fn.vars ~= synVar(w.prm.ident.toString(), w.loc.linnum(), w.prm.type);
         synWalkBody(w._body, funcEnd, fn);
         return;
     }
@@ -596,6 +736,7 @@ private void synFunc(FuncDeclaration fd, uint depth)
                     {
                         fn.params ~= p.ident.toString().idup;
                         fn.paramTypes ~= identTypeName(p.type);
+                        fn.paramTypeTexts ~= typeTextOf(p.type);
                     }
                 }
         }
@@ -997,10 +1138,14 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
     }
     if (!shadowed)
     {
-        // Module-level lookup (members + import aliases + module names).
+        // Module-level lookup (members + import aliases + module names +
+        // names visible through imports, e.g. `EventType.` for an imported
+        // enum — hover already resolves these; completion must too).
         Dsymbol cur = findMember(rootMembers, baseName(segs[0]));
         if (!cur)
             cur = findImportScope(root, baseName(segs[0]));
+        if (!cur)
+            cur = findImportMember(root, baseName(segs[0]));
         if (!cur)
             return null;
         curMembers = stepInto(cur, depth + 1, root, rootMembers);
@@ -1102,6 +1247,47 @@ private Dsymbol findInModuleInterface(Module m, const(char)[] name, int depth)
         }
     }
     return null;
+}
+
+// Name -> symbol reachable through direct imports and their public
+// re-exports. Built once so per-token lookups don't re-flatten the module.
+private void indexImportInterfaces(Module root, ref Dsymbol[const(char)[]] map)
+{
+    if (!root || !root.members)
+        return;
+    Dsymbol[] flat;
+    flattenMembers(root.members, flat);
+    foreach (s; flat)
+    {
+        auto imp = s.isImport();
+        if (!imp || !imp.mod || imp.isstatic)
+            continue;
+        indexModuleInterface(imp.mod, map, 0);
+    }
+}
+
+private void indexModuleInterface(Module m, ref Dsymbol[const(char)[]] map,
+    int depth)
+{
+    if (!m || !m.members || depth > 4)
+        return;
+    Dsymbol[] flat;
+    flattenMembers(m.members, flat);
+    foreach (s; flat)
+    {
+        if (s.ident)
+        {
+            auto id = s.ident.toString();
+            if (id !in map)
+                map[id] = s;
+        }
+        auto imp = s.isImport();
+        if (!imp || !imp.mod || !imp.mod.members || imp.isstatic)
+            continue;
+        auto vk = imp.visibility.kind;
+        if (vk == Visibility.Kind.public_ || vk == Visibility.Kind.export_)
+            indexModuleInterface(imp.mod, map, depth + 1);
+    }
 }
 
 // Find an import-derived scope by local name: aliasId, static name, or id.
@@ -1597,24 +1783,28 @@ struct DefLoc
     size_t len = 0;     // identifier length at the definition (for the range)
 }
 
-// Full chain ending at the identifier under the cursor. The cursor's own
-// segment is found by expanding over identifier chars only (so hovering
-// `allocator` in `allocator.create` targets `allocator`, not `create`);
-// the left-hand prefix is then extended back over the chain.
-private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
+// Slice of `text` for 1-based `line`, without its trailing newline. `starts`
+// is the line-start offset table (starts[0] == 0).
+private const(char)[] lineSlice(const(char)[] text, const(size_t)[] starts,
+    uint line)
 {
-    size_t i = 0;
-    uint l = 1;
-    while (i < text.length && l < line)
-    {
-        if (text[i] == '\n')
-            l++;
-        i++;
-    }
-    size_t ls = i;
-    while (i < text.length && text[i] != '\n')
-        i++;
-    auto lt = text[ls .. i];
+    if (line == 0 || line > starts.length)
+        return null;
+    size_t s = starts[line - 1];
+    size_t e = line < starts.length ? starts[line] : text.length;
+    if (e > s && text[e - 1] == '\n')
+        e--;
+    if (e > s && text[e - 1] == '\r')
+        e--;
+    return text[s .. e];
+}
+
+// Full chain ending at the identifier at 1-based `col` within `lt` (a single
+// line). The cursor's own segment is found by expanding over identifier
+// chars only (so hovering `allocator` in `allocator.create` targets
+// `allocator`, not `create`); the prefix is then extended back over the chain.
+private const(char)[] chainInLine(const(char)[] lt, uint col)
+{
     size_t e = col - 1;
     if (e > lt.length)
         e = lt.length;
@@ -1632,19 +1822,43 @@ private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
     return lt[s .. segE];
 }
 
-// Jump target for the symbol under the cursor: locals/params, module
-// members, imported names, or members of a resolved dotted chain.
-// Resolve the symbol under the cursor: locals/params, module members,
-// imported names (incl. public re-exports), or members of a dotted chain.
-// Aliases are followed to their target.
-private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
-    uint character, const(char)[] text)
+private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
 {
-    if (!mod || !mod.members)
-        return null;
-    if (!posInCode(text, line, character))
-        return null;
-    auto chain = chainUnderCursor(text, line, character);
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    while (i < text.length && text[i] != '\n')
+        i++;
+    return chainInLine(text[ls .. i], col);
+}
+
+// Name -> first member, for O(1) single-segment lookups (the common case
+// when highlighting every identifier).
+private void indexMembers(Dsymbol[] members, ref Dsymbol[const(char)[]] map)
+{
+    foreach (m; members)
+    {
+        if (!m || !m.ident)
+            continue;
+        auto id = m.ident.toString();
+        if (id !in map)
+            map[id] = m;
+    }
+}
+
+// Resolve a dotted chain against hoisted module members and in-scope locals.
+// Split out of resolveSymbolAt so callers resolving many positions (semantic
+// highlighting) can flatten the module / collect locals once.
+private Dsymbol resolveChain(Module mod, const(char)[] chain, Dsymbol[] rootMembers,
+    Dsymbol[const(char)[]] rootByName, Dsymbol[const(char)[]] importByName,
+    NameType[] locals, FuncDeclaration fd)
+{
     if (!chain.length)
         return null;
 
@@ -1663,12 +1877,6 @@ private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
     if (!segs.length)
         return null;
 
-    Dsymbol[] rootMembers;
-    flattenMembers(mod.members, rootMembers);
-    NameType[] locals;
-    auto fd = findEnclosingFunc(mod, line);
-    collectSlots(mod, syn, line, fd, locals);
-
     Dsymbol sym = null;
     if (segs.length == 1)
     {
@@ -1681,9 +1889,15 @@ private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
         if (!sym && fd && fd.ident && fd.ident.toString() == segs[0])
             sym = fd; // recursive call
         if (!sym)
-            sym = findMember(rootMembers, segs[0]);
+        {
+            if (auto p = segs[0] in rootByName)
+                sym = *p;
+            else
+                sym = findMember(rootMembers, segs[0]);
+        }
         if (!sym)
-            sym = findImportMember(mod, segs[0]);
+            if (auto p = segs[0] in importByName)
+                sym = *p;
     }
     else
     {
@@ -1698,6 +1912,106 @@ private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
     if (t && t !is sym)
         sym = t;
     return sym;
+}
+
+// Jump target for the symbol under the cursor: locals/params, module
+// members, imported names, or members of a resolved dotted chain.
+// Resolve the symbol under the cursor: locals/params, module members,
+// imported names (incl. public re-exports), or members of a dotted chain.
+// Aliases are followed to their target.
+private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
+    uint character, const(char)[] text)
+{
+    if (!mod || !mod.members)
+        return null;
+    if (!posInCode(text, line, character))
+        return null;
+    auto chain = chainUnderCursor(text, line, character);
+    if (!chain.length)
+        return null;
+
+    Dsymbol[] rootMembers;
+    flattenMembers(mod.members, rootMembers);
+    Dsymbol[const(char)[]] rootByName;
+    indexMembers(rootMembers, rootByName);
+    Dsymbol[const(char)[]] importByName;
+    indexImportInterfaces(mod, importByName);
+    NameType[] locals;
+    auto fd = findEnclosingFunc(mod, line);
+    collectSlots(mod, syn, line, fd, locals);
+    return resolveChain(mod, chain, rootMembers, rootByName, importByName, locals, fd);
+}
+
+// Batch resolution for semantic highlighting: one Dsymbol per 1-based
+// (lines[i], cols[i]) position, null where unresolved. Assumes every
+// position is real code (the caller's scanner skips comments/strings), so
+// the per-position posInCode scan is skipped; module flattening is hoisted
+// and locals are recomputed only when the line changes.
+void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
+    const(uint)[] lines, const(uint)[] cols, ref Dsymbol[] out_)
+{
+    out_.length = lines.length;
+    if (!mod || !mod.members)
+        return;
+    Dsymbol[] rootMembers;
+    flattenMembers(mod.members, rootMembers);
+    Dsymbol[const(char)[]] rootByName;
+    indexMembers(rootMembers, rootByName);
+    Dsymbol[const(char)[]] importByName;
+    indexImportInterfaces(mod, importByName);
+    // Line-start offsets so each position maps to its line in O(1) instead
+    // of rescanning the document from the top (O(tokens * size)).
+    size_t[] lineStart = [size_t(0)];
+    foreach (k, ch; text)
+        if (ch == '\n')
+            lineStart ~= k + 1;
+    // Function ranges once, so line -> enclosing function is a flat scan.
+    FuncRange[] funcs;
+    foreach (i; 0 .. (*mod.members).length)
+    {
+        auto m = (*mod.members)[i];
+        if (auto fd = m.isFuncDeclaration())
+        {
+            uint sl = fd.loc.linnum();
+            if (sl >= 1)
+                funcs ~= FuncRange(sl, fd.endloc.linnum(), 0, fd);
+        }
+        collectFuncRanges(m, 1, funcs);
+    }
+    uint lastLine = uint.max;
+    FuncDeclaration fd;
+    FuncDeclaration cachedFd;
+    bool haveCached = false;
+    NameType[] locals;
+    foreach (i; 0 .. lines.length)
+    {
+        auto chain = chainInLine(lineSlice(text, lineStart, lines[i]), cols[i]);
+        if (!chain.length)
+            continue;
+        if (lines[i] != lastLine)
+        {
+            lastLine = lines[i];
+            fd = enclosingFunc(funcs, lines[i]);
+        }
+        // Locals depend on position; recompute only when the enclosing
+        // function changes (at its end line, i.e. the full local set).
+        if (!haveCached || fd !is cachedFd)
+        {
+            haveCached = true;
+            cachedFd = fd;
+            locals = null;
+            uint slotLine = lines[i];
+            if (fd)
+            {
+                uint el = fd.endloc.linnum();
+                if (el >= slotLine)
+                    slotLine = el;
+            }
+            collectSlots(mod, syn, slotLine, fd, locals);
+        }
+        out_[i] = resolveChain(mod, chain, rootMembers, rootByName, importByName,
+            locals, fd);
+    }
 }
 
 private size_t lastSegLen(const(char)[] chain)
@@ -2057,7 +2371,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     continue;
                 if (!hasPrefix(pn, prefix))
                     continue;
-                string tn = i < sfn.paramTypes.length ? sfn.paramTypes[i] : null;
+                string tn = i < sfn.paramTypeTexts.length ? sfn.paramTypeTexts[i] : null;
+                if (!tn.length)
+                    tn = i < sfn.paramTypes.length ? sfn.paramTypes[i] : null;
                 pushItem(arena, out_, pn, 6, "parameter", null, "0", seen, null, tn);
             }
             foreach (ref vl; sfn.vars)
@@ -2066,7 +2382,8 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     continue;
                 if (!hasPrefix(vl.name, prefix))
                     continue;
-                pushItem(arena, out_, vl.name, 6, "local", null, "0", seen, null, vl.typeName);
+                pushItem(arena, out_, vl.name, 6, "local", null, "0", seen, null,
+                    vl.typeText.length ? vl.typeText : vl.typeName);
             }
         }
     }
