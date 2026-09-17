@@ -311,7 +311,7 @@ Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
         stdoutRestore(og);
         return serverAnalyze(s, path, text, identity);
     }
-    a.syn = snapshotModule(cast(Module)modp);
+    a.syn = snapshotModule(cast(Module)modp, text);
     auto errs = dmdSemantic(modp);
     stdoutRestore(og);
     a.module_ = modp;
@@ -369,7 +369,7 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
     stdoutToStderr(og);
     auto pr = dmdParseOnly(path, text);
     if (pr.ok && pr.module_)
-        a.syn = snapshotModule(cast(Module)pr.module_);
+        a.syn = snapshotModule(cast(Module)pr.module_, text);
     auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
     stdoutRestore(og);
     a.module_ = pr.module_;

@@ -530,7 +530,7 @@ private FuncDeclaration enclosingFunc(FuncRange[] rs, uint line)
     return best;
 }
 
-private FuncDeclaration findEnclosingFunc(Module mod, uint line)
+private FuncDeclaration findEnclosingFunc(Module mod, const ref SynMod syn, uint line)
 {
     FuncDeclaration best = null;
     uint bestDepth = 0;
@@ -551,7 +551,26 @@ private FuncDeclaration findEnclosingFunc(Module mod, uint line)
         }
         findFuncRec(s, line, best, bestDepth, 1);
     }
+    // An AST range can be recovery-extended over following functions, so accept
+    // it only when the cursor is inside the function's lexical body; otherwise
+    // the snapshot's brace-scoped fallback owns the locals.
+    if (!funcScopedToLine(syn, best, line))
+        best = null;
     return best;
+}
+
+// True when `fd`'s lexical body (from the snapshot) contains `line`, so its
+// statement-level AST endLocs are safe to trust. A null fd, or a function with
+// no snapshot entry, passes: there is no lexical bound to contradict. This is
+// the single predicate all callers of the statement-level walkers must satisfy.
+// The walkers enforce it unconditionally (guarding, not merely asserting) so an
+// ungated call site fails safe even under -release, where asserts are stripped.
+private bool funcScopedToLine(const ref SynMod syn, FuncDeclaration fd, uint line)
+{
+    if (!fd)
+        return true;
+    auto fsn = synFuncAt(syn, fd.loc.linnum());
+    return !fsn || line <= fsn.endLine;
 }
 
 // ---------- pre-semantic snapshot ----------
@@ -683,6 +702,7 @@ private string initTypeName(Initializer init)
 
 struct SynFunc
 {
+    FuncDeclaration fd; // the parsed function; fbody is re-checked post-semantic
     string name; // null for literals
     uint startLine = 0;
     uint endLine = 0; // 0 = unknown/open
@@ -696,6 +716,9 @@ struct SynFunc
 struct SynMod
 {
     SynFunc[] funcs;
+    // Lexer brace ranges, for scoping captured vars when no function range
+    // matches (recovery merged a function away; see collectSlots).
+    BraceRange[] braces;
 }
 
 private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
@@ -838,14 +861,81 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
 // appends can never invalidate anything being walked.
 private SynFunc[] g_synFuncs;
 
+// Lexer-derived brace ranges for the current snapshot (g_braces, reset with
+// g_synFuncs). Parser error recovery can extend a function's AST past its real
+// body (an unterminated `.` swallows following functions), so scoping from
+// `endloc` leaks locals forward across functions. Matching the body's `{` with
+// dmd's lexer bounds each snapshot scope to its actual body. A text scan would
+// miscount braces inside strings/comments; the lexer cannot.
+struct BraceRange
+{
+    uint openLine;
+    uint openCol;
+    uint closeLine;
+}
+
+private BraceRange[] g_braces;
+
+private void braceRanges(const(char)[] text)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    g_braces = null;
+    auto buf = text.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    uint[] openLines;
+    uint[] openCols;
+    while (true)
+    {
+        Token tok;
+        lex.scan(&tok);
+        if (tok.value == TOK.endOfFile)
+            break;
+        if (tok.value == TOK.leftCurly)
+        {
+            openLines ~= tok.loc.linnum();
+            openCols ~= cast(uint) tok.loc.charnum();
+        }
+        else if (tok.value == TOK.rightCurly && openLines.length)
+        {
+            g_braces ~= BraceRange(openLines[$ - 1], openCols[$ - 1],
+                tok.loc.linnum());
+            openLines.length--;
+            openCols.length--;
+        }
+    }
+}
+
+// Line of the `}` matching this function's body `{`. For a body-less function
+// there is no body scope, and for a body `{` with no lexical match (unterminated
+// or recovery-mangled) the AST end cannot be trusted — it may have swallowed
+// following functions. Both cases collapse the range to the signature line:
+// body locals are then not offered. Missing names are safe; wrong-scope names
+// are not, so we never fall back to the extended AST end.
+private uint lexicalBodyEnd(FuncDeclaration fd)
+{
+    if (!fd.fbody)
+        return fd.loc.linnum();
+    uint l = fd.fbody.loc.linnum();
+    uint c = cast(uint) fd.fbody.loc.charnum();
+    foreach (ref br; g_braces)
+        if (br.openLine == l && br.openCol == c)
+            return br.closeLine;
+    return fd.loc.linnum();
+}
+
 private void synFunc(FuncDeclaration fd, uint depth)
 {
     if (!fd)
         return;
     SynFunc fn;
+    fn.fd = fd;
     fn.name = fd.ident ? fd.ident.toString().idup : null;
     fn.startLine = fd.loc.linnum();
-    fn.endLine = fd.endloc.linnum();
+    fn.endLine = lexicalBodyEnd(fd);
     fn.depth = depth;
     if (fd.type)
     {
@@ -884,19 +974,68 @@ private void synMembers(Dsymbol[] members, uint depth)
 
 // Snapshot structure from a FRESH parse (pre-semantic). Call once per
 // request before semantic rewrites bodies. Plain data only.
-SynMod snapshotModule(Module mod)
+SynMod snapshotModule(Module mod, const(char)[] text)
 {
     SynMod m;
     if (!mod || !mod.members)
         return m;
     g_synFuncs = null;
+    braceRanges(text);
     Dsymbol[] members;
     foreach (i; 0 .. (*mod.members).length)
         members ~= (*mod.members)[i];
     synMembers(members, 0);
     m.funcs = g_synFuncs;
+    m.braces = g_braces;
     g_synFuncs = null;
+    g_braces = null;
     return m;
+}
+
+// Whether some lexer brace range contains both lines. Used to scope captured
+// locals when parser recovery merged a function into an earlier one and no
+// SynFunc range covers the cursor: a local and the cursor are in the same
+// function iff a brace encloses them both. Nested blocks still share their
+// function's brace, while two sibling functions share none.
+private bool sameBraceRegion(const ref SynMod syn, uint declLine, uint cursorLine)
+{
+    // Innermost matched pair containing the declaration line, then require the
+    // cursor to be inside that same pair. Being inside the declaration's block
+    // (or a nested one) is exactly the declaration's scope. Two sibling
+    // functions/blocks are excluded even when an enclosing aggregate or
+    // version block contains them both, and module-scope cursors (no enclosing
+    // pair) are gated out.
+    int best = -1;
+    foreach (i, ref br; syn.braces)
+    {
+        if (br.openLine > declLine || declLine > br.closeLine)
+            continue;
+        if (best >= 0 &&
+            (br.closeLine - br.openLine) >=
+            (syn.braces[best].closeLine - syn.braces[best].openLine))
+            continue;
+        best = cast(int) i;
+    }
+    if (best < 0)
+        return false;
+    auto br = syn.braces[best];
+    return br.openLine <= cursorLine && cursorLine <= br.closeLine;
+}
+
+// Snapshot locals usable at `line`: the matching function's captured vars, or
+// when no function range matches (recovery merged the function into an earlier
+// one) every captured var sharing a lexer brace region with the cursor.
+private const(SynLocal)[] snapshotLocals(const ref SynMod syn, uint line,
+    const(SynFunc)* sfn)
+{
+    if (sfn)
+        return sfn.vars;
+    const(SynLocal)[] pool;
+    foreach (ref fn; syn.funcs)
+        foreach (ref vl; fn.vars)
+            if (vl.line <= line && sameBraceRegion(syn, vl.line, line))
+                pool ~= vl;
+    return pool;
 }
 
 // Innermost snapshot function containing line (deepest match wins).
@@ -950,8 +1089,8 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
     pushItem(a, o, nm, 6, typeDetail(vd.type), docOf(vd), "0", seen, vd);
 }
 
-private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(char)[] prefix,
-    Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen)
+private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, uint cursorLine,
+    const(char)[] prefix, Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen)
 {
     if (!s || s.loc.linnum() > cursorLine)
         return;
@@ -974,8 +1113,9 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
                             pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(fd), "0", seen, fd);
                         }
                         uint el = fd.endloc.linnum();
-                        if (fd.loc.linnum() <= cursorLine && (el == 0 || cursorLine <= el))
-                            collectInFunc(fd, cursorLine, prefix, a, o, seen);
+                        if (fd.loc.linnum() <= cursorLine && (el == 0 || cursorLine <= el) &&
+                            funcScopedToLine(syn, fd, cursorLine))
+                            collectInFunc(fd, syn, cursorLine, prefix, a, o, seen);
                     }
                 }
             }
@@ -985,12 +1125,12 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
     if (auto cs = s.isCompoundStatement())
     {
         for (size_t i = 0; i < cs.statements.length; i++)
-            walkStmt(cs.statements[i], cur, cursorLine, prefix, a, o, seen);
+            walkStmt(cs.statements[i], cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto ss = s.isScopeStatement())
     {
-        walkStmt(ss.statement, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(ss.statement, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     // Descend only into the branch/body that contains the cursor, so a
@@ -1011,9 +1151,9 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
             addLocal(a, o, seen, is_.match, cursorLine, prefix);
         uint elseStart = is_.elsebody ? is_.elsebody.loc.linnum() : 0;
         if (elseStart != 0 && cursorLine >= elseStart)
-            walkStmt(is_.elsebody, cur, cursorLine, prefix, a, o, seen);
+            walkStmt(is_.elsebody, cur, syn, cursorLine, prefix, a, o, seen);
         else
-            walkStmt(is_.ifbody, cur, cursorLine, prefix, a, o, seen);
+            walkStmt(is_.ifbody, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto ws = s.isWhileStatement())
@@ -1027,14 +1167,14 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
             if (hasPrefix(wnm, prefix))
                 pushItem(a, o, wnm, 6, typeDetail(ws.param.type), null, "0", seen, null, typeDetail(ws.param.type));
         }
-        walkStmt(ws._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(ws._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto ds = s.isDoStatement())
     {
         uint end = ds.endloc.linnum();
         if (end == 0 || cursorLine <= end)
-            walkStmt(ds._body, cur, cursorLine, prefix, a, o, seen);
+            walkStmt(ds._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto fs = s.isForStatement())
@@ -1042,8 +1182,8 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         uint end = fs.endloc.linnum();
         if (end != 0 && cursorLine > end)
             return;
-        walkStmt(fs._init, cur, cursorLine, prefix, a, o, seen);
-        walkStmt(fs._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(fs._init, cur, syn, cursorLine, prefix, a, o, seen);
+        walkStmt(fs._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto fes = s.isForeachStatement())
@@ -1066,7 +1206,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
             addLocal(a, o, seen, fes.key, cursorLine, prefix);
         if (fes.value)
             addLocal(a, o, seen, fes.value, cursorLine, prefix);
-        walkStmt(fes._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(fes._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto sw = s.isSwitchStatement())
@@ -1080,22 +1220,22 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
             if (hasPrefix(snm, prefix))
                 pushItem(a, o, snm, 6, typeDetail(sw.param.type), null, "0", seen, null, typeDetail(sw.param.type));
         }
-        walkStmt(sw._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(sw._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto c1 = s.isCaseStatement())
     {
-        walkStmt(c1.statement, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(c1.statement, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto d1 = s.isDefaultStatement())
     {
-        walkStmt(d1.statement, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(d1.statement, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto lb = s.isLabelStatement())
     {
-        walkStmt(lb.statement, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(lb.statement, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto tc = s.isTryCatchStatement())
@@ -1103,7 +1243,7 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
         uint bodyEnd = tc.catches && (*tc.catches).length
             ? (*tc.catches)[0].handler.loc.linnum() : 0;
         if (bodyEnd == 0 || cursorLine < bodyEnd)
-            walkStmt(tc._body, cur, cursorLine, prefix, a, o, seen);
+            walkStmt(tc._body, cur, syn, cursorLine, prefix, a, o, seen);
         if (tc.catches)
             foreach (i; 0 .. (*tc.catches).length)
             {
@@ -1115,14 +1255,14 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
                     continue;
                 if (c.var)
                     addLocal(a, o, seen, c.var, cursorLine, prefix);
-                walkStmt(c.handler, cur, cursorLine, prefix, a, o, seen);
+                walkStmt(c.handler, cur, syn, cursorLine, prefix, a, o, seen);
             }
         return;
     }
     if (auto tf = s.isTryFinallyStatement())
     {
-        walkStmt(tf._body, cur, cursorLine, prefix, a, o, seen);
-        walkStmt(tf.finalbody, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(tf._body, cur, syn, cursorLine, prefix, a, o, seen);
+        walkStmt(tf.finalbody, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto w = s.isWithStatement())
@@ -1136,22 +1276,32 @@ private void walkStmt(Statement s, FuncDeclaration cur, uint cursorLine, const(c
             if (hasPrefix(wnm, prefix))
                 pushItem(a, o, wnm, 6, typeDetail(w.prm.type), null, "0", seen, null, typeDetail(w.prm.type));
         }
-        walkStmt(w._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(w._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     if (auto sy = s.isSynchronizedStatement())
     {
-        walkStmt(sy._body, cur, cursorLine, prefix, a, o, seen);
+        walkStmt(sy._body, cur, syn, cursorLine, prefix, a, o, seen);
         return;
     }
     // Other statements: no locals.
 }
 
-private void collectInFunc(FuncDeclaration fd, uint cursorLine, const(char)[] prefix,
-    Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen)
+private void collectInFunc(FuncDeclaration fd, const ref SynMod syn, uint cursorLine,
+    const(char)[] prefix, Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen)
 {
     if (!fd)
         return;
+    // Invariant: callers only pass a function whose lexical body contains the
+    // cursor (findEnclosingFunc gates it; nested descent below gates too).
+    // Enforced unconditionally, not just by assert: asserts are stripped under
+    // -release, and an ungated future call site must degrade to no locals
+    // rather than leak a preceding function's locals once that flag appears.
+    if (!funcScopedToLine(syn, fd, cursorLine))
+    {
+        assert(false); // dev: fail loudly
+        return;        // release: fail safe
+    }
     if (fd.parameters)
         foreach (i; 0 .. fd.parameters.length)
         {
@@ -1159,7 +1309,7 @@ private void collectInFunc(FuncDeclaration fd, uint cursorLine, const(char)[] pr
             addLocal(a, o, seen, v, cursorLine, prefix);
         }
     if (fd.fbody)
-        walkStmt(fd.fbody, fd, cursorLine, prefix, a, o, seen);
+        walkStmt(fd.fbody, fd, syn, cursorLine, prefix, a, o, seen);
 }
 
 // ---------- dotted chains ----------
@@ -1657,6 +1807,14 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
                 return true;
         return false;
     }
+    // An AST function range can be recovery-extended over following functions
+    // (and its body left un-collapsed), so the semantic slots path can leak
+    // across the boundary just like the snapshot did. If the cursor is outside
+    // the enclosing function's lexical body, drop it and let the snapshot's
+    // brace-scoped fallback below handle the locals.
+    if (!funcScopedToLine(syn, fd, line))
+        fd = null;
+    assert(funcScopedToLine(syn, fd, line));
     if (fd && fd.parameters)
         foreach (i; 0 .. fd.parameters.length)
         {
@@ -1683,7 +1841,6 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
     }
     auto sfn = synFuncAt(syn, line);
     if (sfn)
-    {
         foreach (pi, pn; sfn.params)
         {
             if (has(pn))
@@ -1691,33 +1848,38 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             string tn = pi < sfn.paramTypes.length ? sfn.paramTypes[pi] : null;
             slots ~= NameType(pn, null, tn, null);
         }
-        // Snapshot has no block scopes (body collapsed), so keep the nearest
-        // declaration per name (line <= cursor).
-        string[const(char)[]] synType;
-        uint[const(char)[]] synLine;
-        VarDeclaration[const(char)[]] synVd;
-        foreach (ref vl; sfn.vars)
-        {
-            if (vl.line > line)
+    // Candidate snapshot vars. When a function range matches, its captured
+    // vars (bounded by the lexical body brace). When none does — recovery
+    // merged this function into an earlier one — take every captured var whose
+    // line shares the cursor's innermost lexer brace range, so the merged-away
+    // function's locals stay usable without leaking a preceding one's.
+    auto pool = snapshotLocals(syn, line, sfn);
+    // Snapshot has no block scopes (body collapsed), so keep the nearest
+    // declaration per name (line <= cursor).
+    string[const(char)[]] synType;
+    uint[const(char)[]] synLine;
+    VarDeclaration[const(char)[]] synVd;
+    foreach (ref vl; pool)
+    {
+        if (vl.line > line)
+            continue;
+        if (auto p = vl.name in synLine)
+            if (*p >= vl.line)
                 continue;
-            if (auto p = vl.name in synLine)
-                if (*p >= vl.line)
-                    continue;
-            synLine[vl.name] = vl.line;
-            synType[vl.name] = vl.typeName;
-            synVd[vl.name] = cast(VarDeclaration) vl.vd;
-        }
-        foreach (name, tn; synType)
-            if (!has(name))
-            {
-                // dmd resolved `.type` on the same node, even if a later
-                // statement error collapsed the body; prefer it over the
-                // pre-semantic spelling.
-                auto vd = synVd[name];
-                Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
-                slots ~= NameType(name, t, tn, vd);
-            }
+        synLine[vl.name] = vl.line;
+        synType[vl.name] = vl.typeName;
+        synVd[vl.name] = cast(VarDeclaration) vl.vd;
     }
+    foreach (name, tn; synType)
+        if (!has(name))
+        {
+            // dmd resolved `.type` on the same node, even if a later
+            // statement error collapsed the body; prefer it over the
+            // pre-semantic spelling.
+            auto vd = synVd[name];
+            Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
+            slots ~= NameType(name, t, tn, vd);
+        }
 }
 
 // ---------- signature help ----------
@@ -1987,7 +2149,7 @@ void signatureAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     Dsymbol[] rootMembers;
     flattenMembers(mod.members, rootMembers);
     NameType[] slots;
-    collectSlots(mod, syn, ctx.line, findEnclosingFunc(mod, ctx.line), slots);
+    collectSlots(mod, syn, ctx.line, findEnclosingFunc(mod, syn, ctx.line), slots);
     auto sym = resolveCallee(mod, segs, rootMembers, slots);
     if (!sym)
         return;
@@ -2292,7 +2454,7 @@ private Dsymbol resolveSymbolAt(Module mod, const ref SynMod syn, uint line,
     Dsymbol[const(char)[]] importByName;
     indexImportInterfaces(mod, importByName);
     NameType[] locals;
-    auto fd = findEnclosingFunc(mod, line);
+    auto fd = findEnclosingFunc(mod, syn, line);
     collectSlots(mod, syn, line, fd, locals);
     auto sym = resolveChain(mod, chain, rootMembers, rootByName, importByName,
         locals, fd);
@@ -2363,6 +2525,10 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
         {
             lastLine = lines[i];
             fd = enclosingFunc(funcs, lines[i]);
+            // AST ranges can be recovery-extended over following functions;
+            // accept fd only when the token is inside its lexical body.
+            if (!funcScopedToLine(syn, fd, lines[i]))
+                fd = null;
         }
         // Locals depend on position; recompute only when the enclosing
         // function changes (at its end line, i.e. the full local set).
@@ -2374,7 +2540,11 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
             uint slotLine = lines[i];
             if (fd)
             {
-                uint el = fd.endloc.linnum();
+                // Prefer the snapshot's lexical body end. The AST end can run
+                // past the closing brace (recovery / off-by-one) and would then
+                // miss the bounded range for this function.
+                auto sfn = synFuncAt(syn, fd.loc.linnum());
+                uint el = sfn ? sfn.endLine : fd.endloc.linnum();
                 if (el >= slotLine)
                     slotLine = el;
             }
@@ -2879,7 +3049,7 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         return;
 
     // Semantic function (params with types + surviving body vars).
-    auto fd = findEnclosingFunc(mod, ctx.line);
+    auto fd = findEnclosingFunc(mod, syn, ctx.line);
     // Snapshot function (pre-semantic names; survives error rewrites).
     auto sfn = synFuncAt(syn, ctx.line);
 
@@ -2952,9 +3122,8 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     {
         // Plain: emit typed items first, then untyped snapshot names.
         if (fd)
-            collectInFunc(fd, ctx.line, prefix, arena, out_, seen);
+            collectInFunc(fd, syn, ctx.line, prefix, arena, out_, seen);
         if (sfn)
-        {
             foreach (i, pn; sfn.params)
             {
                 if (pn in seen)
@@ -2966,28 +3135,27 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                     tn = i < sfn.paramTypes.length ? sfn.paramTypes[i] : null;
                 pushItem(arena, out_, pn, 6, "parameter", null, "0", seen, null, tn);
             }
-            // Snapshot vars are in source order; a later same-named one
-            // shadows an earlier one, so keep the nearest per name.
-            string[const(char)[]] nearest;
-            foreach (ref vl; sfn.vars)
-                if (vl.line <= ctx.line)
-                {
-                    // dmd's resolved type (survives a collapsed body) beats
-                    // the pre-semantic spelling.
-                    auto vd = cast(VarDeclaration) vl.vd;
-                    string disp = null;
-                    if (vd && vd.type && vd.type.ty != TY.Terror)
-                        disp = typeDetail(vd.type).idup;
-                    if (!disp.length)
-                        disp = vl.typeText.length ? vl.typeText : vl.typeName;
-                    nearest[vl.name] = disp;
-                }
-            foreach (name, tn; nearest)
+        // Snapshot vars are in source order; a later same-named one
+        // shadows an earlier one, so keep the nearest per name.
+        string[const(char)[]] nearest;
+        foreach (ref vl; snapshotLocals(syn, ctx.line, sfn))
+            if (vl.line <= ctx.line)
             {
-                if (name in seen || !hasPrefix(name, prefix))
-                    continue;
-                pushItem(arena, out_, name, 6, "local", null, "0", seen, null, tn);
+                // dmd's resolved type (survives a collapsed body) beats
+                // the pre-semantic spelling.
+                auto vd = cast(VarDeclaration) vl.vd;
+                string disp = null;
+                if (vd && vd.type && vd.type.ty != TY.Terror)
+                    disp = typeDetail(vd.type).idup;
+                if (!disp.length)
+                    disp = vl.typeText.length ? vl.typeText : vl.typeName;
+                nearest[vl.name] = disp;
             }
+        foreach (name, tn; nearest)
+        {
+            if (name in seen || !hasPrefix(name, prefix))
+                continue;
+            pushItem(arena, out_, name, 6, "local", null, "0", seen, null, tn);
         }
     }
 
