@@ -3,6 +3,12 @@
 // state and formats results.
 module main;
 
+version (Windows)
+{
+    extern (C) int _setmode(int fd, int mode) nothrow;
+    extern (C) int _fileno(void*) nothrow;
+}
+
 import core.stdc.stdio : printf, fprintf, stderr;
 import core.stdc.stdlib : getenv;
 import core.stdc.signal : signal, SIG_IGN;
@@ -1914,8 +1920,6 @@ int main(string[] args)
         import core.stdc.stdio : setvbuf, _IONBF, stdin, stdout, FILE;
 
         // Binary mode: the CRT would otherwise translate CRLF in the framing.
-        extern (C) int _setmode(int fd, int mode) nothrow;
-        extern (C) int _fileno(FILE*) nothrow;
         enum _O_BINARY = 0x8000;
         _setmode(_fileno(stdin), _O_BINARY);
         _setmode(_fileno(stdout), _O_BINARY);

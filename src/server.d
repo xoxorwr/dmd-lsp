@@ -1,5 +1,13 @@
 module server;
 
+version (Windows)
+{
+    // CRT low-level I/O (module scope, so they get C linkage).
+    extern (C) int _dup(int) nothrow;
+    extern (C) int _dup2(int, int) nothrow;
+    extern (C) int _close(int) nothrow;
+}
+
 // Daemon state + analysis pipeline. Struct-only, no classes.
 
 import arena;
@@ -47,8 +55,6 @@ private void stdoutToStderr(ref StdoutGuard g)
     else version (Windows)
     {
         import core.stdc.stdio : fflush, stdout;
-        extern (C) int _dup(int) nothrow;
-        extern (C) int _dup2(int, int) nothrow;
 
         fflush(stdout);
         g.saved = _dup(1);
@@ -65,8 +71,6 @@ private void stdoutRestore(ref StdoutGuard g)
     version (Windows)
     {
         import core.stdc.stdio : fflush, stdout;
-        extern (C) int _dup2(int, int) nothrow;
-        extern (C) int _close(int) nothrow;
 
         if (!g.active)
             return;
