@@ -76,6 +76,24 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
         labelDesc = "alias -> " ~ (target.length ? target : "?");
         return;
     }
+    if (auto td = s.isTemplateDeclaration())
+    {
+        if (auto fn = templateFunc(td))
+        {
+            // Function template: show `(template params)(function params)` and
+            // the return type, like a plain function.
+            auto tp = templateParamList(a, td);
+            const(char)[] fp;
+            const(char)[] rt;
+            funcParts(a, fn, fp, rt);
+            if (tp.length && fp.length)
+                labelDetail = arenaDupStr(a, cast(string) tp ~ fp);
+            else
+                labelDetail = tp.length ? tp : fp;
+            labelDesc = rt;
+            return;
+        }
+    }
     const(char)* k = s.kind();
     if (k)
     {
@@ -166,8 +184,12 @@ private ubyte kindOfDepth(Dsymbol s, int depth)
         return 20; // EnumMember-ish; enums themselves fall through below
     if (s.isModule())
         return 9;
-    if (s.isTemplateDeclaration())
+    if (auto td = s.isTemplateDeclaration())
+    {
+        if (auto fn = templateFunc(td))
+            return kindOfDepth(fn, depth + 1);
         return 1;
+    }
     return 1;
 }
 
@@ -316,6 +338,43 @@ private void funcParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
         return;
     labelDetail = funcParamList(a, tf, false);
     labelDesc = arenaDupStr(a, typeDetail(tf.next));
+}
+
+// A function template's underlying FuncDeclaration, if it is one (e.g.
+// `void f(T)(T x)`), so completion can present it as a function rather than
+// an opaque "template".
+private FuncDeclaration templateFunc(TemplateDeclaration td)
+{
+    import dmd.templatesem : computeOneMember;
+    if (!td)
+        return null;
+    if (!td.haveComputedOneMember)
+        computeOneMember(td);
+    if (td.onemember)
+        if (auto fd = td.onemember.isFuncDeclaration())
+            return fd;
+    return td.funcroot;
+}
+
+// `(T, U...)` from a template declaration's parameters.
+private const(char)[] templateParamList(Arena* a, TemplateDeclaration td)
+{
+    if (!td.parameters || (*td.parameters).length == 0)
+        return null;
+    import core.stdc.string : strlen;
+    string buf = "(";
+    foreach (i; 0 .. (*td.parameters).length)
+    {
+        if (i)
+            buf ~= ", ";
+        auto p = (*td.parameters)[i];
+        const(char)* s = p ? p.toChars() : null;
+        buf ~= s ? s[0 .. strlen(s)] : "?";
+        if (p && p.isTemplateTupleParameter())
+            buf ~= "...";
+    }
+    buf ~= ")";
+    return arenaDupStr(a, buf);
 }
 
 private Dsymbol[] scopeMembers(Dsymbol scope_)

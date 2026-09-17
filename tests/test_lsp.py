@@ -573,6 +573,32 @@ err_items = [i['label'] for i in read_msg()['result']['items']]
 check('error-local-auto-dot', 'clear_queue' in err_items and 'count' in err_items,
       str(err_items[:8]))
 
+# Function templates are presented as functions with a full signature
+# `(template params)(function params)` + return type, not as an opaque
+# "template" item.
+tmpl_text = ('module tmpltest;\n'
+             'void LINFO(Char, A...)(in Char[] fmt, scope A args)\n'
+             '{\n}\n'
+             'void main()\n'
+             '{\n'
+             '    LIN\n'
+             '}\n')
+open('/tmp/tmpltest.d', 'w').write(tmpl_text)
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": "file:///tmp/tmpltest.d",
+                                 "languageId": "d", "version": 1, "text": tmpl_text}}})
+read_msg()
+send({"jsonrpc": "2.0", "id": 114, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": "file:///tmp/tmpltest.d"},
+                 "position": {"line": 6, "character": 7}}})
+tmpl_items = read_msg()['result']['items']
+tmpl = next((i for i in tmpl_items if i['label'] == 'LINFO'), None)
+tmld = (tmpl or {}).get('labelDetails') or {}
+check('fn-template-kind', tmpl is not None and tmpl['kind'] == 3, str(tmpl))
+check('fn-template-detail', tmld.get('detail') == '(Char, A...)(Char[], A)',
+      str(tmld))
+check('fn-template-return', tmld.get('description') == 'void', str(tmld))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
