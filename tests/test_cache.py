@@ -90,16 +90,27 @@ acts = code_actions()
 check('cache-codeaction', any('cextra' in a.get('title', '') for a in acts),
       str([a.get('title') for a in acts]))
 
-# edit with a new error: rebuild, diagnostics update
-bad = text.replace('it.keep', 'it.keep;\n    nosuch_xyz;')
+# edit with a new (syntax) error: lint updates live. Semantic errors are a
+# save/open concern now (the debounced keypress path is parse-only).
+bad = text.replace('it.keep', 'it.keep;\n    string s = "unterminated;')
 d = change_doc(bad, 2)
 open(ROOT, 'w').write(bad)
-check('cache-edit-rebuilds', any('nosuch_xyz' in m for m in d), str(d))
+check('cache-edit-rebuilds', any('unterminated' in m for m in d), str(d))
 
 # revert: clean again (modulo the unused-import hint)
 d = change_doc(text, 3)
 open(ROOT, 'w').write(text)
 check('cache-revert-clean', all('unused import' in m for m in d), str(d))
+
+# semantic diagnostics are a save/open concern: the debounced keypress path is
+# parse-only, so they must not appear live, and must appear after save
+sem = text.replace('it.keep', 'it.keep;\n    nosuch_xyz;')
+d = change_doc(sem, 5)
+check('edit-no-semantic-live', not any('nosuch_xyz' in m for m in d), str(d))
+send({"jsonrpc": "2.0", "method": "textDocument/didSave",
+      "params": {"textDocument": {"uri": URI}, "text": sem}})
+d = [x['message'] for x in read_msg()['params']['diagnostics']]
+check('save-semantic-diags', any('nosuch_xyz' in m for m in d), str(d))
 
 # dep changed on disk, root text identical: rebuild picks it up
 with open(os.path.join(WORK, 'cdep.d'), 'w') as f:

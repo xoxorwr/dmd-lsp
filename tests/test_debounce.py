@@ -61,7 +61,7 @@ d = read_msg()
 check('debounce-open-clean', d['params']['diagnostics'] == [], str(d['params']))
 
 # didChange: silence within the debounce window, publish after idle
-bad1 = text.replace('int ok = 1;', 'int ok = 1;\n    alpha_missing;')
+bad1 = text.replace('int ok = 1;', 'int ok = 1;\n    alpha_missing alpha_missing alpha_missing;')
 send({"jsonrpc": "2.0", "method": "textDocument/didChange",
       "params": {"textDocument": {"uri": URI, "version": 2},
                  "contentChanges": [{"text": bad1}]}})
@@ -72,9 +72,9 @@ msgs = [x['message'] for x in d['params']['diagnostics']]
 check('debounce-publishes-change', any('alpha_missing' in m for m in msgs), str(msgs))
 
 # burst of 3 rapid changes coalesces into exactly one publish (latest wins)
-bad2 = text.replace('int ok = 1;', 'int ok = 1;\n    beta_missing;')
-bad3 = text.replace('int ok = 1;', 'int ok = 1;\n    gamma_missing;')
-bad4 = text.replace('int ok = 1;', 'int ok = 1;\n    delta_missing;')
+bad2 = text.replace('int ok = 1;', 'int ok = 1;\n    beta_missing beta_missing beta_missing;')
+bad3 = text.replace('int ok = 1;', 'int ok = 1;\n    gamma_missing gamma_missing gamma_missing;')
+bad4 = text.replace('int ok = 1;', 'int ok = 1;\n    delta_missing delta_missing delta_missing;')
 for i, t in enumerate((bad2, bad3, bad4)):
     send({"jsonrpc": "2.0", "method": "textDocument/didChange",
           "params": {"textDocument": {"uri": URI, "version": 3 + i},

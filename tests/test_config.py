@@ -167,7 +167,7 @@ d.drain(1.0)
 t = open(root5 + '/a.d').read()
 d.open_doc(root5 + '/a.d', t)
 d.read_msg()
-bad = t.replace('int ok = 1;', 'int ok = 1;\n    zz_missing;')
+bad = t.replace('int ok = 1;', 'int ok = 1;\n    zz_missing zz_missing zz_missing;')
 d.send({"jsonrpc": "2.0", "method": "textDocument/didChange",
         "params": {"textDocument": {"uri": 'file://' + root5 + '/a.d',
                                    "version": 2},

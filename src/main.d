@@ -411,8 +411,19 @@ private void publishFor(App* app, const(char)[] path, const(char)[] text,
     worker.WAnalysis a;
     if (!workerAnalyzeRetry(app, path, text, a, realOnly))
         return;
-    app.cache[path.idup] = HitCache(a);
     clearPending(app, path);
+    // Trivia-only save: the program is unchanged, so keep the previously
+    // published diagnostics instead of re-analysing. The worker invalidated
+    // its universe (positions moved); drop position-keyed caches so the next
+    // semantic pull rebuilds.
+    if (a.unchanged)
+    {
+        app.cache.remove(path.idup);
+        app.tokCache.remove(path.idup);
+        app.tokHash.remove(path.idup);
+        return;
+    }
+    app.cache[path.idup] = HitCache(a);
     auto js = jmake();
     auto diags = buildDiagnostics(js, a);
     auto params = js.create_object();

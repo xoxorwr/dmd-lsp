@@ -24,6 +24,7 @@ import server;
 import complete;
 import lint;
 import semantic : SemTok, semanticTokens;
+import dmdwrap : dmdRootHasImporters, dmdTokenHash;
 
 import dmd.dmodule : Module;
 
@@ -182,7 +183,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         js.add_item_to_object(root, key, o);
     }
 
-    private void sendAnalyze(const ref Analysis a)
+    private void sendAnalyze(const ref Analysis a, bool unchanged = false)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -190,6 +191,8 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         addLint(js, root, "lintImports", a.lintImports);
         addLint(js, root, "lintParams", a.lintParams);
         js.add_bool_to_object(root, "needRespawn", false);
+        if (unchanged)
+            js.add_bool_to_object(root, "unchanged", true);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -438,17 +441,30 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                // open/save (realOnly) require a universe built from the real
-                // text, so a completion placeholder can't hide an error in the
-                // statement it blanked. The debounced keypress analyze reuses
-                // the live universe by identity when it can, which is the
-                // cheap path; otherwise it rebuilds anyway.
-                bool realOnly = jbool(jget(p, "realOnly"), false);
-                // realOnly needs a universe built from the real text, so it
-                // matches on the analysis text; the keypress analyze matches
-                // the document identity.
-                auto st = built ? serverUniState(s, path, realOnly ? null : text,
-                    realOnly ? text : null) : UniState.miss;
+                // Diagnostics must never come from a completion-neutralized
+                // universe, and open/save must not use the in-place re-parse:
+                // for an edited root it leaves modules that import the root
+                // holding stale symbols (false "not callable" in cyclic
+                // projects). Reuse only an exact-text universe, else rebuild.
+                auto st = built ? serverUniState(s, path, null, text) : UniState.miss;
+                // Trivia-only edit (same significant tokens): no re-analysis.
+                // The program is unchanged, so keep the previous diagnostics
+                // and just invalidate the universe (positions moved) so the
+                // next semantic request rebuilds cleanly.
+                if (built && st == UniState.incremental &&
+                    dmdTokenHash(text) == s.uni.tokenHash)
+                {
+                    s.uni.valid = false;
+                    Analysis none;
+                    sendAnalyze(none, true);
+                    continue;
+                }
+                // Narrowed to cyclic roots: only an in-place re-parse of a
+                // root that some loaded module imports is unsafe (stale
+                // symbols). Any other root keeps the cheap incremental path.
+                if (st == UniState.incremental && built &&
+                    dmdRootHasImporters(s.uni.analysis.module_))
+                    st = UniState.miss;
                 // Only the root text changed: re-analyze it in a fork child on
                 // the warm dependency closure. A root switch, dependency edit
                 // or config change needs a fresh universe.
@@ -467,6 +483,29 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                     s.scratch.rewind(s.uni.mark);
                 sendAnalyze(a);
                 built = true;
+                continue;
+            }
+            if (ops == "lint")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto text = jstr(jget(p, "text"));
+                if (text is null)
+                    text = "";
+                // Parse + AST lints on a fresh state. On POSIX this runs in a
+                // fork child and leaves the live universe untouched; on
+                // Windows it runs inline, so invalidate the universe and let
+                // the next semantic request respawn.
+                if (forkRun(() {
+                    auto a = serverLint(s, path, text);
+                    sendAnalyze(a);
+                    version (Windows)
+                        s.uni.valid = false;
+                }))
+                    continue;
+                auto a = serverLint(s, path, text);
+                sendAnalyze(a);
+                version (Windows)
+                    s.uni.valid = false;
                 continue;
             }
             if (ops == "complete")
@@ -837,6 +876,7 @@ struct WAnalysis
     WDiag[] diags;
     WLint lintImports;
     WLint lintParams;
+    bool unchanged; // trivia-only edit: no re-analysis, keep prior diagnostics
 }
 
 struct WItem
@@ -945,11 +985,12 @@ ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] tex
 {
     auto js = jmake();
     auto root = js.create_object();
-    js.add_string_to_object(root, "op", zstr("analyze"));
+    // open/save (realOnly) get full semantic diagnostics; the debounced
+    // keypress uses the parse-only lint path, which is independent of the
+    // (possibly neutralized, possibly stale) warm universe.
+    js.add_string_to_object(root, "op", zstr(realOnly ? "analyze" : "lint"));
     js.add_string_to_object(root, "path", zstr(path));
     js.add_string_to_object(root, "text", zstr(text));
-    if (realOnly)
-        js.add_bool_to_object(root, "realOnly", true);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -958,6 +999,7 @@ ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] tex
         return ExchangeResult.failed;
     if (jbool(jget(r, "needRespawn"), false))
         return ExchangeResult.respawn;
+    out_.unchanged = jbool(jget(r, "unchanged"), false);
     parseAnalysis(r, out_);
     return ExchangeResult.ok;
 }

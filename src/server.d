@@ -175,6 +175,7 @@ struct Universe
     // while still keying on the real document text (so the debounced
     // analyze for that same text is a hit, not a second build).
     ulong analysisHash;
+    ulong tokenHash; // significant-token fingerprint of the parsed text
     DepRec[] deps; // disk fingerprints of loaded deps (root excluded)
     ulong configGen; // DmdState.configGen at record time
     Arena.Mark mark; // scratch high-water after analysis
@@ -258,6 +259,35 @@ UniState serverUniState(ref ServerState s, const(char)[] path,
 // pointing at it, which is what makes the mutation flat and safe to run in the
 // long-lived process. This is ~10x cheaper than a full
 // build and advances the live universe to the new text.
+// Parse-only diagnostics path (open/save use the full semantic one). It never
+// touches the live universe: throwaway parse + AST lints only (syntax errors
+// and unused imports/params), no semantic analysis. So a half-typed statement
+// cannot cascade and a stale warm closure cannot leak into diagnostics.
+// Runs on a fresh dmd state, so the caller must isolate it (fork child on
+// POSIX); on Windows the caller marks the universe invalid afterwards.
+Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
+{
+    Analysis a;
+    s.scratch.reset();
+    dmdResetRequest(s.dmd, &s.sink);
+    StdoutGuard og;
+    stdoutToStderr(og);
+    auto pr = dmdParseOnly(path, text);
+    a.ok = pr.ok;
+    a.errors = pr.errors;
+    a.diags = s.sink.msgs;
+    if (pr.ok && pr.module_)
+    {
+        auto mod = cast(Module)pr.module_;
+        lintUnusedImports(&s.scratch, mod, path, text, pr.errors != 0, a.lintImports);
+        lintUnusedParams(&s.scratch, mod, path, text, pr.errors != 0, a.lintParams);
+        pinLint(s.session, a.lintImports);
+        pinLint(s.session, a.lintParams);
+    }
+    stdoutRestore(og);
+    return a;
+}
+
 Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     const(char)[] text, const(char)[] identity)
 {
@@ -301,6 +331,7 @@ Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     s.uni.rootPath = path.idup;
     s.uni.rootHash = fnv1a64(cast(const(ubyte)[])id);
     s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
+    s.uni.tokenHash = dmdTokenHash(text);
     universeRecord(s.uni.deps, path);
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
@@ -360,6 +391,7 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
     s.uni.rootPath = path.idup;
     s.uni.rootHash = h;
     s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
+    s.uni.tokenHash = dmdTokenHash(text);
     universeRecord(s.uni.deps, path);
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();

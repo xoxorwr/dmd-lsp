@@ -93,6 +93,7 @@ check: $(BIN) check-no-oop
 	python3 tests/test_broken_body.py
 	python3 tests/test_cache.py
 	python3 tests/test_debounce.py
+	python3 tests/test_trivia.py
 	python3 tests/test_config.py
 	python3 tests/test_memory.py
 	python3 tests/test_spawn.py
