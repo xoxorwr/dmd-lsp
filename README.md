@@ -18,7 +18,6 @@ library — no DCD, no libdparse heuristics.
 - **Signature help**, **goto definition**, **hover** (type + docs).
 - **Code actions** (remove unused import).
 - **Semantic tokens** — identifier-level highlighting.
-- Serves broken code: analysis continues while you type.
 
 Supported LSP methods:
 
@@ -106,25 +105,17 @@ loads at `initialize` and on save.
 
 ## How it works
 
-Analysis runs in a **worker process that keeps one dmd universe warm**: the
-front end holds no dmd state, and the OS reclaims a discarded universe
-wholesale. On POSIX the server `fork()`s the worker; on Windows it spawns this
-executable with `--worker`. On an edit the worker re-parses only the changed
-root on the warm closure — evicting the old root module and its types — so the
-~330 ms dependency closure is not rebuilt. On POSIX that re-parse runs in a
-copy-on-write child that exits, so its mutations never reach the warm process;
-on Windows it runs inline and the worker is replaced on the next closure
-change. Any change to the closure (dependency/config/root) respawns the worker.
-Identical inputs hit the universe cache for free; diagnostics are debounced;
-while you type broken code, completion analyses a neutralised variant of the
-buffer so dmd does not collapse the function body and drop local types.
+`dmd-lsp` runs the real dmd frontend in a worker process. The imported
+dependency graph is compiled once and kept warm, so an edit re-analyses only
+the changed file on top of it. When a dependency, the configuration or the
+entry file changes, the worker is restarted and the OS reclaims the old state.
 
-Internals, measurements and limitations: [docs/design.md](docs/design.md).
+Details: [docs/design.md](docs/design.md).
 
 ## Docs
 
 - [design.md](docs/design.md) — internals, conventions, limitations, status
-- [vendoring.md](docs/vendoring.md) — vendored dmd closure, Makefile
+- [vendoring.md](docs/vendoring.md) — vendored dmd sources, Makefile
 - [releases.md](docs/releases.md) — nightly CI, VS Code extension
 - [upstream.md](docs/upstream.md) — patches in `../dmd`, roadmap
 - [findings.md](docs/findings.md) — memory/GC investigation
