@@ -3,7 +3,7 @@
 ## Nightly builds
 
 **[Grab the latest prebuilt →](https://github.com/xoxorwr/dmd-lsp/releases/tag/nightly)**
-(download the tarball for your platform, or `dmd-lsp.vsix` for VS Code).
+(download the archive for your platform, or `dmd-lsp.vsix` for VS Code).
 
 `.github/workflows/nightly.yml` builds a rolling prerelease tagged
 `nightly` (LDC `ldmd2`), on a schedule (06:00 UTC), on push to `master`, and
@@ -12,6 +12,7 @@ on manual dispatch. Asset names are stable so clients can fetch and verify:
 - `dmd-lsp-linux-x64.tar.gz`
 - `dmd-lsp-darwin-arm64.tar.gz`
 - `dmd-lsp-darwin-x64.tar.gz`
+- `dmd-lsp-win-x64.zip` (`dmd-lsp.exe`)
 - `dmd-lsp.vsix` (VS Code extension)
 - `SHA256SUMS`
 
@@ -21,9 +22,9 @@ Each archive contains the `dmd-lsp` binary at its root. Download base:
 https://github.com/<owner>/<repo>/releases/download/nightly/<asset>
 ```
 
-macOS runners: `macos-15` (arm64) and `macos-15-intel` (x64). Windows is not
-built — see `.github/workflows/nightly.yml` for the platform matrix.
-not run.
+Runners: `ubuntu-latest` (linux-x64), `macos-15` (arm64), `macos-15-intel`
+(x64), `windows-latest` (win-x64); the Windows build uses `dlang-community/setup-dlang`.
+See `.github/workflows/nightly.yml`.
 
 ## VS Code extension
 

@@ -8,15 +8,14 @@ read-only as a library — no DCD, no libdparse heuristics.
 
 ## Get it
 
-Prebuilt nightly (Linux x64, macOS arm64/x64):
+Prebuilt nightly (Linux x64, macOS arm64/x64, Windows x64):
 **[Releases → nightly](https://github.com/xoxorwr/dmd-lsp/releases/tag/nightly)**
 
-- `dmd-lsp-<platform>.tar.gz` — standalone server binary (also `--check`).
+- `dmd-lsp-linux-x64.tar.gz`, `dmd-lsp-darwin-arm64.tar.gz`,
+  `dmd-lsp-darwin-x64.tar.gz` — standalone server binary (also `--check`).
+- `dmd-lsp-win-x64.zip` — `dmd-lsp.exe`.
 - `dmd-lsp.vsix` — VS Code extension (fetches and auto-updates the binary).
 - `SHA256SUMS`.
-
-Windows is not supported yet (the worker is POSIX-only); build from source or
-point `dmdLsp.serverPath` at your own build.
 
 More in [docs/releases.md](docs/releases.md).
 
@@ -82,14 +81,17 @@ loads at `initialize` and on save; the VS Code extension can write one via
 
 ## How it works
 
-Analysis runs in a **forked worker that keeps one dmd universe warm**: the
+Analysis runs in a **worker process that keeps one dmd universe warm**: the
 front end holds no dmd state, and the OS reclaims a discarded universe
-wholesale (dmd's process globals cannot be reset in-process). On an edit the
-worker forks a child over its warm universe (copy-on-write); the child evicts
-the old root module and its types and re-analyzes only the new root — the
-~330 ms dependency closure is not rebuilt — then answers and exits, so its
-mutations never reach the warm process. Any change that touches the closure
-(dependency/config/root) respawns the worker instead. Inside a worker,
+wholesale (dmd's process globals cannot be reset in-process). On POSIX the
+server `fork()`s the worker; on Windows it spawns this executable with
+`--worker`. On an edit the worker re-parses only the changed root on the warm
+closure — evicting the old root module and its types — so the ~330 ms
+dependency closure is not rebuilt. On POSIX that re-parse runs in a
+copy-on-write child that exits, so its mutations never reach the warm
+process; on Windows it runs inline and the worker is replaced on the next
+closure change. Any change that touches the closure (dependency/config/root)
+respawns the worker instead. Inside a worker,
 identical inputs (root text + dep disk bytes + config) hit the universe cache
 for free; diagnostics are debounced, and completion/signature help reuse the
 live universe. While you type broken code, completion analyses a neutralised

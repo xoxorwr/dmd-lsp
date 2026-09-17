@@ -115,7 +115,7 @@ materialise it.
 **Review notes**: upstream uses phobos freely and may judge the duplicated
 path/file helpers as a maintenance cost. Frame it as opt-in for the `frontend`
 dub package (or gate the helpers behind a version) and point at the unittests.
-Windows branches cannot be CI-checked here.
+Windows is covered by the nightly CI (see releases.md).
 
 ### 3. `identifier.d` + `tokens.d` + `frontend.d` — reset the identifier pool
 
