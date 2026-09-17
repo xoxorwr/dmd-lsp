@@ -16,6 +16,7 @@ import dmd.dsymbol : Dsymbol, Visibility;
 import dmd.func : FuncDeclaration;
 import dmd.declaration : VarDeclaration;
 import dmd.aggregate : AggregateDeclaration;
+import dmd.dclass : ClassDeclaration;
 import dmd.dtemplate : TemplateDeclaration, TemplateInstance;
 import dmd.statement : Statement;
 import dmd.arraytypes : Dsymbols;
@@ -487,6 +488,88 @@ private void findFuncRec(Dsymbol s, uint line, ref FuncDeclaration best, ref uin
             }
         }
         findFuncRec(m, line, best, bestDepth, depth + 1);
+    }
+}
+
+// The aggregate (struct/class/union) owning the cursor's scope, so its members
+// can act as implicit `this` in completion (`renderer.` where `renderer` is a
+// field). Inside a member function the semantic `parent` chain is exact; a
+// cursor in the aggregate body itself (no enclosing function) falls back to the
+// lexer brace ranges, innermost (deepest declaration) winning.
+private AggregateDeclaration enclosingAggregate(Module mod, const ref SynMod syn,
+    uint line, FuncDeclaration fd)
+{
+    for (Dsymbol p = fd ? fd.parent : null; p; p = p.parent)
+        if (auto ad = p.isAggregateDeclaration())
+            return ad;
+    if (!mod || !mod.members)
+        return null;
+    AggregateDeclaration best = null;
+    uint bestStart = 0;
+    void visit(Dsymbol s)
+    {
+        if (!s)
+            return;
+        if (auto ad = s.isAggregateDeclaration())
+        {
+            uint sl = ad.loc.linnum();
+            if (sl >= 1 && sl <= line && aggregateBraceContains(syn, sl, line))
+                if (!best || sl >= bestStart)
+                {
+                    best = ad;
+                    bestStart = sl;
+                }
+        }
+        Dsymbol[] subs = null;
+        appendScopeSubs(s, subs);
+        foreach (c; subs)
+            visit(c);
+    }
+    foreach (i; 0 .. (*mod.members).length)
+        visit((*mod.members)[i]);
+    return best;
+}
+
+// True when a lexer brace opened after the aggregate's declaration still
+// contains `line`: the aggregate body (method bodies nest inside it, so the
+// earliest such brace is the body and its presence is what we test).
+private bool aggregateBraceContains(const ref SynMod syn, uint declLine, uint line)
+{
+    foreach (ref br; syn.braces)
+        if (br.openLine >= declLine && br.openLine <= line && line <= br.closeLine)
+            return true;
+    return false;
+}
+
+// Own + inherited (class base chain) members, for implicit-`this` completion.
+private Dsymbol[] aggregateMembers(AggregateDeclaration ad)
+{
+    Dsymbol[] r;
+    if (!ad)
+        return r;
+    r ~= scopeMembers(ad);
+    if (auto cd = ad.isClassDeclaration())
+        for (auto b = cd.baseClass; b; b = b.baseClass)
+            r ~= scopeMembers(b);
+    return r;
+}
+
+// Emit an aggregate's members as completion items (implicit `this`): a member
+// function's fields/methods are in scope when typing a bare prefix, though they
+// are not locals. `seen` dedups against already-listed locals/params.
+private void addAggregateMemberItems(Arena* a, ref CompleteOut o,
+    ref bool[const(char)[]] seen, const(char)[] prefix, AggregateDeclaration ad)
+{
+    foreach (m; aggregateMembers(ad))
+    {
+        if (!m.ident)
+            continue;
+        auto nm = m.ident.toString();
+        if (nm == "this" || nm == "super" || nm == "_")
+            continue;
+        if (!hasPrefix(nm, prefix))
+            continue;
+        pushItem(a, o, nm, kindOf(m), typeDetail(symType(m)), docOf(m), "0", seen, m);
     }
 }
 
@@ -1453,6 +1536,11 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
             // slots are in source order, so keep the last match.
             shadowed = true;
             auto cm = followTypeDepth(v.type, root, rootMembers, depth + 1);
+            // An aggregate slot (`this`/`super`) carries its declaration but no
+            // type: step straight into it. Also covers a field whose resolved
+            // type was wiped by an error.
+            if (!cm.length && v.sym)
+                cm = stepInto(v.sym, depth + 1, root, rootMembers);
             if (!cm.length && v.typeName.length)
             {
                 // Unresolved (pre-semantic) type name: scope lookup.
@@ -1880,6 +1968,30 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
             slots ~= NameType(name, t, tn, vd);
         }
+    // Implicit `this`: the enclosing aggregate's members are in scope inside a
+    // member function (or the aggregate body) even though they are not locals.
+    // Locals already collected above win by name, matching D shadowing.
+    if (auto ad = enclosingAggregate(mod, syn, line, fd))
+    {
+        foreach (m; aggregateMembers(ad))
+        {
+            if (!m.ident)
+                continue;
+            auto nm = m.ident.toString();
+            if (nm == "this" || nm == "super" || nm == "_")
+                continue;
+            if (has(nm))
+                continue;
+            if (auto vd = m.isVarDeclaration())
+                slots ~= NameType(nm, vd.type, identTypeName(vd.type), vd);
+            else
+                slots ~= NameType(nm, null, null, m);
+        }
+        slots ~= NameType("this", null, null, ad);
+        if (auto cd = ad.isClassDeclaration())
+            if (cd.baseClass)
+                slots ~= NameType("super", null, null, cd.baseClass);
+    }
 }
 
 // ---------- signature help ----------
@@ -3157,6 +3269,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
                 continue;
             pushItem(arena, out_, name, 6, "local", null, "0", seen, null, tn);
         }
+        // Implicit `this`: enclosing aggregate fields/methods.
+        if (auto ad = enclosingAggregate(mod, syn, ctx.line, fd))
+            addAggregateMemberItems(arena, out_, seen, prefix, ad);
     }
 
     if (hasDot)

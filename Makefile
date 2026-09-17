@@ -89,6 +89,7 @@ check: $(BIN) check-no-oop
 	python3 tests/test_completion_burst.py
 	python3 tests/test_completion_prefix.py
 	python3 tests/test_completion_scope.py
+	python3 tests/test_field_scope.py
 	python3 tests/test_recovery_scope.py
 	python3 tests/test_realworld.py
 	python3 tests/test_broken_body.py
