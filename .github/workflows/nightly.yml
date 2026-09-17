@@ -112,7 +112,7 @@ jobs:
 
       - name: Smoke test
         shell: pwsh
-        run: ./dmd-lsp.exe --version
+        run: .\dmd-lsp.exe --version
 
       - name: Package
         shell: pwsh
