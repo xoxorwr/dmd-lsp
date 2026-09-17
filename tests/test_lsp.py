@@ -543,6 +543,36 @@ vitem = next((i for i in items if i['label'] == 'value'), None)
 vdesc = (vitem or {}).get('labelDetails', {}).get('description')
 check('alias-template-member-type', vdesc == 'int', str(vdesc))
 
+# An unrelated semantic error and an incomplete `shap` line both collapse the
+# enclosing body. Locals must still resolve from dmd's own resolved types on
+# the parsed declarations (they are semanticized in order before the collapse),
+# including nested initializers (`auto sss = &shapes;`).
+err_text = ('module errcomp;\n'
+            'struct Shapes { void clear_queue() {} int count; }\n'
+            'struct State { Shapes shapes; }\n'
+            'struct Allocator {}\n'
+            'State gState;\n'
+            'State* editor_init(State* a);\n'
+            'void f(State* state, Allocator alloc)\n'
+            '{\n'
+            '    auto shapes = &state.shapes;\n'
+            '    auto sss = &shapes;\n'
+            '    editor_init(state);\n'
+            '    shap\n'
+            '    sss.\n'
+            '}\n')
+open('/tmp/errcomp.d', 'w').write(err_text)
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": "file:///tmp/errcomp.d",
+                                 "languageId": "d", "version": 1, "text": err_text}}})
+read_msg()
+send({"jsonrpc": "2.0", "id": 113, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": "file:///tmp/errcomp.d"},
+                 "position": {"line": 12, "character": 8}}})
+err_items = [i['label'] for i in read_msg()['result']['items']]
+check('error-local-auto-dot', 'clear_queue' in err_items and 'count' in err_items,
+      str(err_items[:8]))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})

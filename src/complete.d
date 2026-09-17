@@ -499,13 +499,17 @@ private FuncDeclaration findEnclosingFunc(Module mod, uint line)
 // Post-semantic bodies are lossy (failed statements propagate
 // ErrorStatement up to fbody), so structure (function ranges, local
 // names) is snapshotted from the fresh parse BEFORE semantic runs.
-// Only plain data is retained (names idup'd); no dmd pointers escape.
+// The snapshot is consumed in the same worker process as the parsed Module
+// it came from, so it also keeps the local's VarDeclaration: semantic runs
+// on those same nodes (and keeps going after a statement error), so its
+// resolved `.type` is readable even once the body has been collapsed.
 struct SynLocal
 {
     string name;
     uint line = 0;
     string typeName; // unresolved (pre-semantic) type ident, if simple
-    string typeText; // full pre-semantic type spelling for display (`Event*`)
+    string typeText; // pre-semantic type spelling, display fallback
+    VarDeclaration vd; // the parsed declaration; `.type` is dmd-resolved
 }
 
 // Full pre-semantic type spelling, for describing a local in completion.
@@ -521,9 +525,10 @@ private string typeTextOf(Type t)
 }
 
 // SynLocal with both the resolution ident and the display spelling.
-private SynLocal synVar(const(char)[] name, uint line, Type t)
+private SynLocal synVar(const(char)[] name, uint line, Type t,
+    VarDeclaration vd = null)
 {
-    return SynLocal(name.idup, line, identTypeName(t), typeTextOf(t));
+    return SynLocal(name.idup, line, identTypeName(t), typeTextOf(t), vd);
 }
 
 // Best-effort pre-semantic type ident from a declaration's type: a
@@ -652,7 +657,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
                         if (!tn.length)
                             tn = initTypeName(vd._init);
                         fn.vars ~= SynLocal(vd.ident.toString().idup,
-                            vd.loc.linnum(), tn, typeTextOf(vd.type));
+                            vd.loc.linnum(), tn, typeTextOf(vd.type), vd);
                     }
                 }
                 else if (auto nfd = de.declaration.isFuncDeclaration())
@@ -708,9 +713,9 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
                     fn.vars ~= synVar(p.ident.toString(), fes.loc.linnum(), p.type);
             }
         if (fes.key && fes.key.ident)
-            fn.vars ~= synVar(fes.key.ident.toString(), fes.key.loc.linnum(), fes.key.type);
+            fn.vars ~= synVar(fes.key.ident.toString(), fes.key.loc.linnum(), fes.key.type, fes.key);
         if (fes.value && fes.value.ident)
-            fn.vars ~= synVar(fes.value.ident.toString(), fes.value.loc.linnum(), fes.value.type);
+            fn.vars ~= synVar(fes.value.ident.toString(), fes.value.loc.linnum(), fes.value.type, fes.value);
         synWalkBody(fes._body, funcEnd, fn);
         return;
     }
@@ -744,7 +749,7 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
             {
                 auto c = (*tc.catches)[i];
                 if (c.ident)
-                    fn.vars ~= synVar(c.ident.toString(), c.loc.linnum, c.type);
+                    fn.vars ~= synVar(c.ident.toString(), c.loc.linnum, c.type, c.var);
                 synWalkBody(c.handler, funcEnd, fn);
             }
         return;
@@ -1631,6 +1636,7 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
         // declaration per name (line <= cursor).
         string[const(char)[]] synType;
         uint[const(char)[]] synLine;
+        VarDeclaration[const(char)[]] synVd;
         foreach (ref vl; sfn.vars)
         {
             if (vl.line > line)
@@ -1640,10 +1646,18 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
                     continue;
             synLine[vl.name] = vl.line;
             synType[vl.name] = vl.typeName;
+            synVd[vl.name] = cast(VarDeclaration) vl.vd;
         }
         foreach (name, tn; synType)
             if (!has(name))
-                slots ~= NameType(name, null, tn, null);
+            {
+                // dmd resolved `.type` on the same node, even if a later
+                // statement error collapsed the body; prefer it over the
+                // pre-semantic spelling.
+                auto vd = synVd[name];
+                Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
+                slots ~= NameType(name, t, tn, vd);
+            }
     }
 }
 
@@ -2898,7 +2912,17 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             string[const(char)[]] nearest;
             foreach (ref vl; sfn.vars)
                 if (vl.line <= ctx.line)
-                    nearest[vl.name] = vl.typeText.length ? vl.typeText : vl.typeName;
+                {
+                    // dmd's resolved type (survives a collapsed body) beats
+                    // the pre-semantic spelling.
+                    auto vd = cast(VarDeclaration) vl.vd;
+                    string disp = null;
+                    if (vd && vd.type && vd.type.ty != TY.Terror)
+                        disp = typeDetail(vd.type).idup;
+                    if (!disp.length)
+                        disp = vl.typeText.length ? vl.typeText : vl.typeName;
+                    nearest[vl.name] = disp;
+                }
             foreach (name, tn; nearest)
             {
                 if (name in seen || !hasPrefix(name, prefix))
