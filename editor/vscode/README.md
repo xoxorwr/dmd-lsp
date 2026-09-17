@@ -11,7 +11,8 @@ Install the `dmd-lsp.vsix` from the
 (`Extensions: Install from VSIX…`).
 
 On first activation the extension downloads the `dmd-lsp` binary for your
-platform (Linux x64, macOS arm64/x64) into the extension's global storage.
+platform (Linux x64, macOS arm64/x64, Windows x64) into the extension's
+global storage.
 Set `dmdLsp.serverPath` to use a local build instead.
 
 The binary is refreshed automatically: on each activation the extension
@@ -20,8 +21,8 @@ re-downloads only when the hash changed. If the release can't be reached
 it falls back to the cached binary. Disable with `dmdLsp.autoUpdate`
 = `false`.
 
-> Windows is not supported yet: the server's worker and stdio loop are
-> POSIX-only.
+> On Windows the server is a `.exe`; the extension picks
+> `dmd-lsp-win-x64.zip` automatically.
 
 ## Settings
 

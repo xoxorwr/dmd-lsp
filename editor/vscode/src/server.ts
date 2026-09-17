@@ -8,8 +8,6 @@ import { execFile } from 'child_process';
 const REPO = 'xoxorwr/dmd-lsp';
 const TAG = 'nightly';
 
-// dmd-lsp is POSIX-only (fork/socketpair worker); Windows must supply its
-// own binary via dmdLsp.serverPath.
 function assetName(): string | undefined {
   if (process.platform === 'linux' && process.arch === 'x64') {
     return 'dmd-lsp-linux-x64.tar.gz';
@@ -20,7 +18,14 @@ function assetName(): string | undefined {
   if (process.platform === 'darwin' && process.arch === 'x64') {
     return 'dmd-lsp-darwin-x64.tar.gz';
   }
+  if (process.platform === 'win32' && process.arch === 'x64') {
+    return 'dmd-lsp-win-x64.zip';
+  }
   return undefined;
+}
+
+function binaryName(): string {
+  return process.platform === 'win32' ? 'dmd-lsp.exe' : 'dmd-lsp';
 }
 
 export async function ensureServer(
@@ -41,7 +46,7 @@ export async function ensureServer(
   }
 
   const dir = context.globalStorageUri.fsPath;
-  const bin = path.join(dir, 'dmd-lsp');
+  const bin = path.join(dir, binaryName());
   const stamp = path.join(dir, 'dmd-lsp.sha256');
   fs.mkdirSync(dir, { recursive: true });
   const have = fs.existsSync(bin);
@@ -74,7 +79,9 @@ export async function ensureServer(
     async () => {
       await download(url, tarball);
       await extract(tarball, dir);
-      fs.chmodSync(bin, 0o755);
+      if (process.platform !== 'win32') {
+        fs.chmodSync(bin, 0o755);
+      }
       fs.rmSync(tarball, { force: true });
       if (expected) {
         fs.writeFileSync(stamp, expected + '\n', 'utf8');
@@ -151,10 +158,20 @@ function fetchText(url: string): Promise<string> {
   );
 }
 
-function extract(tarball: string, dest: string): Promise<void> {
+function extract(archive: string, dest: string): Promise<void> {
+  const [cmd, args] =
+    process.platform === 'win32'
+      ? [
+          'powershell',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `Expand-Archive -Force -LiteralPath '${archive}' -DestinationPath '${dest}'`,
+          ],
+        ]
+      : ['tar', ['-xzf', archive, '-C', dest]];
   return new Promise((resolve, reject) => {
-    execFile('tar', ['-xzf', tarball, '-C', dest], (err) =>
-      err ? reject(err) : resolve(),
-    );
+    execFile(cmd, args, (err) => (err ? reject(err) : resolve()));
   });
 }
