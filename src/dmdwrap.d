@@ -374,6 +374,53 @@ void* dmdReparseModule(void* modp, const(char)[] text)
     return cast(void*) m.parseModule!ASTCodegen();
 }
 
+// True when some loaded module imports `modp`. Inside a closure that is
+// exactly the "root is in an import cycle" case, and it means an in-place
+// re-parse of the root would leave those importers holding stale symbols.
+bool dmdRootHasImporters(void* modp)
+{
+    import dmd.dmodule : Module;
+    auto root = cast(Module) modp;
+    if (!root)
+        return false;
+    foreach (m; Module.amodules)
+    {
+        if (m is root || m.aimports.length == 0)
+            continue;
+        foreach (imp; m.aimports)
+            if (imp is root)
+                return true;
+    }
+    return false;
+}
+
+// Fingerprint of a source's significant tokens (comments and whitespace are
+// not tokens). Two texts with the same fingerprint differ only in trivia, so
+// re-analysis can be skipped; unlike stripping whitespace/comments by hand,
+// this never mistakes string/char literal content for trivia.
+ulong dmdTokenHash(const(char)[] text)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    auto buf = text.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    ulong h = 0xcbf29ce484222325UL;
+    while (true)
+    {
+        Token tok;
+        lex.scan(&tok);
+        if (tok.value == TOK.endOfFile)
+            break;
+        h = (h ^ 0x1F) * 0x100000001b3UL;
+        h = (h ^ cast(ubyte) tok.value) * 0x100000001b3UL;
+        tok.toString((ubyte c) nothrow { h = (h ^ c) * 0x100000001b3UL; });
+    }
+    return h;
+}
+
 // Apply a supported subset of dmd command-line flags so analysis matches
 // the project's real build (previews/versions change overload resolution,
 // version blocks and template constraints). Unknown flags are ignored.
