@@ -18,6 +18,7 @@ import dmd.semantic3 : semantic3;
 import dmd.errors : DiagnosticHandler, FatalErrorHandler;
 import dmd.astcodegen : ASTCodegen;
 import dmd.dsymbol : Dsymbol;
+import dmd.dmodule : Module;
 import dmd.console : Color;
 import dmd.globals : global, FeatureState;
 import dmd.location : SourceLoc;
@@ -141,21 +142,51 @@ ParseOut dmdParseOnly(const(char)[] path, const(char)[] text)
     return r;
 }
 
-// Stepped semantic mirroring stock main.d gates: import (load) errors
-// stop before semantic. A scope search over a failed import (mod == null)
-// segfaults, stock only avoids it via the gate — so must we.
-// NOTE: parse errors do NOT stop us: dmd recovers from them and an LSP
-// must analyse broken code (mixins expand via CTFE, `auto` infers, ...).
-// Only errors *introduced by importAll* gate semantic.
-// Returns: semantic-phase error count (parse errors excluded).
+// True when any module in the import closure has a failed load (its `Import.mod`
+// is null). A scope search over a null import segfaults, so that — and only
+// that — must gate semantic. A parse error in a loaded import also bumps
+// `global.errors`, but must not gate: the LSP analyses mid-edit code, and
+// gating on it would blank out every inferred type in the closure whenever any
+// imported file is momentarily syntactically invalid.
+private bool hasUnloadedImport(Module root)
+{
+    import dmd.dmodule : Module;
+    import dmd.dimport : Import;
+
+    if (root is null)
+        return false;
+    Module[] stack = [root];
+    bool[Module] seen;
+    while (stack.length)
+    {
+        auto cur = stack[$ - 1];
+        stack.length--;
+        if (cur is null || cur in seen)
+            continue;
+        seen[cur] = true;
+        if (!cur.members)
+            continue;
+        foreach (i; 0 .. (*cur.members).length)
+        {
+            auto s = (*cur.members)[i];
+            if (auto imp = s.isImport())
+            {
+                if (imp.mod is null)
+                    return true;
+                stack ~= imp.mod;
+            }
+        }
+    }
+    return false;
+}
+
 uint dmdSemantic(void* modp)
 {
     import dmd.dmodule : Module;
 
     auto m = cast(Module)modp;
-    uint beforeImport = global.errors;
     m.importAll(null);
-    if (global.errors != beforeImport)
+    if (hasUnloadedImport(m))
         return global.errors;
     dsymbolSemantic(m, null);
     runDeferredSemantic();
