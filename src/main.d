@@ -1921,8 +1921,8 @@ int main(string[] args)
 
         // Binary mode: the CRT would otherwise translate CRLF in the framing.
         enum _O_BINARY = 0x8000;
-        _setmode(_fileno(stdin), _O_BINARY);
-        _setmode(_fileno(stdout), _O_BINARY);
+        _setmode(_fileno(cast(void*) stdin), _O_BINARY);
+        _setmode(_fileno(cast(void*) stdout), _O_BINARY);
         setvbuf(stdin, null, _IONBF, 0);
         setvbuf(stdout, null, _IONBF, 0);
 
