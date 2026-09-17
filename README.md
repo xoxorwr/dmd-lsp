@@ -30,7 +30,7 @@ server for your platform and keeps it updated. Settings:
 
 - `dmdLsp.serverPath` — use a local build instead of the downloaded binary.
 - `dmdLsp.autoUpdate` — re-download when the nightly changes (default `true`).
-- **dmd-lsp: Create dls.json** — write a starter config (see below).
+- **dmd-lsp: Create dls.json** — write a starter config (see [Configuration](#configuration)).
 
 ### Other editors
 Download the standalone binary for your platform from the
