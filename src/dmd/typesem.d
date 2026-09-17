@@ -3642,9 +3642,6 @@ Type typeSemantic(Type type, Loc loc, Scope* sc)
                 return error();
             }
 
-            __gshared FuncDeclaration feq = null;
-            __gshared FuncDeclaration fcmp = null;
-            __gshared FuncDeclaration fhash = null;
             if (!feq)
                 feq = search_function(ClassDeclaration.object, Id.opEquals).isFuncDeclaration();
             if (!fcmp)
@@ -4127,7 +4124,7 @@ Type typeSemantic(Type type, Loc loc, Scope* sc)
                         Type tv = t.baseElemOf();
                         if (tv.ty == Tstruct && tv.isTypeStruct().sym.noDefaultCtor)
                         {
-                            eSink.error(loc, "cannot have `out` parameter of type `%s` because the default construction is disabled", fparam.type.toErrMsg());
+                            eSink.error(loc, "cannot have `out` parameter of type `%s` because the default initialization is disabled", fparam.type.toErrMsg());
                             errors = true;
                         }
                     }
@@ -4933,12 +4930,19 @@ Type merge2(Type type)
     {
         t = sv.value;
         assert(t.deco);
-        return t;
     }
-    // The table entry is gone (an incremental re-analysis evicted it) while
-    // `t` still carries its deco. Clear it and merge anew instead of aborting.
-    t.deco = null;
-    return t.merge();
+    else
+    {
+        version (DMDLIB)
+        {
+            // Tooling may evict entries during re-analysis; merge anew instead.
+            t.deco = null;
+            return t.merge();
+        }
+        else
+            assert(0);
+    }
+    return t;
 }
 
 private enum LOGDEFAULTINIT = 0;
@@ -7559,7 +7563,24 @@ bool isZeroInit(Type t, Loc loc)
 
     bool visitBasic(TypeBasic t)
     {
-		return true; // yes
+        switch (t.ty)
+        {
+            case Tchar:
+            case Twchar:
+            case Tdchar:
+            case Timaginary32:
+            case Timaginary64:
+            case Timaginary80:
+            case Tfloat32:
+            case Tfloat64:
+            case Tfloat80:
+            case Tcomplex32:
+            case Tcomplex64:
+            case Tcomplex80:
+                return false; // no
+            default:
+                return true; // yes
+        }
     }
 
     bool visitVector(TypeVector t)
@@ -7625,19 +7646,35 @@ Expression defaultInit(Type mt, Loc loc, const bool isCfile = false)
 
         switch (mt.ty)
         {
+        case Tchar:
+            value = isCfile ? 0 : 0xFF;
+            break;
+
+        case Twchar:
+        case Tdchar:
+            value = isCfile ? 0 : 0xFFFF;
+            break;
+
         case Timaginary32:
         case Timaginary64:
         case Timaginary80:
         case Tfloat32:
         case Tfloat64:
         case Tfloat80:
-            return new RealExp(loc, CTFloat.zero, mt);
+            if (!isCfile && global.params.v.nanInit)
+                eSink.message(loc, "default NaN initialization of floating point variable");
+            return new RealExp(loc, isCfile ? CTFloat.zero : target.RealProperties.nan, mt);
 
         case Tcomplex32:
         case Tcomplex64:
         case Tcomplex80:
+            if (!isCfile && global.params.v.nanInit)
+                eSink.message(loc, "default NaN initialization of complex floating point variable");
             {
-                return new ComplexExp(loc, complex_t(CTFloat.zero, CTFloat.zero), mt);
+                // Can't use fvalue + I*fvalue (the im part becomes a quiet NaN).
+                const cvalue = isCfile ? complex_t(CTFloat.zero, CTFloat.zero)
+                                       : complex_t(target.RealProperties.nan, target.RealProperties.nan);
+                return new ComplexExp(loc, cvalue, mt);
             }
 
         case Tvoid:
@@ -7977,13 +8014,27 @@ Type addStorageClass(Type type, STC stc)
  *      Complex!float, Complex!double, Complex!real or null for error
  */
 
+// Caches for getComplexLibraryType and the AA-key functions; hoisted so deinitialize can reset them.
+private __gshared Type complex_float;
+private __gshared Type complex_double;
+private __gshared Type complex_real;
+private __gshared FuncDeclaration feq = null;
+private __gshared FuncDeclaration fcmp = null;
+private __gshared FuncDeclaration fhash = null;
+
+/// Reset the module's global state between analyses.
+void deinitialize() nothrow
+{
+    complex_float = null;
+    complex_double = null;
+    complex_real = null;
+    feq = null;
+    fcmp = null;
+    fhash = null;
+}
+
 Type getComplexLibraryType(Loc loc, Scope* sc, TY ty)
 {
-    // singleton
-    __gshared Type complex_float;
-    __gshared Type complex_double;
-    __gshared Type complex_real;
-
     Type* pt;
     Identifier id;
     switch (ty)

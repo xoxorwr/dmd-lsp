@@ -1,8 +1,9 @@
 # Vendoring
 
-`src/dmd/` is a snapshot of `../dmd/compiler/src/dmd` containing the exact
-`-i` closure plus the two string imports it needs (`VERSION`,
-`res/default_ddoc_theme.ddoc`): **145 files, ~6.9 MB**. It carries the fixes
+`src/dmd/` is a snapshot of `../dmd/compiler/src/dmd` (branch `lsp-fixes`:
+upstream `master` + the patches in [upstream.md](upstream.md)) containing the
+exact `-i` closure plus the two string imports it needs (`VERSION`,
+`res/default_ddoc_theme.ddoc`): **146 files, ~6.9 MB**. It carries the fixes
 listed in [upstream.md](upstream.md), so the build needs no `../dmd` at all —
 only the D compiler's druntime/phobos are external.
 
@@ -23,8 +24,9 @@ The closure was derived on Linux/x86_64. Extras needed elsewhere:
 - `dmd/iasm.d` and `dmd/backend/symbol.d` are intentionally absent: the
   build sets `-version=NoBackend`, so those imports are compiled out.
 
-`dmd-lsp` itself is POSIX-only (the worker uses `fork`/`socketpair`, the
-stdio loop uses `poll`); Windows is not a supported target yet.
+`dmd-lsp` is cross-platform: on POSIX the worker is `fork()`ed; on Windows it
+is spawned via `CreateProcess` with `--worker` and the stdio loop waits on the
+stdin handle.
 
 ## Refreshing
 

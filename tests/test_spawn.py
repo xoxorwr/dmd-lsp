@@ -1,10 +1,8 @@
 import json, subprocess, sys, time, os
 
-# The worker is spawned once and keeps the dependency closure warm. A root
-# edit is re-analysed in a fork child (copy-on-write, exits after answering),
-# so completions, the debounced analyze, hover and definition after an edit
-# must never spawn another worker. The regression guarded here is a
-# per-edit worker rebuild (and a stale warm universe that ignores the edit).
+# Analysis runs in-process: the daemon keeps one warm universe and re-parses
+# the root in place on edits, so nothing is ever spawned. The regression
+# guarded here is a stale warm universe that ignores the edit.
 
 BIN = './dmd-lsp'
 URI = 'file:///tmp/spawntest.d'
@@ -84,8 +82,8 @@ dfn = read_msg()['result']
 check('definition-reuses',
       dfn is not None and dfn[0]['range']['start']['line'] == 1, str(dfn))
 
-# A semantic root edit must be picked up by the fork child (the warm parent
-# still holds the pre-edit root): the added field has to show up.
+# A semantic root edit must be picked up by the in-place re-parse: the added
+# field has to show up.
 v2 = v1.replace('int y; }', 'int y; int z; }')
 send({"jsonrpc": "2.0", "method": "textDocument/didChange",
       "params": {"textDocument": {"uri": URI, "version": 3},
@@ -107,9 +105,8 @@ proc.wait(timeout=5)
 errf.close()
 
 spawns = sum(1 for line in open(TRACE) if 'spawn' in line)
-# Exactly one worker: didOpen's build warms it, and everything after runs in
-# fork children. More than one means the edit path still rebuilds a worker.
-check('warm-worker-reused', spawns == 1, 'spawns=%d' % spawns)
+# No subprocess: everything runs in-process.
+check('no-subprocess', spawns == 0, 'spawns=%d' % spawns)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

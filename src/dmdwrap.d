@@ -17,6 +17,7 @@ import dmd.semantic2 : semantic2;
 import dmd.semantic3 : semantic3;
 import dmd.errors : DiagnosticHandler, FatalErrorHandler;
 import dmd.astcodegen : ASTCodegen;
+import dmd.dsymbol : Dsymbol;
 import dmd.console : Color;
 import dmd.globals : global, FeatureState;
 import dmd.location : SourceLoc;
@@ -178,6 +179,68 @@ void dmdResetCounters()
     global.gag = 0;
 }
 
+// Snapshot / restore the global Loc tables. `dmd.location` appends a BaseLoc
+// (holding the entire file content) on every parse, so a long-lived consumer
+// must roll back to the end of the initial build before each re-parse.
+void dmdLocCheckpoint(ref size_t tableLen, ref uint index)
+{
+    import dmd.location : Loc;
+    auto cp = Loc.checkpoint();
+    tableLen = cp.tableLength;
+    index = cp.index;
+}
+
+void dmdLocRollback(size_t tableLen, uint index)
+{
+    import dmd.location : Loc;
+    Loc.rollback(Loc.Checkpoint(tableLen, index));
+}
+
+// Reset the frontend's global *caches* without tearing down the module
+// registry, so a live universe can be re-analysed in place without the caches
+// accumulating one generation per edit. This is the cache-only subset of
+// `deinitializeDMD` (no `Module.deinitialize`, no `global.deinitialize`).
+void dmdResetCaches()
+{
+    import dmd.dsymbol : Dsymbol;
+    import dmd.dscope : Scope;
+    import dmd.location : Loc;
+    import funcsem = dmd.funcsem;
+    import dsymbolsem = dmd.dsymbolsem;
+    import typesem = dmd.typesem;
+    import semantic3 = dmd.semantic3;
+    import templatesem = dmd.templatesem;
+    import dtemplate = dmd.dtemplate;
+    import clone = dmd.clone;
+    import arrayop = dmd.arrayop;
+
+    // Only the module-scoped caches are cleared here. `Type.stringtable` and
+    // the `Expression` singletons are deliberately left alone: re-initialising
+    // them mid-universe recreates the basic `Type` objects and CTFE sentinels,
+    // which breaks identity comparisons (`t is Type.tint32`) and semantic
+    // against the still-live dependency closure. Module-specific `Type` entries
+    // are handled by `dmdEvictRoot`.
+    Dsymbol.deinitialize();
+    funcsem.deinitialize();
+    dsymbolsem.deinitialize();
+    typesem.deinitialize();
+    semantic3.deinitialize();
+    templatesem.deinitialize();
+    dtemplate.deinitialize();
+    clone.deinitialize();
+    arrayop.deinitialize();
+    Scope.freelist = null;
+    // Loc._init();
+    import dmd.dmodule : Module;
+    Module.deferred = Module.deferred.init;
+    Module.deferred2 = Module.deferred2.init;
+    Module.deferred3 = Module.deferred3.init;
+    // CTFE caches every evaluated global constant, which keeps the constant's
+    // declaration (and its module) alive across analyses.
+    import dmd.dinterpret : dinterpret = deinitialize;
+    dinterpret();
+}
+
 private bool containsSlice(const(char)[] hay, const(char)[] needle) pure nothrow @nogc @safe
 {
     if (needle.length == 0 || hay.length < needle.length)
@@ -259,8 +322,56 @@ void dmdEvictRoot(void* modp)
             break;
         }
 
-    Type.stringtable.removeWhere((const(StringValue!Type)* sv)
+    auto removedTypes = Type.stringtable.removeWhere((const(StringValue!Type)* sv)
         => containsSlice(sv.toString(), tok));
+    import core.stdc.stdlib : getenv;
+    import core.stdc.stdio : fprintf, stderr;
+    if (getenv("DMD_LSP_TRACE_EVICT"))
+        fprintf(stderr, "dmd-lsp: evict token=%.*s typesRemoved=%zu\n",
+            cast(int) tok.length, tok.ptr, removedTypes);
+}
+
+// Re-parse a module in place with `text`, reusing the same Module object so
+// importers' `imp.mod` and template-instance links keep pointing at it (a
+// fresh Module would leave the closure pinned to the old one). The module's
+// interned types are evicted first so semantic re-merges cleanly. The caller
+// runs dmdSemantic on the returned module next; returns null on failure.
+void* dmdReparseModule(void* modp, const(char)[] text)
+{
+    import dmd.dmodule : Module;
+    import dmd.dsymbol : DsymbolTable, PASS;
+
+    if (!modp)
+        return null;
+    auto m = cast(Module) modp;
+    dmdEvictRoot(modp);
+    dmdResetCaches(); // drop the previous generation's frontend caches
+    // The reused Module still carries the previous run's semantic state, which
+    // makes `dsymbolSemantic` short-circuit (visit(Module): semanticRun !=
+    // initial -> return) and the import list. Reset both so the new members
+    // are analysed from scratch.
+    m.semanticRun = PASS.initial;
+    m._scope = null;
+    m.aimports = m.aimports.init;
+    m.errors = 0;
+    m.members = null; // drop the previous member list before parse replaces it
+    m.symtab = null; // drop references to the previous members (fresh-module state)
+    // Other symbol-bearing fields the previous semantic populated; left over
+    // they anchor the replaced members.
+    m.importedScopes = null; // imported modules + template mixins
+    m.userAttribDecl = null;
+    m.decldefs = null;
+    m.tagSymTab = m.tagSymTab.init;
+    m.contentImportedFiles = m.contentImportedFiles.init;
+    // Invalidate the symbol-search cache: it holds a Dsymbol from the previous
+    // parse (Module field at offset 360) and would otherwise pin the replaced
+    // members for as long as the module object lives.
+    m.searchCacheIdent = null;
+    m.searchCacheSymbol = null;
+    m.searchCacheFlags = typeof(m.searchCacheFlags).init;
+    m.insearch = false;
+    m.src = cast(const(ubyte)[]) (text.dup ~ '\0');
+    return cast(void*) m.parseModule!ASTCodegen();
 }
 
 // Apply a supported subset of dmd command-line flags so analysis matches
@@ -404,13 +515,32 @@ private void dmdResetGlobals()
 //   errors/warnings/deprecations/gag counters, Module registry
 //   (modules/amodules/deferred queues), FileManager, Id/Type/target
 //   tables, Loc tables, errorLimit.
-void dmdResetRequest(ref DmdState st, DiagSink* sink)
+void dmdResetRequest(ref DmdState st, DiagSink* sink,
+    scope void delegate() nothrow regionReset = null)
 {
     auto saved = st.importPaths;
     auto savedStr = st.stringPaths;
     if (st.inited)
         deinitializeDMD();
     dmdResetGlobals();
+    // Reclaim transient OutBuffer stores (e.g. cached file contents) from the
+    // discarded universe; independent of any arena reset.
+    import dmd.root.scratch : resetScratch;
+    resetScratch();
+    if (regionReset !is null)
+    {
+        regionReset(); // free the run's arena between clearing and re-init
+        // The Identifier table lives in persistent memory but its values point
+        // into the freed arena; drop the stale entries (and counters), then
+        // re-register the keywords *before* dmdInit (whose Id.initialize then
+        // finds them, matching stock deinit/init order).
+        import dmd.identifier : Identifier;
+        import dmd.tokens : initializeKeywords;
+        import dmd.dinterpret : reinitAfterRegion;
+        reinitAfterRegion();
+        Identifier.reinitAfterRegion();
+        initializeKeywords();
+    }
     st.inited = false;
     st.importPaths = saved;
     st.stringPaths = savedStr;

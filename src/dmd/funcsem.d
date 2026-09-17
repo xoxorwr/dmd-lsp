@@ -256,6 +256,15 @@ bool hasNestedFrameRefs(FuncDeclaration _this)
     return false;
 }
 
+// Cache for genCfunc; hoisted so deinitialize can reset it.
+private __gshared DsymbolTable st = null;
+
+/// Reset the module's global state between analyses.
+void deinitialize() nothrow
+{
+    st = null;
+}
+
 /**********************************
  * Generate a FuncDeclaration for a runtime library function.
  */
@@ -269,7 +278,6 @@ FuncDeclaration genCfunc(Parameters* fparams, Type treturn, Identifier id, STC s
     FuncDeclaration fd;
     TypeFunction tf;
     Dsymbol s;
-    __gshared DsymbolTable st = null;
 
     //printf("genCfunc(name = '%s')\n", id.toChars());
     //printf("treturn\n\t"); treturn.print();
@@ -919,7 +927,6 @@ Ldone:
      */
     funcdecl._scope = sc.copy();
     funcdecl._scope.setNoFree();
-	funcdecl._scope.parent = funcdecl;
 
     __gshared bool printedMain = false; // semantic might run more than once
     if (global.params.v.verbose && !printedMain)
@@ -2097,10 +2104,12 @@ FuncDeclaration resolveFuncCall(Loc loc, Scope* sc, Dsymbol s,
 
     if (od)
     {
+        if (checkNamedArgErrorAndReportOverload(od, argumentList, loc))
+            return null;
+
         eSink.error(loc, "none of the overloads of `%s` are callable using argument types `!(%s)%s`",
             od.ident.toErrMsg(), tiargsBuf.peekChars(), fargsBuf.peekChars());
 
-        checkNamedArgErrorAndReportOverload(od, argumentList, loc);
         printCandidates(loc, od, sc.isDeprecated());
         return null;
     }
@@ -2176,6 +2185,9 @@ FuncDeclaration resolveFuncCall(Loc loc, Scope* sc, Dsymbol s,
     //printf("tf = %s, args = %s\n", tf.deco, (*fargs)[0].type.deco);
     if (hasOverloads)
     {
+        if (checkNamedArgErrorAndReportOverload(fd, argumentList, loc))
+            return null;
+
         eSink.error(loc, "none of the overloads of `%s` are callable using argument types `%s`",
                fd.toErrMsg(), fargsBuf.peekChars());
         printCandidates(loc, fd, sc.isDeprecated());
@@ -2259,11 +2271,13 @@ private void checkNamedArgErrorAndReport(TemplateDeclaration td, ArgumentList ar
  *      od = overload declaration to check
  *      argumentList = arguments to check
  *      loc = location for error report
+ * Returns:
+ *      true if a named argument error was found and reported, false otherwise
  */
-private void checkNamedArgErrorAndReportOverload(Dsymbol od, ArgumentList argumentList, Loc loc)
+private bool checkNamedArgErrorAndReportOverload(Dsymbol od, ArgumentList argumentList, Loc loc)
 {
     if (!argumentList.hasArgNames())
-        return;
+        return false;
 
     FuncDeclaration tf = null;
     overloadApply(od, (Dsymbol s) {
@@ -2286,8 +2300,12 @@ private void checkNamedArgErrorAndReportOverload(Dsymbol od, ArgumentList argume
         OutBuffer buf;
         auto resolvedArgs = tf.type.isTypeFunction().resolveNamedArgs(argumentList, &buf);
         if (!resolvedArgs && buf.length)
-            global.errorSink.errorSupplemental(loc, "%s", buf.peekChars());
+        {
+            global.errorSink.error(loc, "%s", buf.peekChars());
+            return true;
+        }
     }
+    return false;
 }
 
 /*******************************************

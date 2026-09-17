@@ -1,9 +1,10 @@
-// dmd-lsp: LSP front end (struct-only). All dmd work happens in a forked
-// worker process (see worker.d); this module holds only session/config
+// dmd-lsp: LSP front end (struct-only). All dmd work happens in the
+// worker (see worker.d); this module holds only session/config
 // state and formats results.
 module main;
 
 import core.stdc.stdio : printf, fprintf, stderr;
+import core.stdc.stdlib : getenv;
 import core.stdc.signal : signal, SIG_IGN;
 version (Posix)
     import core.sys.posix.signal : SIGPIPE;
@@ -34,7 +35,7 @@ struct App
     bool debounceSet = false; // true when --debounce-ms= was given (beats file)
     // Explicit paths: CLI flags, replaced wholesale by editor settings.
     // Effective lists (explicit ++ file ++ builtin defaults) recomputed by
-    // refreshImports; sent to each worker at spawn.
+    // refreshImports; applied at worker init.
     string[] baseImports;
     string[] baseStringImports;
     string[] baseFlags; // dmd flags from CLI (--flag=...)
@@ -168,7 +169,7 @@ private JsonNode* buildDiagnostics(Json js, const ref worker.WAnalysis a)
     return arr;
 }
 
-// Run an analyze request against the worker, respawning once if the worker
+// Run an analyze request against the worker, respawning once if needed.
 // already served its single universe. `realOnly` forces the universe to have
 // parsed the real text (open/save, where diagnostics must be exact); false
 // lets the analyze reuse a live completion placeholder by identity, which is
@@ -213,7 +214,7 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn, or recover from a worker that died mid-request.
+            // Respawn the worker.
             workerKill(app.wk);
             continue;
         }
@@ -240,7 +241,7 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn, or recover from a worker that died mid-request.
+            // Respawn the worker.
             workerKill(app.wk);
             continue;
         }
@@ -267,7 +268,7 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn, or recover from a worker that died mid-request.
+            // Respawn the worker.
             workerKill(app.wk);
             continue;
         }
@@ -294,7 +295,7 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn, or recover from a worker that died mid-request.
+            // Respawn the worker.
             workerKill(app.wk);
             continue;
         }
@@ -1611,10 +1612,24 @@ private void handleMessage(App* app, ref RawMsg m)
     lspRespondError(m.idJson, -32601, "method not found: " ~ m.method);
 }
 
+private ulong parseHex(const(char)[] s, size_t from, size_t to)
+{
+    ulong v = 0;
+    foreach (i; from .. to)
+    {
+        char c = s[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+    }
+    return v;
+}
+
 private int runCheck(string[] files, string[] imports, string[] stringImports = null,
     string[] flags = null)
 {
-    // One-shot batch mode: single process, no worker needed.
+    // One-shot batch mode: single process.
     App app;
     app.baseImports = imports;
     app.baseStringImports = stringImports;
@@ -1635,6 +1650,17 @@ private int runCheck(string[] files, string[] imports, string[] stringImports = 
             continue;
         }
         auto a = serverAnalyze(srv, f, text);
+        if (getenv("DMD_LSP_TRACE_GCSTATS") !is null)
+        {
+            import core.memory : GC;
+            GC.collect();
+            auto st = GC.stats();
+            auto before = st.usedSize;
+            GC.minimize();
+            auto after = GC.stats().usedSize;
+            fprintf(stderr, "gcstats: used=%zuMB afterMinimize=%zuMB allocatedTotal=%zuMB\n",
+                before / 1024 / 1024, after / 1024 / 1024, st.allocatedInCurrentThread / 1024 / 1024);
+        }
         foreach (ref d; a.diags)
         {
             if (d.kind == 'S' || d.kind == 'M')
@@ -1727,7 +1753,7 @@ private void refreshImports(App* app)
         app.stringPaths = seff;
         app.flags = feff;
         app.configGen++;
-        // Worker bakes paths in at spawn; drop it so the next request
+        // Host bakes paths in at init; drop it so the next request
         // respawns with the new configuration. Tokens may resolve
         // differently under the new paths, so drop the cache too.
         app.tokCache = null;
@@ -1757,6 +1783,14 @@ enum dmdLspVersion = "0.3.0";
 
 int main(string[] args)
 {
+    // Worker mode: this process is a spawned analysis child.
+    foreach (a; args[1 .. $])
+        if (a == "--worker")
+        {
+            workerMain();
+            return 0;
+        }
+
     string[] imports;
     string[] stringImports;
     string[] flags;
@@ -1812,7 +1846,7 @@ int main(string[] args)
     // the analysis runs on the debounce idle (so the unsaved doc is analysed
     // without a save), reusing the live universe when the text is unchanged
     // since the last build. open/save force a real rebuild for exact
-    // diagnostics. All dmd work happens in a forked worker (worker.d); the
+    // diagnostics. All dmd work happens in the worker (worker.d); the
     // parent holds no dmd state, so nothing accumulates across rebuilds.
     App app;
     app.debounceMs = debounceMs;
@@ -1822,7 +1856,7 @@ int main(string[] args)
     app.baseFlags = flags;
     refreshImports(&app);
     version (Posix)
-        signal(SIGPIPE, SIG_IGN); // worker pipe may close on respawn
+        signal(SIGPIPE, SIG_IGN); // client may close stdout
     scope (exit)
         workerKill(app.wk);
     app.lastMsgMs = nowMs();
@@ -1868,6 +1902,53 @@ int main(string[] args)
             handleMessage(&app, m);
             // Restart the idle clock after handling so a slow build doesn't
             // make the debounce look elapsed the moment it returns.
+            app.lastMsgMs = nowMs();
+            GC.collect();
+        }
+    }
+    else version (Windows)
+    {
+        import core.sys.windows.winbase : WaitForSingleObject, GetStdHandle,
+            STD_INPUT_HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT, INFINITE;
+        import core.stdc.stdio : setvbuf, _IONBF, stdin, stdout, FILE;
+
+        // Binary mode: the CRT would otherwise translate CRLF in the framing.
+        extern (C) int _setmode(int fd, int mode) nothrow;
+        extern (C) int _fileno(FILE*) nothrow;
+        enum _O_BINARY = 0x8000;
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+        setvbuf(stdin, null, _IONBF, 0);
+        setvbuf(stdout, null, _IONBF, 0);
+
+        auto hIn = GetStdHandle(STD_INPUT_HANDLE);
+        RawMsg m;
+        string body_;
+        for (;;)
+        {
+            uint timeout = INFINITE;
+            if (app.pending.length)
+            {
+                ulong idle = nowMs() - app.lastMsgMs;
+                if (idle >= app.debounceMs)
+                    timeout = 0;
+                else
+                {
+                    ulong wait = app.debounceMs - idle;
+                    timeout = wait > uint.max ? uint.max : cast(uint)wait;
+                }
+            }
+            auto r = WaitForSingleObject(hIn, timeout);
+            if (r == WAIT_TIMEOUT)
+            {
+                flushPending(&app);
+                continue;
+            }
+            if (r != WAIT_OBJECT_0)
+                break;
+            if (!lspRead(&m, body_))
+                break;
+            handleMessage(&app, m);
             app.lastMsgMs = nowMs();
             GC.collect();
         }

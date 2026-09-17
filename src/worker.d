@@ -1,16 +1,20 @@
 module worker;
 
-// Process-isolated analysis. The LSP front end (parent) holds no dmd state.
-// One worker process is spawned per universe; it performs a single full dmd
-// build (dependency closure + root) and keeps that universe warm. A root edit
-// is answered by forking a child over the warm universe (copy-on-write): the
-// child evicts the old root module and its interned types, re-analyzes only
-// the new root (~10x cheaper than a full build), sends its response and
-// exits — so its mutations, and the memory the eviction cannot reclaim under
-// the conservative GC, never reach the warm process. A dependency, config or
-// root-path change still discards the worker (`needRespawn`) and the OS
-// reclaims everything. All results crossing the boundary are plain data.
-// Struct-only, no phobos. Requires Posix (fork/socketpair).
+// Cross-platform analysis worker.
+//
+// One child process builds a full dmd universe (dependency closure + root) and
+// keeps it warm; a root-text edit is re-parsed in place on the warm closure
+// (serverAnalyzeIncremental -> dmdReparseModule). A dependency/config/root
+// change respawns the child, so the OS reclaims the discarded universe. The
+// parent (LSP front end) holds only documents/config.
+//
+// Transport: two pipes with length-prefixed frames, so the same code runs on
+// POSIX and Windows.
+//   * POSIX:   fork(); the child dups the pipes onto stdin/stdout and runs
+//              workerMain().
+//   * Windows: CreateProcess of this executable with `--worker`; main.d calls
+//              workerMain(), which speaks over the inherited std handles.
+// Struct-only, no phobos.
 
 import arena;
 import json;
@@ -23,60 +27,98 @@ import semantic : SemTok, semanticTokens;
 
 import dmd.dmodule : Module;
 
-version (Posix):
-import core.stdc.stdio : fprintf, stderr;
-import core.sys.posix.unistd : read, write, close, fork, dup2, pid_t;
-import core.sys.posix.sys.socket : socketpair, AF_UNIX, SOCK_STREAM;
-import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
-    WEXITSTATUS;
-import core.sys.posix.unistd : _exit;
+version (Posix)
+{
+    import core.sys.posix.unistd : read, write, close, fork, dup2, pipe, pid_t, _exit;
+    import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
+        WEXITSTATUS;
+}
 
-// ---------- framing (length-prefixed, like LSP) ----------
-private bool writeAll(int fd, const(ubyte)[] data) nothrow
+version (Windows)
+{
+    import core.sys.windows.winbase;
+    import core.sys.windows.windef;
+    import core.sys.windows.winnt;
+}
+
+// ---------- framing ----------
+
+struct Chan
+{
+    version (Posix)
+        int fd = -1;
+    version (Windows)
+        void* h = null;
+}
+
+private __gshared Chan inChan;   // child: requests
+private __gshared Chan outChan;  // child: responses
+
+private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
 {
     size_t off = 0;
     while (off < data.length)
     {
-        auto n = write(fd, data.ptr + off, data.length - off);
-        if (n <= 0)
-            return false;
-        off += cast(size_t)n;
+        version (Posix)
+        {
+            auto n = write(c.fd, data.ptr + off, data.length - off);
+            if (n <= 0)
+                return false;
+            off += cast(size_t)n;
+        }
+        version (Windows)
+        {
+            DWORD n = 0;
+            if (!WriteFile(c.h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
+                return false;
+            off += n;
+        }
     }
     return true;
 }
 
-private bool readAll(int fd, ubyte[] data) nothrow
+private bool chanRead(ref Chan c, ubyte[] data) nothrow
 {
     size_t off = 0;
     while (off < data.length)
     {
-        auto n = read(fd, data.ptr + off, data.length - off);
-        if (n <= 0)
-            return false;
-        off += cast(size_t)n;
+        version (Posix)
+        {
+            auto n = read(c.fd, data.ptr + off, data.length - off);
+            if (n <= 0)
+                return false;
+            off += cast(size_t)n;
+        }
+        version (Windows)
+        {
+            DWORD n = 0;
+            if (!ReadFile(c.h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
+                return false;
+            off += n;
+        }
     }
     return true;
 }
 
-private bool writeFrame(int fd, const(char)[] s) nothrow
+private bool writeFrame(ref Chan c, const(char)[] s) nothrow
 {
     uint len = cast(uint)s.length;
     ubyte[4] hdr = [cast(ubyte)(len & 0xff), cast(ubyte)((len >> 8) & 0xff),
         cast(ubyte)((len >> 16) & 0xff), cast(ubyte)((len >> 24) & 0xff)];
-    return writeAll(fd, hdr[]) && writeAll(fd, cast(const(ubyte)[])s);
+    return chanWrite(c, hdr[]) && chanWrite(c, cast(const(ubyte)[])s);
 }
 
-private bool readFrame(int fd, ref char[] out_) nothrow
+private bool readFrame(ref Chan c, ref char[] out_) nothrow
 {
     ubyte[4] hdr;
-    if (!readAll(fd, hdr[]))
+    if (!chanRead(c, hdr[]))
         return false;
     uint len = cast(uint)hdr[0] | (cast(uint)hdr[1] << 8) |
         (cast(uint)hdr[2] << 16) | (cast(uint)hdr[3] << 24);
     if (len > 64 * 1024 * 1024)
         return false;
     out_.length = len;
-    return readAll(fd, cast(ubyte[])out_);
+    return chanRead(c, cast(ubyte[])out_);
 }
 
 private string dupOrEmpty(const(char)[] s)
@@ -93,14 +135,12 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
 }
 
 // ---------- worker (child) side ----------
-version (Posix)
-{
-    private void sendNeedRespawn(int fd)
+    private void sendNeedRespawn()
     {
         auto js = jmake();
         auto root = js.create_object();
         js.add_bool_to_object(root, "needRespawn", true);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
     private void addDiags(Json js, JsonNode* root, const ref Analysis a)
@@ -142,7 +182,7 @@ version (Posix)
         js.add_item_to_object(root, key, o);
     }
 
-    private void sendAnalyze(int fd, const ref Analysis a)
+    private void sendAnalyze(const ref Analysis a)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -150,10 +190,10 @@ version (Posix)
         addLint(js, root, "lintImports", a.lintImports);
         addLint(js, root, "lintParams", a.lintParams);
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendComplete(int fd, const ref CompleteOut out_)
+    private void sendComplete(const ref CompleteOut out_)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -173,10 +213,10 @@ version (Posix)
         }
         js.add_item_to_object(root, "items", arr);
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendSignature(int fd, const ref SignatureInfo si)
+    private void sendSignature(const ref SignatureInfo si)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -199,10 +239,10 @@ version (Posix)
             js.add_item_to_object(root, "parameters", arr);
         }
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendDefinition(int fd, const ref DefLoc def)
+    private void sendDefinition(const ref DefLoc def)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -215,10 +255,10 @@ version (Posix)
             js.add_number_to_object(root, "len", cast(double)def.len);
         }
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendSemantic(int fd, const(SemTok)[] toks)
+    private void sendSemantic(const(SemTok)[] toks)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -235,10 +275,10 @@ version (Posix)
         }
         js.add_item_to_object(root, "tokens", arr);
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendHover(int fd, const ref HoverInfo h)
+    private void sendHover(const ref HoverInfo h)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -249,7 +289,7 @@ version (Posix)
             addStrOpt(js, root, "doc", h.doc);
         }
         js.add_bool_to_object(root, "needRespawn", false);
-        writeFrame(fd, printJsonStr(root));
+        writeFrame(outChan, printJsonStr(root));
     }
 
     // Run `work` in a fork child over the inherited (copy-on-write) universe:
@@ -279,7 +319,7 @@ version (Posix)
     // Per-op tail shared by the in-process (hit/first-build) path and the
     // fork-child (incremental) path.
     private void completeAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col, const(char)[] prefix, int fd)
+        const(char)[] orig, uint line, uint col, const(char)[] prefix)
     {
         CompleteCtx ctx;
         ctx.line = line;
@@ -287,50 +327,56 @@ version (Posix)
         ctx.prefix = prefix;
         CompleteOut out_;
         completeAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, out_);
-        sendComplete(fd, out_);
+        sendComplete(out_);
     }
 
     private void signatureAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col, int fd)
+        const(char)[] orig, uint line, uint col)
     {
         CompleteCtx ctx;
         ctx.line = line;
         ctx.character = col;
         SignatureInfo si;
         signatureAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, si);
-        sendSignature(fd, si);
+        sendSignature(si);
     }
 
     private void definitionAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col, int fd)
+        const(char)[] orig, uint line, uint col)
     {
         CompleteCtx ctx;
         ctx.line = line;
         ctx.character = col;
         DefLoc def;
         definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
-        sendDefinition(fd, def);
+        sendDefinition(def);
     }
 
     private void hoverAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col, int fd)
+        const(char)[] orig, uint line, uint col)
     {
         CompleteCtx ctx;
         ctx.line = line;
         ctx.character = col;
         HoverInfo h;
         hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
-        sendHover(fd, h);
+        sendHover(h);
     }
 
-    private void workerLoop(int fd)
+    void workerMain()
     {
+        version (Posix) { inChan.fd = 0; outChan.fd = 1; }
+        version (Windows)
+        {
+            inChan.h = GetStdHandle(STD_INPUT_HANDLE);
+            outChan.h = GetStdHandle(STD_OUTPUT_HANDLE);
+        }
         ServerState s;
         bool built = false;
         for (;;)
         {
             char[] req;
-            if (!readFrame(fd, req))
+            if (!readFrame(inChan, req))
                 break;
             jtmp.reset();
             auto p = jparse(req);
@@ -370,7 +416,7 @@ version (Posix)
                 auto js = jmake();
                 auto root = js.create_object();
                 js.add_bool_to_object(root, "ok", true);
-                writeFrame(fd, printJsonStr(root));
+                writeFrame(outChan, printJsonStr(root));
                 continue;
             }
             if (ops == "analyze")
@@ -395,18 +441,18 @@ version (Posix)
                 // or config change needs a fresh universe.
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, text, null);
-                    sendAnalyze(fd, a);
+                    sendAnalyze(a);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                sendAnalyze(fd, a);
+                sendAnalyze(a);
                 built = true;
                 continue;
             }
@@ -432,12 +478,12 @@ version (Posix)
                 auto st = built ? serverUniState(s, path, null, atext) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a2 = serverAnalyzeIncremental(s, path, atext, orig);
-                    completeAndSend(s, a2, orig, line, col, prefix, fd);
+                    completeAndSend(s, a2, orig, line, col, prefix);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 Analysis a;
@@ -455,7 +501,7 @@ version (Posix)
                 {
                     a = serverAnalyze(s, path, atext, orig);
                 }
-                completeAndSend(s, a, orig, line, col, prefix, fd);
+                completeAndSend(s, a, orig, line, col, prefix);
                 built = true;
                 continue;
             }
@@ -473,18 +519,18 @@ version (Posix)
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    signatureAndSend(s, a, orig, line, col, fd);
+                    signatureAndSend(s, a, orig, line, col);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                signatureAndSend(s, a, orig, line, col, fd);
+                signatureAndSend(s, a, orig, line, col);
                 built = true;
                 continue;
             }
@@ -502,18 +548,18 @@ version (Posix)
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    definitionAndSend(s, a, orig, line, col, fd);
+                    definitionAndSend(s, a, orig, line, col);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                definitionAndSend(s, a, orig, line, col, fd);
+                definitionAndSend(s, a, orig, line, col);
                 built = true;
                 continue;
             }
@@ -531,18 +577,18 @@ version (Posix)
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    hoverAndSend(s, a, orig, line, col, fd);
+                    hoverAndSend(s, a, orig, line, col);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                hoverAndSend(s, a, orig, line, col, fd);
+                hoverAndSend(s, a, orig, line, col);
                 built = true;
                 continue;
             }
@@ -562,12 +608,12 @@ version (Posix)
                     auto a = serverAnalyzeIncremental(s, path, text, null);
                     SemTok[] toks;
                     semanticTokens(cast(Module)a.module_, a.syn, text, toks);
-                    sendSemantic(fd, toks);
+                    sendSemantic(toks);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn(fd);
+                    sendNeedRespawn();
                     continue;
                 }
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
@@ -575,20 +621,24 @@ version (Posix)
                     s.scratch.rewind(s.uni.mark);
                 SemTok[] toks;
                 semanticTokens(cast(Module)a.module_, a.syn, text, toks);
-                sendSemantic(fd, toks);
+                sendSemantic(toks);
                 built = true;
                 continue;
             }
-            sendNeedRespawn(fd); // unknown op
+            sendNeedRespawn(); // unknown op
         }
     }
-}
+
 
 // ---------- parent side ----------
 struct Worker
 {
-    pid_t pid = -1;
-    int fd = -1;
+    Chan req;   // parent -> child requests
+    Chan resp;  // child -> parent responses
+    version (Posix)
+        pid_t pid = -1;
+    version (Windows)
+        void* proc = null;
     bool alive = false;
 }
 
@@ -596,7 +646,7 @@ private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
 {
     if (!w.alive)
         return false;
-    if (writeFrame(w.fd, req) && readFrame(w.fd, resp))
+    if (writeFrame(w.req, req) && readFrame(w.resp, resp))
         return true;
     import core.stdc.stdio : fprintf, stderr;
     fprintf(stderr, "dmd-lsp: worker exchange failed; respawning\n");
@@ -607,11 +657,8 @@ void workerKill(ref Worker w)
 {
     version (Posix)
     {
-        if (w.fd >= 0)
-        {
-            close(w.fd);
-            w.fd = -1;
-        }
+        if (w.req.fd >= 0) { close(w.req.fd); w.req.fd = -1; }
+        if (w.resp.fd >= 0) { close(w.resp.fd); w.resp.fd = -1; }
         if (w.pid > 0)
         {
             int status = 0;
@@ -619,10 +666,21 @@ void workerKill(ref Worker w)
             if (WIFSIGNALED(status))
             {
                 import core.stdc.stdio : fprintf, stderr;
-                fprintf(stderr, "dmd-lsp: worker killed by signal %d\n",
-                    WTERMSIG(status));
+                fprintf(stderr, "dmd-lsp: worker killed by signal %d\n", WTERMSIG(status));
             }
             w.pid = -1;
+        }
+    }
+    version (Windows)
+    {
+        if (w.req.h) { CloseHandle(w.req.h); w.req.h = null; }
+        if (w.resp.h) { CloseHandle(w.resp.h); w.resp.h = null; }
+        if (w.proc)
+        {
+            TerminateProcess(w.proc, 0);
+            WaitForSingleObject(w.proc, 5000);
+            CloseHandle(w.proc);
+            w.proc = null;
         }
     }
     w.alive = false;
@@ -632,62 +690,107 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
 {
     version (Posix)
     {
-        import core.stdc.stdlib : getenv;
-        import core.stdc.stdio : fprintf, stderr;
-        if (getenv("DMD_LSP_TRACE_SPAWN"))
-            fprintf(stderr, "dmd-lsp: spawn\n");
-        int[2] sv;
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        int[2] toChild, fromChild;
+        if (pipe(toChild) != 0)
             return false;
+        if (pipe(fromChild) != 0)
+        {
+            close(toChild[0]); close(toChild[1]);
+            return false;
+        }
         auto pid = fork();
         if (pid < 0)
         {
-            close(sv[0]);
-            close(sv[1]);
+            close(toChild[0]); close(toChild[1]);
+            close(fromChild[0]); close(fromChild[1]);
             return false;
         }
         if (pid == 0)
         {
-            // Child. Never touch the parent's LSP stdout channel.
-            close(sv[0]);
-            dup2(2, 1);
-            workerLoop(sv[1]);
+            // Child: never touch the parent's LSP stdout channel.
+            dup2(toChild[0], 0);
+            dup2(fromChild[1], 1);
+            close(toChild[0]); close(toChild[1]);
+            close(fromChild[0]); close(fromChild[1]);
+            workerMain();
             _exit(0);
         }
-        close(sv[1]);
+        close(toChild[0]);
+        close(fromChild[1]);
+        w.req.fd = toChild[1];
+        w.resp.fd = fromChild[0];
         w.pid = pid;
-        w.fd = sv[0];
         w.alive = true;
-
-        auto js = jmake();
-        auto root = js.create_object();
-        js.add_string_to_object(root, "op", zstr("init"));
-        auto ia = js.create_array();
-        foreach (p; imports)
-            js.add_item_to_array(ia, js.create_string(zstr(p)));
-        js.add_item_to_object(root, "importPaths", ia);
-        auto sa = js.create_array();
-        foreach (p; strings)
-            js.add_item_to_array(sa, js.create_string(zstr(p)));
-        js.add_item_to_object(root, "stringPaths", sa);
-        auto fa = js.create_array();
-        foreach (p; flags)
-            js.add_item_to_array(fa, js.create_string(zstr(p)));
-        js.add_item_to_object(root, "flags", fa);
-
-        char[] resp;
-        if (!workerExchange(w, printJsonStr(root), resp))
+    }
+    version (Windows)
+    {
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = SECURITY_ATTRIBUTES.sizeof;
+        sa.lpSecurityDescriptor = null;
+        sa.bInheritHandle = TRUE;
+        HANDLE toChildR, toChildW, fromChildR, fromChildW;
+        if (!CreatePipe(&toChildR, &toChildW, &sa, 0))
+            return false;
+        if (!CreatePipe(&fromChildR, &fromChildW, &sa, 0))
         {
-            workerKill(w);
+            CloseHandle(toChildR); CloseHandle(toChildW);
             return false;
         }
-        return true;
+        STARTUPINFOA si;
+        si.cb = STARTUPINFOA.sizeof;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = toChildR;
+        si.hStdOutput = fromChildW;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi;
+        char[4096] exe;
+        auto n = GetModuleFileNameA(null, exe.ptr, cast(DWORD)exe.length);
+        if (n == 0 || n >= exe.length)
+        {
+            CloseHandle(toChildR); CloseHandle(toChildW);
+            CloseHandle(fromChildR); CloseHandle(fromChildW);
+            return false;
+        }
+        exe[n] = 0;
+        if (!CreateProcessA(exe.ptr, "--worker".ptr, null, null, TRUE, 0, null, null, &si, &pi))
+        {
+            CloseHandle(toChildR); CloseHandle(toChildW);
+            CloseHandle(fromChildR); CloseHandle(fromChildW);
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(toChildR);
+        CloseHandle(fromChildW);
+        w.req.h = toChildW;
+        w.resp.h = fromChildR;
+        w.proc = pi.hProcess;
+        w.alive = true;
     }
-    else
-        return false;
-}
 
-// Parse the plain-data results back into GC structs (outlive jtmp).
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("init"));
+    auto ia = js.create_array();
+    foreach (p; imports)
+        js.add_item_to_array(ia, js.create_string(zstr(p)));
+    js.add_item_to_object(root, "importPaths", ia);
+    auto sa = js.create_array();
+    foreach (p; strings)
+        js.add_item_to_array(sa, js.create_string(zstr(p)));
+    js.add_item_to_object(root, "stringPaths", sa);
+    auto fa = js.create_array();
+    foreach (p; flags)
+        js.add_item_to_array(fa, js.create_string(zstr(p)));
+    js.add_item_to_object(root, "flags", fa);
+
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+    {
+        workerKill(w);
+        return false;
+    }
+    return true;
+}
 
 struct WDiag
 {

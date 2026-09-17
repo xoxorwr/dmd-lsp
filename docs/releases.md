@@ -22,7 +22,7 @@ https://github.com/<owner>/<repo>/releases/download/nightly/<asset>
 ```
 
 macOS runners: `macos-15` (arm64) and `macos-15-intel` (x64). Windows is not
-built — the worker and stdio loop are POSIX-only, so a Windows binary would
+built — see `.github/workflows/nightly.yml` for the platform matrix.
 not run.
 
 ## VS Code extension

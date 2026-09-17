@@ -20,42 +20,36 @@ How `dmd-lsp` works and the conventions it is built on.
 - Toolchain targets the 2.113.0 line (never system dmd). LDC's `ldmd2` is
   supported (`make DC=ldmd2`) and is what CI/nightlies use.
 
-## Memory model: a warm worker, fork per edit
+## Memory model: warm worker, in-place re-parse
 
-The LSP front end holds no dmd state — only session docs, config and the
-debounce bookkeeping. **Analysis runs in a forked worker process, one warm
-universe per worker** (`worker.d`).
-
-dmd's process-global state is never fully reset by `deinitializeDMD` (it is
-written for one-shot compiler runs): reusing one universe across rebuilds
-retained a whole module graph per rebuild (~140 MB/request, growing without
-bound). So the process is the isolation boundary: a worker builds one
-universe and the OS reclaims it wholesale when it is discarded.
+The LSP front end holds only session docs, config and the debounce
+bookkeeping. Analysis runs in a worker process (`worker.d`, cross-platform):
+POSIX `fork()`s the server, Windows spawns this executable with `--worker`;
+either way the child owns one warm dmd universe and speaks length-prefixed
+frames over pipes.
 
 The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
 ~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies), and it is identical
-on every keystroke. The worker keeps it warm. A root edit then does not
-rebuild: the worker `fork`s a child over the warm universe (copy-on-write),
-the child **evicts the previous root module and its interned types** and
-re-analyzes only the new root (~43 ms for the same frontend), writes its
-response and exits. Its mutations, and the memory that eviction cannot
-reclaim under the conservative GC, die with it — the warm process is never
-touched. A dependency, config or root-path change still replies `needRespawn`
-and the parent forks a fresh worker. Bounded to ~one warm universe plus one
-short-lived child per request.
+on every keystroke, so it is kept warm. A **root-text-only** edit does not
+rebuild it: the worker re-parses the root **in place** on the warm closure
+(`dmdReparseModule`), which **evicts the previous root module and its interned
+types** and parses into the same `Module` object so importers' `imp.mod` and
+template-instance links stay valid (~43 ms for the same frontend). The
+per-generation frontend caches are reset by the patches in
+[upstream.md](upstream.md).
 
-One worker serves everything. A neutralised (completion) parse and a real
-(diagnostics/semantic) parse cannot coexist in one process's dmd globals, so
-the universe records which buffer it parsed (`analysisHash`) and which
-document version it was keyed to (`rootHash`). Because the warm process is
-never mutated, the hash bookkeeping cannot make a post-edit request cheap by
-rebuilding in place — it only decides whether a request is served from the
-warm universe without a fork at all (e.g. repeated symbol requests on the
-same neutralised text). See *Neutralised variants*.
+A dependency, config or root-path change replies `needRespawn`: the parent
+discards the worker and starts a fresh one, so the OS reclaims the discarded
+universe. Process isolation is the reclamation boundary because the
+conservative GC cannot prove a discarded universe unreachable in-process (see
+[findings.md](findings.md)).
 
-The isolation decision (measurements, the identifier-pool bug, eviction
-experiments, a region-GC spike) is written up in
-[findings.md](findings.md).
+The universe records which buffer it parsed (`analysisHash`) and which
+document version it was keyed to (`rootHash`): that decides whether a request
+is served from the warm universe (`reuse`), re-parsed in place
+(`incremental`) or rebuilt (`miss`). A neutralised (completion) parse and a
+real (diagnostics/semantic) parse share the one universe. See *Neutralised
+variants*.
 
 ## Semantic pipeline
 
@@ -101,7 +95,7 @@ experiments, a region-GC spike) is written up in
   recovers an `auto` local's constructed type from its initializer
   (`auto q = Point(...)`, `new Point(...)`, `auto s = factory!(State)()`),
   so member access above the error keeps its `property`/`method` colour.
-- The worker's stdout is rerouted to stderr: dmd message-kind output
+- dmd's message-kind output is rerouted to stderr: it
   bypasses `DiagnosticHandler` straight to stdout, which would corrupt LSP
   framing. `initDMD` leaves the lexer identifier tables unset (stock sets
   them from CLI flags), which segfaults on the first non-ASCII identifier —
@@ -113,9 +107,8 @@ The warm universe (`server.Universe`) is reused while inputs are identical —
 same root text (`fnv1a64`), same dep disk bytes (hashes recorded from
 `Module.src`), same config generation. A request the warm universe can answer
 is served with zero dmd work; the residual cost is piping the document in. A
-**root-text-only** miss is handled by `serverCanIncremental` →
-`serverAnalyzeIncremental` in a fork child (evict root, re-analyze it on the
-warm closure), see *Memory model*. A miss for any other reason (different
+**root-text-only** miss is handled by `serverAnalyzeIncremental`
+(evict root, re-analyze it in place on the warm closure), see *Memory model*. A miss for any other reason (different
 root, config generation, dep bytes) replies `needRespawn`.
 
 Deps are fingerprinted from disk bytes, so unsaved dep edits are not seen
@@ -159,13 +152,13 @@ abort point, so debouncing is the cancellation story. The default is 500 ms
 keystrokes whose gap is *below* it, and a realistic typing cadence has
 300–500 ms thinking pauses, so 300 ms analysed most characters individually.
 The idle clock is restarted *after* each message is handled, so a slow request
-(a completion's worker build) can't make the debounce look elapsed the instant
+(a completion's build) can't make the debounce look elapsed the instant
 it returns and trigger a flush between keystrokes. Typing with the suggest
 widget open never relies on the debounce at all: completion neutralises the
 partial token, so the flush hits the same universe (see *Neutralised
 variants*). Each pending path is always unmarked by
 the flush, even on failure — a pending path that survives makes the idle loop
-retry it immediately (timeout 0), forking a worker per iteration. stdin runs
+retry it immediately (timeout 0). stdin runs
 unbuffered so kernel pipe state (what `poll` observes) and stdio agree; mixing
 `poll` with buffered stdio silently strands messages in the userspace buffer.
 Semantic pulls during an edit are served from the token cache; the debounced
@@ -206,13 +199,12 @@ debounce, config and memory suites) plus stress runs against real dmd sources
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
 - Universe cache: repeated requests ~free (13× on the stress file); edits
-  rebuild via a fresh worker; parent RSS flat over dozens of rebuilds
-  (~16 MB); worker memory reclaimed by the OS on respawn.
+  re-parse in place; RSS flat over dozens of rebuilds.
 - `--check` batch mode for CI.
 
 ## Known limitations
 
-- Changed inputs rebuild the whole universe in a fresh worker: re-analysis
+- Changed dependencies/config rebuild the whole universe: re-analysis
   costs full dep semantic (~0.4 s on the stress file, ~10 ms on small files).
   Deliberate: dmd interns canonical types by mangled deco, so re-parsing a
   changed root in a live universe collides with its own previous

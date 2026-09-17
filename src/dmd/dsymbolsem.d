@@ -934,7 +934,7 @@ void noDefaultCtorSupplemental(AggregateDeclaration ad)
         auto ts = field.type.baseElemOf().isTypeStruct();
         if (ts && ts.sym.noDefaultCtor)
         {
-            eSink.errorSupplemental(field.loc, "because field `%s` of type `%s` has disabled default construction",
+            eSink.errorSupplemental(field.loc, "because field `%s` of type `%s` has disabled default initialization",
                 field.toChars(), field.type.toErrMsg());
             noDefaultCtorSupplemental(ts.sym);
         }
@@ -3093,7 +3093,7 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
                 }
                 else
                 {
-                    eSink.error(dsym.loc, "%s `%s` - default construction is disabled for type `%s`", dsym.kind, dsym.toPrettyChars, dsym.type.toErrMsg());
+                    eSink.error(dsym.loc, "%s `%s` - default initialization is disabled for type `%s`", dsym.kind, dsym.toPrettyChars, dsym.type.toErrMsg());
                     noDefaultCtorSupplemental(tbn.isTypeStruct().sym);
                 }
             }
@@ -4014,7 +4014,9 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
         //printf("UserAttributeDeclaration::semantic() %p\n", this);
         if (uad.decl && !uad._scope)
             uad.Dsymbol.setScope(sc); // for function local symbols
-        arrayExpressionSemantic(uad.atts.peekSlice(), sc, true);
+        Scope* sc2 = sc.startCTFE();
+        arrayExpressionSemantic(uad.atts.peekSlice(), sc2, true);
+        sc2.endCTFE();
         return attribSemantic(uad);
     }
 
@@ -7601,9 +7603,16 @@ bool determineFields(AggregateDeclaration ad)
  * Returns:
  *  Module of core.stdc.config, null if couldn't find it
  */
+private __gshared Module core_stdc_config;
+
+/// Reset the module's global state between analyses.
+void deinitialize() nothrow
+{
+    core_stdc_config = null;
+}
+
 Module loadCoreStdcConfig()
 {
-    __gshared Module core_stdc_config;
     auto pkgids = new Identifier[2];
     pkgids[0] = Id.core;
     pkgids[1] = Id.stdc;
@@ -8201,7 +8210,7 @@ private extern(C++) class SearchVisitor : Visitor
         //printf("%s.Import.search(ident = '%s', flags = x%x)\n", imp.toChars(), ident.toChars(), flags);
         if (!imp.pkg)
         {
-            // Load may fail (eg for dmd as a library users who continue for sema); don't deref null `imp.mod`.
+            // Load may fail (eg; for dmd as a library users who continue for sema)
             if (imp.load(null))
             {
                 if (imp.mod)

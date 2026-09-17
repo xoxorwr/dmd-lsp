@@ -592,9 +592,7 @@ private immutable TOK[] keywords =
     TOK.__attribute__,
 ];
 
-// Register the language keywords with the identifier pool, giving each
-// keyword identifier its TOK value. Also used to repopulate the pool after
-// Identifier.deinitialize() in a long-lived frontend session.
+// Register the keywords with the identifier pool (also repopulates it after deinitialize).
 extern (D) static void initializeKeywords() nothrow
 {
     foreach (kw; keywords)

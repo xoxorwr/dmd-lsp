@@ -241,13 +241,9 @@ public:
     }
 
     /********************************
-     * Remove every entry for which `pred` returns true. Open addressing with
-     * quadratic probing has no safe in-place delete, so the hash slots are
-     * compacted into a fresh table array. The pools (and therefore the
-     * strings they hold) are deliberately *not* freed: a stored `Value` may
-     * cache a pointer into its string (e.g. `Type.deco` points at
-     * `StringValue.toDchars`), so moving the string would dangle it.
-     * Returns: the number of entries removed.
+     * Remove every entry matching `pred`; returns the number removed.
+     * The pools are not freed, as a value may cache a pointer into its string.
+     * Utility for tooling that evicts stale entries when re-parsing in place.
      */
     size_t removeWhere(scope bool delegate(const(StringValue!T)*) nothrow pred) nothrow
     {
@@ -262,6 +258,8 @@ public:
             auto sv = getValue(se.vptr);
             if (pred(sv))
             {
+                // Clear the value so the GC-scanned pool doesn't keep it reachable.
+                sv.value = T.init;
                 ++removed;
                 continue;
             }

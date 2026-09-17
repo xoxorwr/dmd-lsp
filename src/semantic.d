@@ -9,7 +9,7 @@ module semantic;
 // token type. Non-identifier syntax is left to the editor's TextMate grammar;
 // semantic tokens only refine what it cannot know.
 //
-// Struct-only. Runs in the worker on the post-semantic universe.
+// Struct-only. Runs on the post-semantic universe.
 
 import complete : SynMod, resolveSymbolsBatch, appendScopeSubs;
 

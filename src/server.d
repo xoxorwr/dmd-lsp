@@ -126,14 +126,13 @@ private string permDup(ref Session session, const(char)[] s)
 // A hit (same root text, same dep bytes, same config) returns the cached
 // analysis with zero dmd work — completions/codeActions after a change
 // analysis are ~free. Anything else rebuilds via dmdResetRequest.
-// The "re-parse only the changed root" path exists but is deliberately kept
-// in a disposable fork child (serverAnalyzeIncremental): it evicts the old
-// root module and every interned type whose deco mentions the module's
-// mangled FQN token, which is what avoids the "module specified twice" /
-// "already exists" collisions a plain re-parse would hit. It mutates and
-// leaks the universe (the conservative GC cannot reclaim the evicted root),
-// so it must never run in the long-lived warm process — only in a child that
-// exits. A dependency/config/root change always takes the full-reset path.
+// The "re-parse only the changed root" path (serverAnalyzeIncremental)
+// re-parses the *same* Module object in place (dmdReparseModule): it evicts
+// the module's interned types and resets the per-generation frontend caches,
+// which avoids the "module specified twice" / "already exists" collisions a
+// plain re-parse would hit and keeps memory flat across edits, so it runs in
+// the long-lived process. A dependency/config/root change still takes the
+// full-reset path.
 struct Universe
 {
     bool valid = false;
@@ -142,17 +141,22 @@ struct Universe
     // The text actually parsed. Equals rootHash's text normally; differs
     // when a completion built the universe from a trailing-dot placeholder
     // while still keying on the real document text (so the debounced
-    // analyze for that same text is a hit, not a second worker build).
+    // analyze for that same text is a hit, not a second build).
     ulong analysisHash;
     DepRec[] deps; // disk fingerprints of loaded deps (root excluded)
     ulong configGen; // DmdState.configGen at record time
     Arena.Mark mark; // scratch high-water after analysis
     Analysis analysis; // module_/syn live while no reset happened since
+    // Location-table checkpoint: dmd appends a BaseLoc (holding the whole
+    // file content) on every parse. Incremental re-parses roll back to this
+    // so the table does not grow one file copy per edit.
+    size_t locTableLen;
+    uint locIndex;
 }
 
 // True when serverAnalyze would serve `path`/`text` from the live universe
-// without any dmd work. Used by the worker to decide whether a request can
-// be served in-process or requires a fresh worker.
+// without any dmd work. Used to decide whether a request can be served from
+// the warm universe or requires a rebuild.
 bool serverWouldHit(ref ServerState s, const(char)[] path, const(char)[] text)
 {
     import session : fnv1a64;
@@ -185,7 +189,7 @@ enum UniState : ubyte
 {
     miss,        // different root/config/deps: needs a fresh universe
     reuse,       // identical inputs: serve the warm analysis
-    incremental, // same root/config/deps, root text moved: fork a child
+    incremental, // same root/config/deps, root text moved: re-parse in place
 }
 
 // Classify a request against the live universe. `identity` is the document
@@ -212,42 +216,48 @@ UniState serverUniState(ref ServerState s, const(char)[] path,
     if (identity !is null &&
         s.uni.rootHash == fnv1a64(cast(const(ubyte)[])identity))
         return UniState.reuse;
-    // Same root, config and deps: only the root's text moved, which the fork
-    // child can re-analyze on the warm closure.
+    // Same root, config and deps: only the root's text moved, which the worker
+    // can re-analyze on the warm closure.
     return UniState.incremental;
 }
 
-// Re-analyse only the root on top of the live dependency closure: evict the
-// previous root module (and its interned types) so re-parsing the same module
-// name cannot collide, then parse/semantic the new text without a universe
-// reset. This is ~10x cheaper than a full build (only the root is processed)
-// and is meant to run in a disposable fork child: it mutates the universe
-// (leaking the evicted root), so the changes must not reach the parent.
+// Re-analyse only the root on top of the live dependency closure: re-parse
+// the *same* Module object in place (dmdReparseModule) so importers keep
+// pointing at it, which is what makes the mutation flat and safe to run in the
+// long-lived process. This is ~10x cheaper than a full
+// build and advances the live universe to the new text.
 Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     const(char)[] text, const(char)[] identity)
 {
     import session : fnv1a64;
 
     auto id = identity is null ? text : identity;
-    dmdEvictRoot(s.uni.analysis.module_);
     s.scratch.reset();
     s.sink.reset();
     dmdResetCounters();
     Analysis a;
     StdoutGuard og;
     stdoutToStderr(og);
-    auto pr = dmdParseOnly(path, text);
-    if (pr.ok && pr.module_)
-        a.syn = snapshotModule(cast(Module)pr.module_);
-    auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
+    // Drop BaseLocs appended by the previous incremental parse (they belong to
+    // the root being replaced) before this parse appends its own.
+    dmdLocRollback(s.uni.locTableLen, s.uni.locIndex);
+    auto modp = dmdReparseModule(s.uni.analysis.module_, text);
+    if (!modp)
+    {
+        // The in-place parse failed (e.g. the buffer did not convert); fall
+        // back to a full universe reset so the request still gets an answer.
+        stdoutRestore(og);
+        return serverAnalyze(s, path, text, identity);
+    }
+    a.syn = snapshotModule(cast(Module)modp);
+    auto errs = dmdSemantic(modp);
     stdoutRestore(og);
-    a.module_ = pr.module_;
-    a.ok = pr.ok;
+    a.module_ = modp;
+    a.ok = true;
     a.errors = errs;
     a.diags = s.sink.msgs;
-    if (pr.ok && pr.module_)
     {
-        auto mod = cast(Module)pr.module_;
+        auto mod = cast(Module)a.module_;
         lintUnusedImports(&s.scratch, mod, path, text, errs != 0, a.lintImports);
         lintUnusedParams(&s.scratch, mod, path, text, errs != 0, a.lintParams);
         pinLint(s.session, a.lintImports);
@@ -263,7 +273,6 @@ Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
     s.uni.analysis = a;
-    // Deliberately no GC.collect(): the caller is a fork child that exits.
     return a;
 }
 
@@ -323,6 +332,7 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
     s.uni.analysis = a;
+    dmdLocCheckpoint(s.uni.locTableLen, s.uni.locIndex);
     // Reclaim dmd GC garbage so the daemon stays flat.
     GC.collect();
     return a;

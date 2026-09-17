@@ -198,7 +198,7 @@ while True:
     if m.get('method') == 'textDocument/publishDiagnostics':
         break
 open_spawns = spawns()
-check('open-one-worker', open_spawns == 1, 'spawns=%d' % open_spawns)
+check('open-no-subprocess', open_spawns == 0, 'spawns=%d' % open_spawns)
 
 lines = MAIN.split('\n')
 dot_line = next(i for i, l in enumerate(lines) if l.strip() == 'w.assets.')

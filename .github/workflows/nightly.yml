@@ -8,11 +8,9 @@ name: nightly
 #   dmd-lsp-linux-x64.tar.gz
 #   dmd-lsp-darwin-arm64.tar.gz
 #   dmd-lsp-darwin-x64.tar.gz
+#   dmd-lsp-win-x64.zip
 #   dmd-lsp.vsix
 #   SHA256SUMS
-#
-# Windows is intentionally absent: the worker (fork/socketpair) and the
-# poll-gated stdio loop are POSIX-only, so a Windows binary would not run.
 
 on:
   push:
@@ -92,6 +90,40 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: error
 
+  build-windows:
+    name: build (win-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Build (ldmd2)
+        shell: pwsh
+        run: |
+          $src = @('src/main.d','src/arena.d','src/lsp.d','src/session.d','src/dmdwrap.d',
+                   'src/lexutil.d','src/lint.d','src/complete.d','src/server.d','src/semantic.d',
+                   'src/worker.d','src/json.d')
+          ldmd2 -I src -i -version=MARS -version=NoMain -version=GC -version=NoBackend `
+            -version=CallbackAPI -version=DMDLIB -preview=dip1000 -O `
+            -Jsrc/dmd/res -Jsrc/dmd -Jstringimp $src -of=dmd-lsp.exe
+
+      - name: Smoke test
+        shell: pwsh
+        run: ./dmd-lsp.exe --version
+
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dmd-lsp.exe,README.md -DestinationPath dmd-lsp-win-x64.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: win-x64
+          path: dmd-lsp-win-x64.zip
+          if-no-files-found: error
+
   vsix:
     name: build (vsix)
     runs-on: ubuntu-latest
@@ -119,7 +151,7 @@ jobs:
 
   release:
     name: publish nightly
-    needs: [build, vsix]
+    needs: [build, build-windows, vsix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -146,5 +178,6 @@ jobs:
 
             Assets: `dmd-lsp-linux-x64.tar.gz`,
             `dmd-lsp-darwin-arm64.tar.gz`, `dmd-lsp-darwin-x64.tar.gz`,
-            `dmd-lsp.vsix` (VS Code extension), plus `SHA256SUMS`.
+            `dmd-lsp-win-x64.zip`, `dmd-lsp.vsix` (VS Code extension),
+            plus `SHA256SUMS`.
           files: dist/*

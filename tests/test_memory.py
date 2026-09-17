@@ -1,10 +1,9 @@
 import json, os, subprocess, sys, tempfile
 
-# Memory regression: the LSP front end must stay small no matter how many
-# rebuilds happen. dmd's process-global state isn't fully reset by
-# deinitializeDMD, so analysis runs in a forked worker (one universe per
-# worker). If analysis ever moves back in-process, the parent RSS grows by
-# roughly a universe per edit and this test fails hard.
+# Memory regression: the daemon must stay small no matter how many edits
+# happen. Analysis runs in-process on one warm universe; a root edit is
+# re-parsed in place and GC.collect() runs after each, so RSS must plateau
+# instead of growing by a universe per edit.
 BIN = './dmd-lsp'
 
 WORK = tempfile.mkdtemp(prefix='dmd-lsp-mem-')

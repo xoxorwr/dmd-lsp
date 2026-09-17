@@ -790,6 +790,10 @@ bool isLvalue(Expression _this)
  * a typed storage. This basically elides a restricted subset of so-called
  * "pure" rvalues, i.e. expressions with no reference semantics.
  *
+ * Please try to keep `dmd.glue.e2ir.toElemRVO()` in sync with this.
+ * It is not destructive to fail to elide a copy, but it is always better
+ * to stay consistent.
+ *
  * Note: Please avoid using `checkMod` parameter because `canElideCopy()`
  * essentially defines a value category and should eventually be merged with
  * `isLvalue()` to return [isLvalue, allowEmplacement].
@@ -4220,7 +4224,7 @@ private bool checkDefCtor(Loc loc, Type t)
     if (ad && ad.noDefaultCtor)
     {
         auto eSink = global.errorSink;
-        eSink.error(loc, "default construction is disabled for type `%s`", tb.toErrMsg());
+        eSink.error(loc, "default initialization is disabled for type `%s`", tb.toErrMsg());
         noDefaultCtorSupplemental(ad);
         return true;
     }
@@ -6317,19 +6321,6 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
         if (e.sd.sizeok != Sizeok.done)
             return setError();
 
-        if (e.elements)
-        {
-            foreach (i, ref elem; *e.elements)
-            {
-                if (elem && i < e.sd.fields.length)
-                {
-                    if (auto field = e.sd.fields[i])
-                        if (field.type)
-                            elem = inferExpType(elem, field.type);
-                }
-            }
-        }
-
         // run semantic() on each element
         if (arrayExpressionSemantic(e.elements.peekSlice(), sc))
             return setError();
@@ -7996,42 +7987,6 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
             result = exp.e1;
             return;
         }
-
-        if (t1 && exp.arguments)
-        {
-            if (t1.ty == Tfunction)
-            {
-                TypeFunction tf = t1.isTypeFunction();
-                const paramCount = tf.parameterList.length;
-                foreach (i, ref arg; *exp.arguments)
-                {
-                    if (arg && i < paramCount && arg.op != EXP.function_)
-                    {
-                        if (auto p = tf.parameterList[i])
-                        {
-                            if (p.type)
-                                arg = inferExpType(arg, p.type);
-                        }
-                    }
-                }
-            }
-            else if (t1.ty == Tstruct)
-            {
-                auto sd = (cast(TypeStruct)t1).sym;
-                foreach (i, ref arg; *exp.arguments)
-                {
-                    if (arg && i < sd.fields.length && arg.op != EXP.function_)
-                    {
-                        if (auto field = sd.fields[i])
-                        {
-                            if (field.type)
-                                arg = inferExpType(arg, field.type);
-                        }
-                    }
-                }
-            }
-        }
-
         if (arrayExpressionSemantic(exp.arguments.peekSlice(), sc) ||
             preFunctionParameters(sc, exp.argumentList, global.errorSink))
             return setError();
@@ -9811,9 +9766,8 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
         }
         if (auto e = exp.e1.isStringExp())
         {
-            // deprecated in 2.107
-            eSink.deprecation(e.loc, "assert condition cannot be a string literal");
-            eSink.deprecationSupplemental(e.loc, "If intentional, use `%s !is null` instead to preserve behaviour",
+            eSink.error(e.loc, "assert condition cannot be a string literal");
+            eSink.errorSupplemental(e.loc, "If intentional, use `%s !is null` instead to preserve behaviour",
                 e.toErrMsg());
         }
 
@@ -12521,8 +12475,7 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
          * depends on the result of e1 in assignments.
          */
         {
-            Type elemType = t1.isTypeEnum() ? t1 : t1.baseElemOf();
-            Expression e2x = inferExpType(exp.e2, elemType);
+            Expression e2x = inferExpType(exp.e2, t1.baseElemOf());
             e2x = e2x.expressionSemantic(sc);
             if (!t1.isTypeSArray())
                 e2x = e2x.arrayFuncConv(sc);
@@ -12736,7 +12689,7 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
                         ? cast(DotVarExp)ce.e1 : null;
                     if (sd.ctor && ce && dve && dve.var.isCtorDeclaration() &&
                         // https://issues.dlang.org/show_bug.cgi?id=19389
-                        dve.e1.op != EXP.dotVariable &&
+                        canElideCopy(ce, t1) &&
                         e2y.type.implicitConvTo(t1))
                     {
                         /* Look for form of constructor call which is:
@@ -12848,22 +12801,9 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
                                 return;
                             }
                         }
-                        else if (sd.hasMoveCtor && (!e2x.isCallExp() || e2x.rvalue) && !e2x.isStructLiteralExp())
+                        else if (sd.hasMoveCtor && !canElideCopy(e2x, t1))
                         {
                             // #move
-                            /* The !e2x.isCallExp() is because it is already an rvalue
-                               and the move constructor is unnecessary:
-                                struct S {
-                                    alias TT this;
-                                    long TT();
-                                    this(T)(int x) {}
-                                    this(S);
-                                    this(ref S);
-                                    ~this();
-                                }
-                                S fun(ref S arg);
-                                void test() { S st; fun(st); }
-                             */
                             /* Rewrite as:
                              * e1 = init, e1.moveCtor(e2);
                              */
@@ -16024,22 +15964,8 @@ Expression binSemantic(BinExp e, Scope* sc)
     {
         printf("BinExp::semantic('%s')\n", e.toErrMsg());
     }
-    Expression e1x;
-    Expression e2x;
-    if (e.e1.isDotIdExp() && e.e1.isDotIdExp().isLeadingDot())
-    {
-        e2x = e.e2.expressionSemantic(sc);
-        if (e2x.type)
-            e.e1 = inferExpType(e.e1, e2x.type);
-        e1x = e.e1.expressionSemantic(sc);
-    }
-    else
-    {
-        e1x = e.e1.expressionSemantic(sc);
-        if (e1x.type && e.e2.isDotIdExp() && e.e2.isDotIdExp().isLeadingDot())
-            e.e2 = inferExpType(e.e2, e1x.type);
-        e2x = e.e2.expressionSemantic(sc);
-    }
+    Expression e1x = e.e1.expressionSemantic(sc);
+    Expression e2x = e.e2.expressionSemantic(sc);
 
     // for static alias this: https://issues.dlang.org/show_bug.cgi?id=17684
     if (e1x.op == EXP.type)
@@ -16331,36 +16257,6 @@ Expression dotIdSemanticProp(DotIdExp exp, Scope* sc, bool gag)
             if (p && checkAccess(sc, p))
             {
                 s = null;
-            }
-        }
-        /* Context-sensitive dot: when module lookup fails for `.ident` expressions
-         * (leading dot syntax), check if targetType was set.
-         * If so, do an O(1) lookup in that type's members.
-         */
-        if (!s && exp.targetType && ie.sds.isModule())
-        {
-            Type tb = exp.targetType.toBasetype();
-            Dsymbol ds = null;
-            if (auto te = exp.targetType.isTypeEnum())
-                ds = te.sym;
-            else if (auto te = tb.isTypeEnum())
-                ds = te.sym;
-            else
-                ds = exp.targetType.toDsymbol(sc);
-
-            if (ds)
-            {
-                if (auto sd = ds.isScopeDsymbol())
-                {
-                    if (sd.symtab)
-                    {
-                        if (auto member = sd.symtab.lookup(exp.ident))
-                        {
-                            if (auto enumMember = member.isEnumMember())
-                                s = enumMember;
-                        }
-                    }
-                }
             }
         }
         if (s)
@@ -18142,7 +18038,7 @@ private bool checkAddressVar(Scope* sc, Expression exp, VarDeclaration v)
         auto msg = (v.storage_class & STC.ref_) ?
             "taking the address of local variable `%s`" :
             "taking the address of stack-allocated local variable `%s`";
-        if (sc.useDIP1000 != FeatureState.enabled &&
+        if (!(sc.useDIP1000 == FeatureState.enabled || global.params.useFastDFA) &&
             (!(v.storage_class & STC.temp) || v.storage_class & STC.result) &&
             sc.setUnsafe(false, exp.loc, msg.ptr, v))
         {

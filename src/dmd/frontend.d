@@ -196,9 +196,7 @@ void deinitializeDMD()
 
     Type.deinitialize();
     Id.deinitialize();
-    // The identifier pool is process-global and otherwise grows unbounded
-    // across sessions; drop it and re-register the keywords (whose TOK
-    // values live on their identifiers).
+    // Drop the process-global identifier pool, then re-register the keywords.
     {
         import dmd.identifier : Identifier;
         import dmd.tokens : initializeKeywords;
@@ -213,6 +211,33 @@ void deinitializeDMD()
     Dsymbol.deinitialize();
     EscapeState.reset();
     DFAAllocator.deinitialize();
+
+    // Drop module-scoped caches that would otherwise retain the old universe.
+    {
+        import funcsem = dmd.funcsem;
+        import dsymbolsem = dmd.dsymbolsem;
+        import typesem = dmd.typesem;
+        import semantic3 = dmd.semantic3;
+        import templatesem = dmd.templatesem;
+        import dtemplate = dmd.dtemplate;
+        import dmd.dscope : Scope;
+        import clone = dmd.clone;
+        import arrayop = dmd.arrayop;
+        import dinterpret = dmd.dinterpret;
+        import dmd.location : Loc;
+
+        funcsem.deinitialize();
+        dsymbolsem.deinitialize();
+        typesem.deinitialize();
+        semantic3.deinitialize();
+        templatesem.deinitialize();
+        dtemplate.deinitialize();
+        clone.deinitialize();
+        arrayop.deinitialize();
+        dinterpret.deinitialize();
+        Scope.freelist = null;
+        Loc._init();
+    }
 }
 
 /**

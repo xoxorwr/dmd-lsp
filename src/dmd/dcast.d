@@ -3320,16 +3320,10 @@ Expression inferExpType(Expression e, Type t)
 
     Expression visitTer(CondExp ce)
     {
-        ce.e1 = inferExpType(ce.e1, t);
-        ce.e2 = inferExpType(ce.e2, t);
+        Type tb = t.toBasetype();
+        ce.e1 = inferExpType(ce.e1, tb);
+        ce.e2 = inferExpType(ce.e2, tb);
         return ce;
-    }
-
-    Expression visitBin(BinExp be)
-    {
-        be.e1 = inferExpType(be.e1, t);
-        be.e2 = inferExpType(be.e2, t);
-        return be;
     }
 
     if (t) switch (e.op)
@@ -3338,18 +3332,6 @@ Expression inferExpType(Expression e, Type t)
         case EXP.assocArrayLiteral: return visitAar(e.isAssocArrayLiteralExp());
         case EXP.function_:         return visitFun(e.isFuncExp());
         case EXP.question:          return visitTer(e.isCondExp());
-        case EXP.or:
-        case EXP.and:
-        case EXP.xor:
-        case EXP.add:
-        case EXP.min:               return visitBin(e.isBinExp());
-        case EXP.dotIdentifier:
-            if (auto die = e.isDotIdExp())
-            {
-                if (die.isLeadingDot())
-                    die.targetType = t;
-            }
-            return e;
         default:
     }
     return e;
