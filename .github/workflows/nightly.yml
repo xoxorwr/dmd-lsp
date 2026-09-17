@@ -106,9 +106,11 @@ jobs:
           $src = @('src/main.d','src/arena.d','src/lsp.d','src/session.d','src/dmdwrap.d',
                    'src/lexutil.d','src/lint.d','src/complete.d','src/server.d','src/semantic.d',
                    'src/worker.d','src/json.d')
-          ldmd2 -I src -i -version=MARS -version=NoMain -version=GC -version=NoBackend `
-            -version=CallbackAPI -version=DMDLIB -preview=dip1000 -O `
-            -Jsrc/dmd/res -Jsrc/dmd -Jstringimp $src -of=dmd-lsp.exe
+          $flags = @('-I','src','-i','-version=MARS','-version=NoMain','-version=GC',
+                     '-version=NoBackend','-version=CallbackAPI','-version=DMDLIB',
+                     '-preview=dip1000','-O','-Jsrc/dmd/res','-Jsrc/dmd','-Jstringimp')
+          ldmd2 @flags @src '-of=dmd-lsp.exe'
+          Get-ChildItem *.exe
 
       - name: Smoke test
         shell: pwsh
