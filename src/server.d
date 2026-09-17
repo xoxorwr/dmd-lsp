@@ -44,10 +44,38 @@ private void stdoutToStderr(ref StdoutGuard g)
             g.active = true;
         }
     }
+    else version (Windows)
+    {
+        import core.stdc.stdio : fflush, stdout;
+        extern (C) int _dup(int) nothrow;
+        extern (C) int _dup2(int, int) nothrow;
+
+        fflush(stdout);
+        g.saved = _dup(1);
+        if (g.saved >= 0)
+        {
+            _dup2(2, 1);
+            g.active = true;
+        }
+    }
 }
 
 private void stdoutRestore(ref StdoutGuard g)
 {
+    version (Windows)
+    {
+        import core.stdc.stdio : fflush, stdout;
+        extern (C) int _dup2(int, int) nothrow;
+        extern (C) int _close(int) nothrow;
+
+        if (!g.active)
+            return;
+        fflush(stdout);
+        _dup2(g.saved, 1);
+        _close(g.saved);
+        g.active = false;
+        return;
+    }
     version (Posix)
     {
         import core.stdc.stdio : fflush, stdout;

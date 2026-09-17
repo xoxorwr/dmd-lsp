@@ -299,21 +299,34 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
     // it produced its response); false means the caller must respawn.
     private bool forkRun(scope void delegate() work)
     {
-        auto pid = fork();
-        if (pid < 0)
-            return false;
-        if (pid == 0)
+        version (Posix)
         {
+            auto pid = fork();
+            if (pid < 0)
+                return false;
+            if (pid == 0)
+            {
+                try
+                    work();
+                catch (Throwable)
+                    _exit(1);
+                _exit(0);
+            }
+            int status = 0;
+            if (waitpid(pid, &status, 0) < 0)
+                return false;
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+        else
+        {
+            // No fork on Windows: run inline in the worker. The worker is
+            // replaced on a rebuild anyway, so the leak is bounded by respawn.
             try
                 work();
             catch (Throwable)
-                _exit(1);
-            _exit(0);
+                return false;
+            return true;
         }
-        int status = 0;
-        if (waitpid(pid, &status, 0) < 0)
-            return false;
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
     }
 
     // Per-op tail shared by the in-process (hit/first-build) path and the
@@ -724,14 +737,14 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
     }
     version (Windows)
     {
-        SECURITY_ATTRIBUTES sa;
-        sa.nLength = SECURITY_ATTRIBUTES.sizeof;
-        sa.lpSecurityDescriptor = null;
-        sa.bInheritHandle = TRUE;
+        SECURITY_ATTRIBUTES secattr;
+        secattr.nLength = SECURITY_ATTRIBUTES.sizeof;
+        secattr.lpSecurityDescriptor = null;
+        secattr.bInheritHandle = TRUE;
         HANDLE toChildR, toChildW, fromChildR, fromChildW;
-        if (!CreatePipe(&toChildR, &toChildW, &sa, 0))
+        if (!CreatePipe(&toChildR, &toChildW, &secattr, 0))
             return false;
-        if (!CreatePipe(&fromChildR, &fromChildW, &sa, 0))
+        if (!CreatePipe(&fromChildR, &fromChildW, &secattr, 0))
         {
             CloseHandle(toChildR); CloseHandle(toChildW);
             return false;
@@ -752,7 +765,8 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
             return false;
         }
         exe[n] = 0;
-        if (!CreateProcessA(exe.ptr, "--worker".ptr, null, null, TRUE, 0, null, null, &si, &pi))
+        char* cmd = cast(char*) "--worker".ptr;
+        if (!CreateProcessA(exe.ptr, cmd, null, null, TRUE, 0, null, null, &si, &pi))
         {
             CloseHandle(toChildR); CloseHandle(toChildW);
             CloseHandle(fromChildR); CloseHandle(fromChildW);

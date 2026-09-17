@@ -1909,7 +1909,8 @@ int main(string[] args)
     else version (Windows)
     {
         import core.sys.windows.winbase : WaitForSingleObject, GetStdHandle,
-            STD_INPUT_HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT, INFINITE;
+            STD_INPUT_HANDLE, WAIT_OBJECT_0, INFINITE;
+        import core.sys.windows.winerror : WAIT_TIMEOUT;
         import core.stdc.stdio : setvbuf, _IONBF, stdin, stdout, FILE;
 
         // Binary mode: the CRT would otherwise translate CRLF in the framing.
