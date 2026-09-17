@@ -62,6 +62,20 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
         if (labelDesc.length)
             return;
     }
+    if (auto al = s.isAliasDeclaration())
+    {
+        // Show what the alias points at (the useful part) while marking it as
+        // an alias: `alias -> Foo.bar`, or `alias -> int` when only the type
+        // is known (e.g. `__traits(getMember, ...)`).
+        const(char)[] target;
+        auto t = al.toAlias();
+        if (t && t !is s)
+            target = qualifiedName(t);
+        if (!target.length)
+            target = typeDetail(al.type);
+        labelDesc = "alias -> " ~ (target.length ? target : "?");
+        return;
+    }
     const(char)* k = s.kind();
     if (k)
     {
@@ -129,8 +143,19 @@ private const(char)[] arenaDupStr(Arena* a, const(char)[] s)
     return p[0 .. s.length];
 }
 
-private ubyte kindOf(Dsymbol s)
+private ubyte kindOf(Dsymbol s) => kindOfDepth(s, 0);
+
+private ubyte kindOfDepth(Dsymbol s, int depth)
 {
+    if (!s || depth > 8)
+        return 1;
+    if (auto al = s.isAliasDeclaration())
+    {
+        auto t = al.toAlias();
+        if (t && t !is s)
+            return kindOfDepth(t, depth + 1);
+        return 1;
+    }
     if (s.isFuncDeclaration())
         return 3;
     if (s.isVarDeclaration())
@@ -141,8 +166,6 @@ private ubyte kindOf(Dsymbol s)
         return 20; // EnumMember-ish; enums themselves fall through below
     if (s.isModule())
         return 9;
-    if (s.isAliasDeclaration())
-        return 1;
     if (s.isTemplateDeclaration())
         return 1;
     return 1;
@@ -203,13 +226,49 @@ private void addMembers(Arena* a, Dsymbol[] members, const(char)[] prefix,
     }
 }
 
-private Type symType(Dsymbol s)
+private Type symType(Dsymbol s) => symTypeDepth(s, 0);
+
+private Type symTypeDepth(Dsymbol s, int depth)
 {
+    if (!s || depth > 8)
+        return null;
     if (auto vd = s.isVarDeclaration())
         return vd.type;
     if (auto fd = s.isFuncDeclaration())
         return fd.type;
+    if (auto al = s.isAliasDeclaration())
+    {
+        auto t = al.toAlias();
+        if (t && t !is s)
+            return symTypeDepth(t, depth + 1);
+        return al.type;
+    }
     return null;
+}
+
+// Qualified name within the module (e.g. `Foo.bar`), or null.
+private const(char)[] qualifiedName(Dsymbol s)
+{
+    if (!s)
+        return null;
+    string[] parts;
+    for (auto p = s; p; p = p.parent)
+    {
+        if (p.isModule())
+            break;
+        if (p.ident)
+            parts ~= p.ident.toString().idup;
+    }
+    if (!parts.length)
+        return s.ident ? s.ident.toString() : null;
+    string r;
+    foreach_reverse (part; parts)
+    {
+        if (r.length)
+            r ~= ".";
+        r ~= part;
+    }
+    return r;
 }
 
 // Function label parts for LSP 3.17 `labelDetails`: the parameter list

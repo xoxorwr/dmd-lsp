@@ -520,6 +520,29 @@ check('sem-fnptr-call', sem_at(call_line, fpc) == (2, 'method', 0),
 ordered = sorted(stoks)
 check('sem-sorted', list(stoks) == ordered, 'unsorted')
 
+# Template + alias chain: `value`'s type resolves through the template member
+# `__traits(getMember, T, name)` (name is a CTFE enum), i.e. int.
+alias_text = ('module aliastest;\n'
+              'struct Foo(T)\n{\n    alias bar = T;\n}\n'
+              'Foo!int foo;\n'
+              'enum name = "bar";\n'
+              'alias T = typeof(foo);\n'
+              'alias M = __traits(getMember, T, name);\n'
+              'M value;\n'
+              'extern(C) void main()\n{\n    val\n}\n')
+open('/tmp/aliastest.d', 'w').write(alias_text)
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": "file:///tmp/aliastest.d",
+                                 "languageId": "d", "version": 1, "text": alias_text}}})
+read_msg()
+send({"jsonrpc": "2.0", "id": 111, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": "file:///tmp/aliastest.d"},
+                 "position": {"line": 12, "character": 7}}})
+items = read_msg()['result']['items']
+vitem = next((i for i in items if i['label'] == 'value'), None)
+vdesc = (vitem or {}).get('labelDetails', {}).get('description')
+check('alias-template-member-type', vdesc == 'int', str(vdesc))
+
 send({"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
