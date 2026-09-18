@@ -632,6 +632,31 @@ check('alias-this-refs',
       atrefs == [('al.d', 1, 19, 27), ('al.d', 3, 33, 41)], str(atrefs))
 d.close()
 
+# `opDispatch`: `d.whatever` is rewritten to `d.opDispatch!"whatever"` with no
+# source occurrence of a real member. References must find only the declaration
+# and the explicit `opDispatch` use, never a guessed location at `whatever`.
+op = ('module op;\n'
+      'struct D\n{\n'
+      '    int opDispatch(string name)() { return 0; }\n'
+      '}\n'
+      'void f()\n{\n'
+      '    D d;\n'
+      '    auto x = d.whatever;\n'
+      '    auto y = d.opDispatch!"foo";\n'
+      '}\n')
+opp = os.path.join(root, 'op.d')
+open(opp, 'w').write(op)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(opp, op)
+d.drain(1.0)
+oprefs = fmt(d.references(opp, 3, 8, True))  # `opDispatch` declaration
+check('opdispatch-no-wrong-location',
+      ('op.d', 3, 8, 18) in oprefs and ('op.d', 9, 15, 25) in oprefs
+      and not any(l == 8 for (_, l, _, _) in oprefs), str(oprefs))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)
