@@ -581,6 +581,39 @@ check('const-manifest-refs',
                 ('cst.d', 3, 8, 9)], str(krefs))
 d.close()
 
+# UFCS: dmd rewrites `s.helper()` to a call to the free `helper` with `s` as
+# the first argument, and the callee node's loc is the *dot*, so a naive walk
+# reports nothing at the call site (a broken rename).
+uf = ('module uf;\n'
+      'struct S { int v; }\n'
+      'void helper(S s) { }\n'
+      'void tmpl(T)(T x) { }\n'
+      'int prop(S s) { return s.v; }\n'
+      'void bar()\n'
+      '{\n'
+      '    S s;\n'
+      '    s.helper();\n'
+      '    s.tmpl();\n'
+      '    auto x = s.prop;\n'
+      '}\n')
+ufp = os.path.join(root, 'uf.d')
+open(ufp, 'w').write(uf)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(ufp, uf)
+d.drain(1.0)
+ufrefs = fmt(d.references(ufp, 2, 5, True))  # `helper` declaration
+check('ufcs-refs',
+      ufrefs == [('uf.d', 2, 5, 11), ('uf.d', 8, 6, 12)], str(ufrefs))
+trefs = fmt(d.references(ufp, 3, 5, True))  # template UFCS `s.tmpl()`
+check('ufcs-template-refs',
+      trefs == [('uf.d', 3, 5, 9), ('uf.d', 9, 6, 10)], str(trefs))
+prefs = fmt(d.references(ufp, 4, 4, True))  # property UFCS `s.prop` (no parens)
+check('ufcs-property-refs',
+      prefs == [('uf.d', 4, 4, 8), ('uf.d', 10, 15, 19)], str(prefs))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

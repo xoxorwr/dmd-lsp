@@ -422,6 +422,30 @@ else:
     check('rename-enum-compound-member', False, str(r)[:200])
 d.close()
 
+# UFCS call site: renaming a free function must rewrite `s.helper()`.
+UF = ('module uf2;\n'
+      'struct S { int v; }\n'
+      'void helper(S s) { }\n'
+      'void bar() { S s; s.helper(); }\n')
+ufp = os.path.join(root, 'uf2.d')
+open(ufp, 'w').write(UF)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(ufp, UF)
+d.drain(1.0)
+r = d.rename(ufp, 2, 5, 'util')  # `helper`
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {ufp: UF})
+    check('rename-ufcs',
+          new[ufp] == ('module uf2;\n'
+                       'struct S { int v; }\n'
+                       'void util(S s) { }\n'
+                       'void bar() { S s; s.util(); }\n'), repr(new[ufp]))
+else:
+    check('rename-ufcs', False, str(r)[:200])
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

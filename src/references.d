@@ -995,8 +995,17 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     override void visit(SymOffExp e) { use(e.loc, e.var, false); super.visit(e); }
     override void visit(CallExp e)
     {
+        // A UFCS call/property (`s.helper()`, `s.helper`) is rewritten by dmd
+        // into a call to the free function with the receiver pushed as the
+        // first argument; `e.e1` is the (rewritten) callee and its loc is the
+        // *dot*, so the callee name is not at `e.e1.loc`. Treat such a call as
+        // a member access: locate the name after the dot. A normal call
+        // (`foo(x)`) has `e.e1.loc` on `foo` itself, so it is left untouched.
+        bool member = isMemberExpr(e.e1);
+        if (!member && e.f && e.f.ident && e.e1 && !useSpells(e.e1.loc, e.f.ident))
+            member = true;
         if (e.f && e.e1)
-            use(e.e1.loc, e.f, isMemberExpr(e.e1));
+            use(e.e1.loc, e.f, member);
         super.visit(e);
     }
     override void visit(NewExp e) { use(e.loc, typeSymbol(e.newtype), false); super.visit(e); }
