@@ -23,9 +23,10 @@ import session;
 import server;
 import complete;
 import symbols : DocSymbol, documentSymbols;
-import references : RefLoc, findReferences, isLocalDsymbol, referencesForKey,
+import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
+    referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt;
-import refs : DeclKey, declKey;
+
 import lexutil : ScanOut, scanIdents;
 import lint;
 import semantic : SemTok, semanticTokens;
