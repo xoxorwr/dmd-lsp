@@ -82,81 +82,6 @@ private struct IdentHit
     bool called = false;    // followed by `(` — a call site
 }
 
-private bool isIdentStart(char c) pure nothrow @nogc @safe
-{
-    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-private bool isIdentChar(char c) pure nothrow @nogc @safe
-{
-    return isIdentStart(c) || (c >= '0' && c <= '9');
-}
-
-// Skip a quoted literal starting at `i`. raw = no backslash escapes
-// (backtick strings and the r"..." / q"..." forms).
-private void skipQuoted(const(char)[] src, ref size_t i, ref uint line,
-    ref uint col, bool raw)
-{
-    char q = src[i];
-    i++;
-    col++;
-    while (i < src.length && src[i] != q && src[i] != '\n')
-    {
-        if (!raw && src[i] == '\\' && i + 1 < src.length)
-        {
-            if (src[i + 1] == '\n')
-            {
-                i += 2;
-                line++;
-                col = 1;
-                continue;
-            }
-            i += 2;
-            col += 2;
-            continue;
-        }
-        i++;
-        col++;
-    }
-    if (i < src.length && src[i] == q)
-    {
-        i++;
-        col++;
-    }
-}
-
-// Skip a q{...} token string (balanced braces), `i` at the opening '{'.
-private void skipTokenString(const(char)[] src, ref size_t i, ref uint line,
-    ref uint col)
-{
-    int depth = 0;
-    while (i < src.length)
-    {
-        char c = src[i];
-        if (c == '\n')
-        {
-            i++;
-            line++;
-            col = 1;
-            continue;
-        }
-        if (c == '{')
-            depth++;
-        else if (c == '}')
-        {
-            depth--;
-            if (depth == 0)
-            {
-                i++;
-                col++;
-                return;
-            }
-        }
-        i++;
-        col++;
-    }
-}
-
 // Lexical context for identifier hints. `Stmt` tracks import/module
 // statements so their path segments can be marked `namespace` without
 // resolution (the resolver has no use for a bare `std.conv` path).
@@ -166,14 +91,6 @@ private enum ScanStmt : ubyte
     modulePath,
     importPath,
     selective,
-}
-
-// True when the identifier at `s` is preceded (modulo spaces) by `@`.
-private bool precededByAt(const(char)[] src, size_t s) pure nothrow @nogc @safe
-{
-    while (s > 0 && (src[s - 1] == ' ' || src[s - 1] == '\t'))
-        s--;
-    return s > 0 && src[s - 1] == '@';
 }
 
 private bool isBuiltinAttr(const(char)[] w) pure nothrow @nogc @safe
@@ -189,212 +106,70 @@ private bool isBuiltinAttr(const(char)[] w) pure nothrow @nogc @safe
 
 private void scanIdents(const(char)[] src, ref IdentHit[] hits)
 {
-    size_t i = 0;
-    uint line = 1;
-    uint col = 1;
-    const n = src.length;
-    ScanStmt stmt = ScanStmt.none;
-    while (i < n)
-    {
-        char c = src[i];
-        if (c == ';' || c == '{' || c == '}')
-        {
-            stmt = ScanStmt.none;
-            i++;
-            col++;
-            continue;
-        }
-        if (c == ':' && stmt == ScanStmt.importPath)
-        {
-            stmt = ScanStmt.selective;
-            i++;
-            col++;
-            continue;
-        }
-        if (c == '\n')
-        {
-            i++;
-            line++;
-            col = 1;
-            continue;
-        }
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f')
-        {
-            i++;
-            col++;
-            continue;
-        }
-        // line comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '/')
-        {
-            i += 2;
-            col += 2;
-            while (i < n && src[i] != '\n')
-            {
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // nested /+ +/ comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '+')
-        {
-            i += 2;
-            col += 2;
-            int depth = 1;
-            while (i < n && depth > 0)
-            {
-                if (src[i] == '\n')
-                {
-                    i++;
-                    line++;
-                    col = 1;
-                    continue;
-                }
-                if (src[i] == '/' && i + 1 < n && src[i + 1] == '+')
-                {
-                    depth++;
-                    i += 2;
-                    col += 2;
-                    continue;
-                }
-                if (src[i] == '+' && i + 1 < n && src[i + 1] == '/')
-                {
-                    depth--;
-                    i += 2;
-                    col += 2;
-                    continue;
-                }
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // /* */ comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '*')
-        {
-            i += 2;
-            col += 2;
-            while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/'))
-            {
-                if (src[i] == '\n')
-                {
-                    line++;
-                    col = 1;
-                }
-                else
-                    col++;
-                i++;
-            }
-            if (i + 1 < n)
-            {
-                i += 2;
-                col += 2;
-            }
-            continue;
-        }
-        // string / char / backtick literal
-        if (c == '"' || c == '\'' || c == '`')
-        {
-            skipQuoted(src, i, line, col, c == '`');
-            continue;
-        }
-        if (isIdentStart(c))
-        {
-            size_t s = i;
-            uint scol = col;
-            while (i < n && isIdentChar(src[i]))
-            {
-                i++;
-                col++;
-            }
-            auto name = src[s .. i];
-            // String prefixes bind to the literal with no space: r".." x".."
-            // q".." i".." and the q{..} token string. Don't report the prefix.
-            if (name.length == 1 && i < n &&
-                (name[0] == 'r' || name[0] == 'R' || name[0] == 'x' ||
-                 name[0] == 'X' || name[0] == 'q' || name[0] == 'Q' ||
-                 name[0] == 'i' || name[0] == 'I'))
-            {
-                if (src[i] == '{' && (name[0] == 'q' || name[0] == 'Q'))
-                {
-                    skipTokenString(src, i, line, col);
-                    continue;
-                }
-                if (src[i] == '"')
-                {
-                    skipQuoted(src, i, line, col, true);
-                    continue;
-                }
-            }
-            if (name == "module")
-                stmt = ScanStmt.modulePath;
-            else if (name == "import")
-            {
-                size_t j = i;
-                while (j < n && (src[j] == ' ' || src[j] == '\t'))
-                    j++;
-                // `import("file")` is the string-import expression.
-                if (!(j < n && src[j] == '('))
-                    stmt = ScanStmt.importPath;
-            }
-            if (!isKeyword(name))
-            {
-                ubyte hint = HINT_NONE;
-                if (stmt == ScanStmt.modulePath || stmt == ScanStmt.importPath)
-                    hint = TT_NAMESPACE;
-                else if (precededByAt(src, s))
-                    hint = isBuiltinAttr(name) ? TT_MODIFIER : TT_DECORATOR;
-                bool called = false;
-                if (hint == HINT_NONE)
-                {
-                    size_t j = i;
-                    while (j < n && (src[j] == ' ' || src[j] == '\t'))
-                        j++;
-                    called = j < n && src[j] == '(';
-                }
-                hits ~= IdentHit(name, line, scol, hint, called);
-            }
-            continue;
-        }
-        // number literal (digits, hex, exponent, `_` separators)
-        if (c >= '0' && c <= '9')
-        {
-            while (i < n && (isIdentChar(src[i]) || src[i] == '.'))
-            {
-                i++;
-                col++;
-            }
-            continue;
-        }
-        i++;
-        col++;
-    }
-}
+    if (!src.length)
+        return;
 
-private bool isKeyword(const(char)[] w) pure nothrow @nogc @safe
-{
-    static immutable string[] kw = [
-        "abstract", "alias", "align", "asm", "assert", "auto", "body", "bool",
-        "break", "byte", "case", "cast", "catch", "cdouble", "cent", "cfloat",
-        "char", "class", "const", "continue", "creal", "dchar", "debug",
-        "default", "delegate", "delete", "deprecated", "do", "double", "else",
-        "enum", "export", "extern", "false", "final", "finally", "float",
-        "for", "foreach", "foreach_reverse", "function", "goto", "idouble",
-        "if", "ifloat", "immutable", "import", "in", "inout", "int",
-        "interface", "invariant", "ireal", "is", "lazy", "long", "macro",
-        "mixin", "module", "new", "nothrow", "null", "out", "override",
-        "package", "pragma", "private", "protected", "public", "pure", "real",
-        "ref", "return", "scope", "shared", "short", "static", "struct",
-        "super", "switch", "synchronized", "template", "this", "throw", "true",
-        "try", "typeid", "typeof", "ubyte", "ucent", "uint", "ulong", "union",
-        "unittest", "ushort", "version", "void", "wchar", "while", "with",
-        "__gshared", "__traits", "__vector", "__parameters",
-    ];
-    foreach (k; kw)
-        if (k == w)
-            return true;
-    return false;
+    // dmd's own lexer handles comments, strings (r""/`/x""/q{}), keywords and
+    // numbers; the scanner only classifies identifier tokens.
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    auto buf = src.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+
+    Token[] toks;
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        toks ~= t;
+    }
+
+    ScanStmt stmt = ScanStmt.none;
+    foreach (i, t; toks)
+    {
+        switch (t.value)
+        {
+        case TOK.semicolon:
+        case TOK.leftCurly:
+        case TOK.rightCurly:
+            stmt = ScanStmt.none;
+            continue;
+        case TOK.colon:
+            if (stmt == ScanStmt.importPath)
+                stmt = ScanStmt.selective;
+            continue;
+        case TOK.module_:
+            stmt = ScanStmt.modulePath;
+            continue;
+        case TOK.import_:
+            // `import("file")` is the string-import expression, not a path.
+            stmt = (i + 1 < toks.length &&
+                toks[i + 1].value == TOK.leftParenthesis)
+                ? ScanStmt.none : ScanStmt.importPath;
+            continue;
+        case TOK.identifier:
+            break;
+        default:
+            continue;
+        }
+
+        auto name = t.ident.toString();
+        ubyte hint = HINT_NONE;
+        if (stmt == ScanStmt.modulePath || stmt == ScanStmt.importPath)
+            hint = TT_NAMESPACE; // module paths need no resolution
+        else if (i > 0 && toks[i - 1].value == TOK.at)
+            hint = isBuiltinAttr(name) ? TT_MODIFIER : TT_DECORATOR;
+        bool called = false;
+        if (hint == HINT_NONE)
+            called = i + 1 < toks.length &&
+                toks[i + 1].value == TOK.leftParenthesis;
+        hits ~= IdentHit(name, t.loc.linnum(), t.loc.charnum(), hint, called);
+    }
 }
 
 // ---------- classification ----------
