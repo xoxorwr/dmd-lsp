@@ -510,6 +510,13 @@ private bool sameTarget(Dsymbol a, Dsymbol b)
     if (auto ti = b.isTemplateInstance())
         if (ti.tempdecl)
             return sameTarget(ti.tempdecl, a);
+    // A template function instance resolves back to its template.
+    if (auto ti = a.isInstantiated())
+        if (ti.tempdecl)
+            return sameTarget(ti.tempdecl, b);
+    if (auto ti = b.isInstantiated())
+        if (ti.tempdecl)
+            return sameTarget(ti.tempdecl, a);
     // A function that is a template's single member stands in for the template.
     if (a.parent is b && b.isTemplateDeclaration() && a.isFuncDeclaration())
         return true;

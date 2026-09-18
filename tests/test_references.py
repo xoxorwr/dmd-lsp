@@ -145,6 +145,28 @@ check('second-block-local', set(l for (_, l, _, _) in second) == {8, 9}
       and len(second) == 3, str(second))
 d.close()
 
+# Template function: calls instantiate the template; references must fold the
+# instance back to the TemplateDeclaration.
+tmpl = ('module tm;\n'
+        'void LINFO(Char, A...)(in Char[] fmt, scope A args) {}\n'
+        'extern(C) void main()\n{\n'
+        '    LINFO("aaa");\n'
+        '    LINFO("bbb");\n'
+        '    LINFO("ccc");\n'
+        '}\n')
+tp = os.path.join(root, 'tm.d')
+open(tp, 'w').write(tmpl)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(tp, tmpl)
+d.drain(1.0)
+tmrefs = fmt(d.references(tp, 1, 5, True))
+check('template-refs',
+      sorted(l for (_, l, _, _) in tmrefs) == [1, 4, 5, 6],
+      str(tmrefs))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)
