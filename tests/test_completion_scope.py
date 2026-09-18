@@ -20,10 +20,16 @@ Event make_event() { return Event.init; }
 MAIN = '''module main;
 
 import mod;
+import evmod = mod;
 
 void on_ref(ref Event arg)
 {
     ar
+}
+
+void on_alias_import()
+{
+    evm
 }
 
 void on_event()
@@ -227,6 +233,14 @@ items = complete_items(el, len(lines[el]))
 aitem = next((i for i in items if i['label'] == 'arg'), None)
 desc = aitem and aitem.get('labelDetails', {}).get('description')
 check('ref-param-type-display', desc == 'ref Event', str(desc))
+
+# 10) A renamed import (`import evmod = mod;`) binds `evmod` in this module.
+# Imports are private symbols, so plain member enumeration skips them.
+ml = line_of('    evm')
+items = complete_items(ml, len(lines[ml]))
+mitem = next((i for i in items if i['label'] == 'evmod'), None)
+check('renamed-import',
+      mitem is not None and mitem.get('detail') == 'mod', str(mitem))
 
 proc.stdin.close()
 proc.wait(timeout=5)

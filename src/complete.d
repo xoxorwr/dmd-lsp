@@ -3450,6 +3450,29 @@ private void walkImports(Module root, int depth, Arena* a, const(char)[] prefix,
     {
         if (auto imp = s.isImport())
         {
+            // The import's local binding -- the alias in
+            // `import custom = rt.dbg;`, otherwise the leftmost package / module
+            // name -- is usable in this module regardless of the import
+            // symbol's visibility (imports default to private, which is why
+            // addMembers skips them). Offer it explicitly.
+            if (imp.ident)
+            {
+                auto nm = imp.ident.toString();
+                if (hasPrefix(nm, prefix))
+                {
+                    const(char)[] d;
+                    if (imp.mod)
+                    {
+                        const(char)* mp = imp.mod.toPrettyChars();
+                        if (mp)
+                        {
+                            import core.stdc.string : strlen;
+                            d = mp[0 .. strlen(mp)];
+                        }
+                    }
+                    pushItem(a, o, nm, 9, d, null, "1", seen);
+                }
+            }
             if (!imp.mod || imp.isstatic)
                 continue; // static import: qualified access only
             addModuleInterface(imp.mod, depth, a, prefix, o, seen);
