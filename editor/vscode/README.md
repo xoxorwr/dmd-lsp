@@ -49,6 +49,9 @@ the server and overrides these per-run.
   when they exist, plus any `dmdLsp.*` settings) and restarts the server so
   it takes effect. If the file already exists it is just opened.
 
+Opening a `.d` file in a workspace that has no `dls.json` offers to create
+one (dismissible per session, or permanently with **Don't show again**).
+
 ## Build
 
 ```sh

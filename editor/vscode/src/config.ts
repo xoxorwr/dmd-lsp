@@ -5,6 +5,12 @@ import * as path from 'path';
 // Directories that commonly hold D sources; probed to seed `importPaths`.
 const IMPORT_CANDIDATES = ['src', 'source', 'sandbox'];
 
+// True when the workspace root already has a dls.json.
+export function dlsJsonExists(): boolean {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  return !!folder && fs.existsSync(path.join(folder.uri.fsPath, 'dls.json'));
+}
+
 // Write a starter dls.json at the workspace root. Returns true when the
 // file was created (false when it already existed and was just opened).
 export async function createDlsJson(): Promise<boolean> {
