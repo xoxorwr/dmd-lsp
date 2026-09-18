@@ -10,6 +10,7 @@ module lint;
 
 import arena;
 import lexutil;
+import complete : appendScopeSubs;
 
 import dmd.dimport : Import;
 import dmd.dmodule : Module;
@@ -17,49 +18,7 @@ import dmd.dsymbol : Dsymbol, Visibility;
 import dmd.func : FuncDeclaration;
 import dmd.declaration : VarDeclaration;
 import dmd.astenums : STC;
-import dmd.attrib : ConditionalDeclaration;
 import dmd.arraytypes : Dsymbols;
-import dmd.dsymbol : DSYM;
-
-// Child scopes to descend when walking members, including attribute
-// blocks (`private:`, `@safe:`, ...) that hide declarations in
-// real-world code.
-private void appendScopeSubs(Dsymbol s, ref Dsymbol[] out_)
-{
-    if (auto ad = s.isAggregateDeclaration())
-    {
-        if (ad.members)
-            foreach (m; (*ad.members)[])
-                out_ ~= m;
-    }
-    else if (auto td = s.isTemplateDeclaration())
-    {
-        if (td.members)
-            foreach (m; (*td.members)[])
-                out_ ~= m;
-    }
-    else if (auto ns = s.isNspace())
-    {
-        if (ns.members)
-            foreach (m; (*ns.members)[])
-                out_ ~= m;
-    }
-    else if (auto at = s.isAttribDeclaration())
-    {
-        if (at.decl)
-            foreach (m; (*at.decl)[])
-                out_ ~= m;
-        // NOTE: never D-cast dmd AST nodes (extern(C++) classes have no
-        // runtime type check); tag-check first, then the cast is safe.
-        if (at.dsym == DSYM.conditionalDeclaration)
-        {
-            auto cd = cast(ConditionalDeclaration)at;
-            if (cd.elsedecl)
-                foreach (m; (*cd.elsedecl)[])
-                    out_ ~= m;
-        }
-    }
-}
 
 // Flat member list with attribute blocks expanded recursively.
 private void flattenScopeMembers(Dsymbols* mem, ref Dsymbol[] out_)
