@@ -13,22 +13,22 @@ module references;
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
-import dmd.declaration : Declaration, VarDeclaration;
+import dmd.declaration : VarDeclaration, AliasDeclaration;
 import dmd.func : FuncDeclaration;
-import dmd.aggregate : AggregateDeclaration;
 import dmd.denum : EnumDeclaration;
-import dmd.dtemplate : TemplateDeclaration, TemplateInstance;
-import dmd.statement : Statement;
-import dmd.expression : Expression;
+import dmd.dtemplate : TemplateDeclaration;
+import dmd.expression : Expression, VarExp, DotVarExp, SymOffExp, CallExp,
+    NewExp, TypeExp, ScopeExp, FuncExp, TemplateExp, DotTemplateExp,
+    DotTemplateInstanceExp, ThisExp, StructLiteralExp, SliceExp;
+import dmd.visitor : SemanticTimeTransitiveVisitor;
+import dmd.dstruct : StructDeclaration, UnionDeclaration;
+import dmd.dclass : ClassDeclaration, InterfaceDeclaration;
 import dmd.mtype : Type;
-import dmd.init : Initializer;
 import dmd.identifier : Identifier;
 import dmd.location : Loc;
 import dmd.typesem : toBasetype;
 import core.stdc.string : strlen;
-import arena : Arena;
 import session : sessionReadDisk;
-import complete : appendScopeSubs;
 
 // ---------- declaration identity ----------
 // A declaration's identity, independent of the live pointer/universe it was
@@ -339,8 +339,12 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
     g_refTextSet = true;
 
     RefLoc[] dummy;
+    scope RefWalker w = new RefWalker();
+    w.target = null;
+    w.includeDecl = false;
+    w.out_ = dummy;
     foreach (i; 0 .. (*mod.members).length)
-        walkDecl((*mod.members)[i], null, false, dummy);
+        (*mod.members)[i].accept(w);
 
     foreach (h; g_hits)
     {
@@ -471,8 +475,13 @@ private void walkModule(Module m, Dsymbol target, bool includeDecl, ref RefLoc[]
     if (!m.members)
         return;
     scopeRefText(m, rootPath, rootText);
+    scope RefWalker w = new RefWalker();
+    w.target = target;
+    w.includeDecl = includeDecl;
+    w.out_ = out_;
     foreach (i; 0 .. (*m.members).length)
-        walkDecl((*m.members)[i], target, includeDecl, out_);
+        (*m.members)[i].accept(w);
+    out_ = w.out_;
 }
 
 // Canonical source path of a module: `arg` first (what dmd parsed), then the
@@ -718,299 +727,116 @@ private void emitDecl(Loc loc, Dsymbol d, Dsymbol target, bool includeDecl,
     recordPos(loc.linnum(), loc.charnum(), d.ident, out_);
 }
 
-private void walkDecl(Dsymbol d, Dsymbol target, bool includeDecl, ref RefLoc[] out_)
+// DMD's own semantic-time transitive visitor provides the AST traversal, so we
+// inherit its complete walk instead of hand-rolling one (a hand-rolled walk
+// silently missed array/assoc/struct literals and several statement kinds).
+// This is the one deliberate OOP adapter in src/: dmd's visitor infrastructure
+// is class-based (see `check-no-oop`).
+extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
 {
-    if (!d)
-        return;
-    if (d.isImport())
-        return;
-    if (d.isAttribDeclaration())
-    {
-        Dsymbol[] subs;
-        appendScopeSubs(d, subs);
-        foreach (s; subs)
-            walkDecl(s, target, includeDecl, out_);
-        return;
-    }
-    emitDecl(d.loc, d, target, includeDecl, out_);
+    alias visit = SemanticTimeTransitiveVisitor.visit;
 
-    if (auto ad = d.isAggregateDeclaration())
+    Dsymbol target;
+    bool includeDecl;
+    RefLoc[] out_;
+
+    private void use(Loc loc, Dsymbol sym, bool member)
     {
-        if (ad.members)
-            foreach (i; 0 .. (*ad.members).length)
-                walkDecl((*ad.members)[i], target, includeDecl, out_);
-        return;
+        emitUse(loc, sym, target, out_, member);
     }
-    if (auto ed = d.isEnumDeclaration())
+
+    private void decl(Dsymbol d)
     {
-        if (ed.members)
-            foreach (i; 0 .. (*ed.members).length)
-                walkDecl((*ed.members)[i], target, includeDecl, out_);
-        return;
+        if (d)
+            emitDecl(d.loc, d, target, includeDecl, out_);
     }
-    if (auto td = d.isTemplateDeclaration())
+
+    // Uses: every expression node that carries a resolved symbol. `super.visit`
+    // continues dmd's traversal into children.
+    override void visit(VarExp e) { use(e.loc, e.var, false); super.visit(e); }
+    override void visit(DotVarExp e) { use(e.loc, e.var, true); super.visit(e); }
+    override void visit(SymOffExp e) { use(e.loc, e.var, false); super.visit(e); }
+    override void visit(CallExp e)
     {
-        if (td.members)
-            foreach (i; 0 .. (*td.members).length)
-                walkDecl((*td.members)[i], target, includeDecl, out_);
-        return;
+        if (e.f && e.e1)
+            use(e.e1.loc, e.f, isMemberExpr(e.e1));
+        super.visit(e);
     }
-    if (auto fd = d.isFuncDeclaration())
+    override void visit(NewExp e) { use(e.loc, typeSymbol(e.newtype), false); super.visit(e); }
+    override void visit(TypeExp e) { use(e.loc, typeSymbol(e.type), false); super.visit(e); }
+    override void visit(ScopeExp e) { use(e.loc, e.sds, false); super.visit(e); }
+    override void visit(FuncExp e)
     {
-        if (fd.parameters)
-            foreach (p; *fd.parameters)
+        use(e.loc, e.fd ? cast(Dsymbol) e.fd : cast(Dsymbol) e.td, false);
+        super.visit(e);
+    }
+    override void visit(TemplateExp e) { use(e.loc, e.td, false); super.visit(e); }
+    override void visit(DotTemplateExp e) { use(e.loc, e.td, true); super.visit(e); }
+    override void visit(DotTemplateInstanceExp e)
+    {
+        use(e.loc, e.ti ? e.ti.tempdecl : null, true);
+        super.visit(e);
+    }
+    override void visit(ThisExp e) { use(e.loc, e.var, false); super.visit(e); }
+
+    // Declarations. The base visitor traverses members but does not emit them,
+    // and not every declaration kind is reached; emit here.
+    override void visit(StructDeclaration d) { decl(d); super.visit(d); }
+    override void visit(UnionDeclaration d) { decl(d); super.visit(d); }
+    override void visit(ClassDeclaration d) { decl(d); super.visit(d); }
+    override void visit(InterfaceDeclaration d) { decl(d); super.visit(d); }
+    override void visit(EnumDeclaration d) { decl(d); super.visit(d); }
+    override void visit(TemplateDeclaration d) { decl(d); super.visit(d); }
+    override void visit(AliasDeclaration d) { decl(d); super.visit(d); }
+
+    override void visit(FuncDeclaration d)
+    {
+        decl(d);
+        // `d.parameters` is a `VarDeclarations*` (the parameter symbols); the
+        // base visitor only walks the function type + body, so emit the
+        // parameters (and their default arguments) explicitly.
+        if (d.parameters)
+            foreach (p; *d.parameters)
             {
                 if (!p)
                     continue;
-                emitDecl(p.loc, p, target, includeDecl, out_);
-                if (p.type) // parameter default values
-                    walkInit(p._init, target, out_);
+                decl(p);
+                if (p._init)
+                    p._init.accept(this);
             }
-        if (fd.fbody)
-            walkStmt(fd.fbody, target, out_);
-        return;
+        super.visit(d);
     }
-    if (auto vd = d.isVarDeclaration())
-    {
-        walkInit(vd._init, target, out_);
-        return;
-    }
-}
 
-private void walkInit(Initializer init, Dsymbol target, ref RefLoc[] out_)
-{
-    if (!init)
-        return;
-    if (auto ei = init.isExpInitializer())
-        if (ei.exp)
-            walkExpr(ei.exp, target, out_);
-}
+    override void visit(VarDeclaration d)
+    {
+        decl(d);
+        super.visit(d);
+    }
 
-private void walkStmt(Statement s, Dsymbol target, ref RefLoc[] out_)
-{
-    if (!s)
-        return;
-    if (auto es = s.isExpStatement())
+    // dmd's transitive visitor does not descend into struct-literal elements or
+    // slice bounds; patch those gaps (a struct literal can be self-referential,
+    // so guard with the same stage flag the compiler's own walker uses).
+    override void visit(StructLiteralExp e)
     {
-        if (es.exp)
-        {
-            if (auto de = es.exp.isDeclarationExp())
-                walkDecl(de.declaration, target, true, out_);
-            else
-                walkExpr(es.exp, target, out_);
-        }
-        return;
+        if (e.stageflags & StructLiteralExp.StageFlags.apply)
+            return;
+        auto old = e.stageflags;
+        e.stageflags |= StructLiteralExp.StageFlags.apply;
+        if (e.elements)
+            foreach (el; *e.elements)
+                if (el)
+                    el.accept(this);
+        e.stageflags = old;
     }
-    if (auto cs = s.isCompoundStatement())
-    {
-        foreach (st; cs.statements)
-            walkStmt(st, target, out_);
-        return;
-    }
-    if (auto ss = s.isScopeStatement())
-    {
-        walkStmt(ss.statement, target, out_);
-        return;
-    }
-    if (auto is_ = s.isIfStatement())
-    {
-        walkExpr(is_.condition, target, out_);
-        if (is_.ifbody)
-            walkStmt(is_.ifbody, target, out_);
-        if (is_.elsebody)
-            walkStmt(is_.elsebody, target, out_);
-        return;
-    }
-    if (auto ws = s.isWhileStatement())
-    {
-        walkExpr(ws.condition, target, out_);
-        if (ws._body)
-            walkStmt(ws._body, target, out_);
-        return;
-    }
-    if (auto ds = s.isDoStatement())
-    {
-        if (ds._body)
-            walkStmt(ds._body, target, out_);
-        walkExpr(ds.condition, target, out_);
-        return;
-    }
-    if (auto fs = s.isForStatement())
-    {
-        walkStmt(fs._init, target, out_);
-        walkExpr(fs.condition, target, out_);
-        walkExpr(fs.increment, target, out_);
-        if (fs._body)
-            walkStmt(fs._body, target, out_);
-        return;
-    }
-    if (auto fes = s.isForeachStatement())
-    {
-        walkExpr(fes.aggr, target, out_);
-        if (fes._body)
-            walkStmt(fes._body, target, out_);
-        return;
-    }
-    if (auto frs = s.isForeachRangeStatement())
-    {
-        walkExpr(frs.lwr, target, out_);
-        walkExpr(frs.upr, target, out_);
-        if (frs._body)
-            walkStmt(frs._body, target, out_);
-        return;
-    }
-    if (auto sw = s.isSwitchStatement())
-    {
-        walkExpr(sw.condition, target, out_);
-        if (sw._body)
-            walkStmt(sw._body, target, out_);
-        return;
-    }
-    if (auto cs = s.isCaseStatement())
-    {
-        walkExpr(cs.exp, target, out_);
-        if (cs.statement)
-            walkStmt(cs.statement, target, out_);
-        return;
-    }
-    if (auto rs = s.isReturnStatement())
-    {
-        walkExpr(rs.exp, target, out_);
-        return;
-    }
-    if (auto ws = s.isWithStatement())
-    {
-        walkExpr(ws.exp, target, out_);
-        if (ws._body)
-            walkStmt(ws._body, target, out_);
-        return;
-    }
-    if (auto ts = s.isThrowStatement())
-    {
-        walkExpr(ts.exp, target, out_);
-        return;
-    }
-    if (auto ts = s.isSynchronizedStatement())
-    {
-        walkExpr(ts.exp, target, out_);
-        if (ts._body)
-            walkStmt(ts._body, target, out_);
-        return;
-    }
-    if (auto ts = s.isTryCatchStatement())
-    {
-        if (ts._body)
-            walkStmt(ts._body, target, out_);
-        if (ts.catches)
-            foreach (c; *ts.catches)
-                if (c && c.handler)
-                    walkStmt(c.handler, target, out_);
-        return;
-    }
-    if (auto ts = s.isTryFinallyStatement())
-    {
-        if (ts._body)
-            walkStmt(ts._body, target, out_);
-        if (ts.finalbody)
-            walkStmt(ts.finalbody, target, out_);
-        return;
-    }
-    if (auto ls = s.isLabelStatement())
-    {
-        if (ls.statement)
-            walkStmt(ls.statement, target, out_);
-        return;
-    }
-}
 
-private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
-{
-    if (!e)
-        return;
-    if (auto ve = e.isVarExp())
-        emitUse(e.loc, ve.var, target, out_);
-    else if (auto dv = e.isDotVarExp())
-        emitUse(e.loc, dv.var, target, out_, true);
-    else if (auto so = e.isSymOffExp())
-        emitUse(e.loc, so.var, target, out_);
-    else if (auto ca = e.isCallExp())
+    override void visit(SliceExp e)
     {
-        // The callee is `e1` (walked below); some calls carry the resolved
-        // function only in `ca.f` (templates/qualified), so record at the
-        // callee identifier too. Dedupe folds the two paths.
-        if (ca.f && ca.e1)
-            emitUse(ca.e1.loc, ca.f, target, out_, isMemberExpr(ca.e1));
-        walkExpr(ca.e1, target, out_);
-        if (ca.arguments)
-            foreach (a; *ca.arguments)
-                walkExpr(a, target, out_);
-        return;
-    }
-    else if (auto ae = e.isArrayExp())
-    {
-        walkExpr(ae.e1, target, out_);
-        if (ae.arguments)
-            foreach (a; *ae.arguments)
-                walkExpr(a, target, out_);
-        return;
-    }
-    else if (auto ne = e.isNewExp())
-    {
-        emitUse(e.loc, typeSymbol(ne.newtype), target, out_);
-        if (ne.arguments)
-            foreach (a; *ne.arguments)
-                walkExpr(a, target, out_);
-        return;
-    }
-    else if (auto te = e.isTypeExp())
-        emitUse(e.loc, typeSymbol(te.type), target, out_);
-    else if (auto se = e.isScopeExp())
-        emitUse(e.loc, se.sds, target, out_);
-    else if (auto fe = e.isFuncExp())
-        emitUse(e.loc, fe.fd ? cast(Dsymbol) fe.fd : cast(Dsymbol) fe.td, target, out_);
-    else if (auto te = e.isTemplateExp())
-        emitUse(e.loc, te.td, target, out_);
-    else if (auto dte = e.isDotTemplateExp())
-    {
-        emitUse(e.loc, dte.td, target, out_, true);
-        walkExpr(dte.e1, target, out_);
-        return;
-    }
-    else if (auto dti = e.isDotTemplateInstanceExp())
-    {
-        emitUse(e.loc, dti.ti ? dti.ti.tempdecl : null, target, out_, true);
-        walkExpr(dti.e1, target, out_);
-        return;
-    }
-    else if (auto th = e.isThisExp())
-        emitUse(e.loc, th.var, target, out_);
-
-    if (auto c = e.isCondExp())
-    {
-        walkExpr(c.econd, target, out_);
-        walkExpr(c.e1, target, out_);
-        walkExpr(c.e2, target, out_);
-        return;
-    }
-    if (auto tup = e.isTupleExp())
-    {
-        if (tup.exps)
-            foreach (a; *tup.exps)
-                walkExpr(a, target, out_);
-        return;
-    }
-    // Binary ops are flagged `unary | binary` in dmd's table, so this must
-    // come before the UnaExp branch or the right operand is skipped.
-    if (auto b = e.isBinExp())
-    {
-        walkExpr(b.e1, target, out_);
-        walkExpr(b.e2, target, out_);
-        return;
-    }
-    if (auto u = e.isUnaExp())
-    {
-        walkExpr(u.e1, target, out_);
-        return;
+        if (e.e1)
+            e.e1.accept(this);
+        if (e.lwr)
+            e.lwr.accept(this);
+        if (e.upr)
+            e.upr.accept(this);
     }
 }
 

@@ -457,6 +457,118 @@ bool dmdIsPlainIdentifier(const(char)[] s)
     return t2.value == TOK.endOfFile;
 }
 
+// True when `text` can synthesise a reference to `name` that dmd's resolved
+// AST does not contain: a string mixin or `__traits`/`is` expression (whose
+// inner expression semantic evaluates with gagging and may discard). Uses the
+// frontend lexer, and is name-aware so a `__traits` unrelated to `name` does
+// not make the reference set incomplete.
+bool dmdHasHiddenRefRisk(const(char)[] text, const(char)[] name)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    if (!text.length || !name.length)
+        return false;
+    auto buf = text.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+
+    // Copy each token's value + identifier/string text (string buffers may be
+    // reused by the lexer).
+    static struct T
+    {
+        TOK v;
+        string s; // identifier name or string-literal content, else null
+    }
+    T[] toks;
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        string s;
+        if (t.ident)
+            s = t.ident.toString().idup;
+        else if (t.ustring && t.len)
+            s = t.ustring[0 .. t.len].idup;
+        toks ~= T(t.value, s);
+    }
+
+    static bool wordIn(const(char)[] hay, const(char)[] needle)
+    {
+        if (!needle.length || hay.length < needle.length)
+            return false;
+        foreach (i; 0 .. hay.length - needle.length + 1)
+        {
+            if (hay[i .. i + needle.length] != needle)
+                continue;
+            if (i > 0 && isWordChar(hay[i - 1]))
+                continue;
+            if (i + needle.length < hay.length && isWordChar(hay[i + needle.length]))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    foreach (i, t; toks)
+    {
+        if (t.v != TOK.traits && t.v != TOK.mixin_ && t.v != TOK.is_)
+            continue;
+        if (i + 1 >= toks.length || toks[i + 1].v != TOK.leftParenthesis)
+            continue;
+        // A member-enumerating trait is risky regardless of any name.
+        if (t.v == TOK.traits && i + 2 < toks.length && toks[i + 2].s.length)
+        {
+            auto tr = toks[i + 2].s;
+            if (tr == "allMembers" || tr == "derivedMembers")
+                return true;
+        }
+        // Scan the parenthesised region for the target name (identifier or
+        // string literal). Dynamic mixins/traits with no literal also count.
+        size_t depth = 0;
+        bool sawString = false;
+        for (size_t j = i + 1; j < toks.length; j++)
+        {
+            auto v = toks[j].v;
+            if (v == TOK.leftParenthesis)
+            {
+                depth++;
+                continue;
+            }
+            if (v == TOK.rightParenthesis)
+            {
+                depth--;
+                if (depth == 0)
+                    break;
+                continue;
+            }
+            if (j == i + 1)
+                continue;
+            if (toks[j].s.length)
+            {
+                if (v == TOK.string_)
+                    sawString = true;
+                if (toks[j].s == name || wordIn(toks[j].s, name))
+                    return true;
+            }
+        }
+        // A `mixin(...)`/`is(...)` whose argument is not a string literal can
+        // generate code we cannot inspect; treat it as risky.
+        if (t.v == TOK.mixin_ && !sawString)
+            return true;
+    }
+    return false;
+}
+
+private bool isWordChar(char c) pure nothrow @nogc @safe
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
 // Fingerprint of a source's significant tokens (comments and whitespace are
 // not tokens). Two texts with the same fingerprint differ only in trivia, so
 // re-analysis can be skipped; unlike stripping whitespace/comments by hand,

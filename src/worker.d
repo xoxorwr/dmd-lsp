@@ -28,11 +28,10 @@ import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
     isAggregateMember;
 
-import lexutil : ScanOut, scanIdents;
 import lint;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
-    dmdHasUnloadedImport, dmdIsPlainIdentifier;
+    dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
 
 import dmd.dmodule : Module;
 
@@ -738,16 +737,6 @@ private bool containsWord(const(char)[] text, const(char)[] word)
     return false;
 }
 
-// True when `text` contains constructs that can synthesise references dmd's
-// resolved AST cannot see (string mixins, reflective __traits). Such a module
-// makes a reference set incomplete.
-private bool hasRiskyConst(const(char)[] text, Arena* a)
-{
-    ScanOut so;
-    scanIdents(a, text, 1, so);
-    return !so.ok || so.riskyMixin || so.riskyTraits;
-}
-
 // One references computation: in-universe target resolution plus per-candidate
 // importer analysis, with completeness. Shared by references and rename.
 struct RefResult
@@ -889,7 +878,7 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
             if (!reason.length)
                 reason = "semantic errors in " ~ mn;
         }
-        if (riskyMatters && hasRiskyConst(text, &s.scratch))
+        if (riskyMatters && dmdHasHiddenRefRisk(text, ident))
         {
             complete = false;
             if (!reason.length)

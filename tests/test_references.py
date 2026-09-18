@@ -337,6 +337,29 @@ check('callee-not-located-in-comment',
       sorted(l for (_, l, _, _) in crefs2) == [1, 4], str(crefs2))
 d.close()
 
+# Uses inside expression kinds that a hand-rolled walk tends to miss:
+# array/associative-array/struct literals and casts.
+lit = ('module lit;\n'
+       'int a;\n'
+       'struct S { int v; }\n'
+       'void f()\n{\n'
+       '    auto arr = [a, a + 1];\n'
+       '    auto aa = ["k": a];\n'
+       '    S s = S(a);\n'
+       '    auto c = cast(int) a;\n'
+       '}\n')
+litp = os.path.join(root, 'lit.d')
+open(litp, 'w').write(lit)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(litp, lit)
+d.drain(1.0)
+lrefs = fmt(d.references(litp, 1, 4, True))
+check('literal-uses-found',
+      sorted(l for (_, l, _, _) in lrefs) == [1, 5, 5, 6, 7, 8], str(lrefs))
+d.close()
+
 # Function parameters resolve like locals (declaration + both uses).
 par = ('module par;\n'
        'void f(int alpha)\n{\n'
