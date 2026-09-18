@@ -21,6 +21,11 @@ MAIN = '''module main;
 
 import mod;
 
+void on_ref(ref Event arg)
+{
+    ar
+}
+
 void on_event()
 {
     EventType.
@@ -214,6 +219,14 @@ ail = line_of('arr2[0].')
 labels = complete(ail, len(lines[ail]))
 check('array-index-element-members',
       'type' in labels and 'consumed' in labels, str(sorted(set(labels))[:8]))
+
+# 9) A `ref` parameter must show its storage class: `ref Event`, not `Event`.
+rl = line_of('void on_ref')
+el = rl + 2  # the `    ar` line
+items = complete_items(el, len(lines[el]))
+aitem = next((i for i in items if i['label'] == 'arg'), None)
+desc = aitem and aitem.get('labelDetails', {}).get('description')
+check('ref-param-type-display', desc == 'ref Event', str(desc))
 
 proc.stdin.close()
 proc.wait(timeout=5)

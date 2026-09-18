@@ -23,7 +23,7 @@ import dmd.arraytypes : Dsymbols;
 import dmd.attrib : ConditionalDeclaration;
 import dmd.dsymbol : DSYM;
 import dmd.mtype : Type, TypePointer, TypeFunction;
-import dmd.astenums : TY, VarArg;
+import dmd.astenums : TY, VarArg, STC;
 import dmd.typesem : nextOf, toBasetype;
 import dmd.dsymbolsem : toAlias;
 import dmd.init : Initializer;
@@ -59,7 +59,7 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
     }
     if (auto vd = s.isVarDeclaration())
     {
-        labelDesc = typeDetail(vd.type); // caller arena-dups
+        labelDesc = typeTextWithStorage(vd); // caller arena-dups
         if (labelDesc.length)
             return;
     }
@@ -210,6 +210,38 @@ private const(char)[] typeDetail(Type t)
         return null;
     import core.stdc.string : strlen;
     return p[0 .. strlen(p)];
+}
+
+// Storage classes that read as part of a declaration but are not part of its
+// `Type` (`ref`, `out`, `lazy`, `scope`, `return`, `in`). A parameter must show
+// its spelling: `ref int arg` is not `int arg`.
+private string storagePrefixStr(ulong stc)
+{
+    string p;
+    if (stc & STC.return_)
+        p ~= "return ";
+    if ((stc & STC.scope_) && !(stc & STC.in_))
+        p ~= "scope ";
+    if (stc & STC.in_)
+        p ~= "in ";
+    if (stc & STC.lazy_)
+        p ~= "lazy ";
+    if (stc & STC.out_)
+        p ~= "out ";
+    else if (stc & STC.ref_)
+        p ~= "ref ";
+    return p;
+}
+
+// A variable/parameter's source spelling for completion detail: storage
+// prefix + type, e.g. `ref int`.
+private const(char)[] typeTextWithStorage(VarDeclaration vd)
+{
+    if (!vd)
+        return null;
+    auto t = typeDetail(vd.type);
+    auto p = storagePrefixStr(vd.storage_class);
+    return p.length ? (p ~ t) : t;
 }
 
 private const(char)[] docOf(Dsymbol s)
@@ -1032,7 +1064,9 @@ private void synFunc(FuncDeclaration fd, uint depth)
                     {
                         fn.params ~= p.ident.toString().idup;
                         fn.paramTypes ~= identTypeName(p.type);
-                        fn.paramTypeTexts ~= typeTextOf(p.type);
+                        auto pdisp = typeTextOf(p.type);
+                        auto sp = storagePrefixStr(p.storageClass);
+                        fn.paramTypeTexts ~= sp.length ? (sp ~ pdisp).idup : pdisp;
                     }
                 }
         }
@@ -1166,10 +1200,10 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
         return;
     if (nm in seen)
     {
-        replaceLocalType(a, o, nm, typeDetail(vd.type));
+        replaceLocalType(a, o, nm, typeTextWithStorage(vd));
         return;
     }
-    pushItem(a, o, nm, 6, typeDetail(vd.type), docOf(vd), "0", seen, vd);
+    pushItem(a, o, nm, 6, typeTextWithStorage(vd), docOf(vd), "0", seen, vd);
 }
 
 private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, uint cursorLine,
