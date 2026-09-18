@@ -448,6 +448,36 @@ check('mixin-generated-decl-excluded',
       mixrefs == [('main_test.d', 15, 9, 19)], str(mixrefs))
 d.close()
 
+# A qualified static member access: dmd resolves `Camera.ortho` to a direct
+# `VarExp(ortho)` whose loc is the *qualifier*, dropping the scope node. Both
+# the type qualifier and the member must still be found.
+qual = ('module qual;\n'
+        'struct Camera { static Camera ortho(); }\n'
+        'void f() { auto c = Camera.ortho(); }\n')
+qp = os.path.join(root, 'qual.d')
+open(qp, 'w').write(qual)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(qp, qual)
+d.drain(1.0)
+# `Camera` declaration -> includes the qualifier in `Camera.ortho()`
+crefs = fmt(d.references(qp, 1, 7, True))
+check('qualified-static-type',
+      ('qual.d', 1, 7, 13) in crefs and ('qual.d', 2, 20, 26) in crefs,
+      str(crefs))
+# `ortho` declaration -> includes the call site member
+orefs = fmt(d.references(qp, 1, 30, True))
+check('qualified-static-member',
+      ('qual.d', 1, 30, 35) in orefs and ('qual.d', 2, 27, 32) in orefs,
+      str(orefs))
+# cursor on the qualifier resolves to the type
+r = d.prepare(qp, 2, 20)
+check('qualified-static-prepare',
+      r.get('result') and r['result']['placeholder'] == 'Camera',
+      str(r.get('result')))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

@@ -318,6 +318,28 @@ else:
     check('rename-type-annotations', False, str(r)[:200])
 d.close()
 
+# Qualified static access: renaming the type must rewrite the qualifier too.
+QUAL = ('module qual2;\n'
+        'struct Camera { static Camera ortho(); }\n'
+        'void f() { auto c = Camera.ortho(); }\n')
+qup = os.path.join(root, 'qual2.d')
+open(qup, 'w').write(QUAL)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(qup, QUAL)
+d.drain(1.0)
+r = d.rename(qup, 1, 7, 'Lens')
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {qup: QUAL})
+    check('rename-qualified-static',
+          new[qup] == ('module qual2;\n'
+                       'struct Lens { static Lens ortho(); }\n'
+                       'void f() { auto c = Lens.ortho(); }\n'), repr(new[qup]))
+else:
+    check('rename-qualified-static', False, str(r)[:200])
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

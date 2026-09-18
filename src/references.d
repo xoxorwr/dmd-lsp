@@ -773,21 +773,53 @@ private bool isTarget(Dsymbol sym, Dsymbol target)
     return sameTarget(sym, target);
 }
 
+// True when the source at `loc` spells `ident`. When the text is unavailable
+// (unlikely in a walk) it returns true so callers take the normal path.
+private bool useSpells(Loc loc, Identifier ident)
+{
+    if (!ident)
+        return false;
+    ensureRefText();
+    if (!g_refText.length)
+        return true;
+    return textSpells(g_refText, loc.linnum(), loc.charnum(), ident.toString());
+}
+
+private void emitAt(uint line, uint col, Dsymbol sym, Dsymbol target,
+    ref RefLoc[] out_)
+{
+    if (line < 1 || !sym || !sym.ident)
+        return;
+    if (g_collect)
+    {
+        g_hits ~= Hit(line, col, sym);
+        return;
+    }
+    if (!isTarget(sym, target))
+        return;
+    recordPos(line, col, sym.ident, out_);
+}
+
 private void emitUse(Loc recv, Dsymbol sym, Dsymbol target, ref RefLoc[] out_,
     bool member = false)
 {
     if (!sym)
         return;
-    if (g_collect)
+    // dmd sometimes resolves a qualified access to the member directly and
+    // keeps the *scope* in `loc` (e.g. `Type.staticMember` becomes a
+    // `VarExp(member)` whose loc is `Type`, with no scope node). The scope is
+    // the member's parent, so emit it at `loc`, then locate the member after
+    // the `.`.
+    if (!member && sym.ident && sym.parent && sym.parent.ident &&
+        !useSpells(recv, sym.ident) && useSpells(recv, sym.parent.ident))
     {
-        auto p = usePos(recv, sym, member);
-        g_hits ~= Hit(p.line, p.col, sym);
+        emitUse(recv, sym.parent, target, out_, false);
+        auto mp = usePos(recv, sym, true);
+        emitAt(mp.line, mp.col, sym, target, out_);
         return;
     }
-    if (!isTarget(sym, target))
-        return;
     auto p = usePos(recv, sym, member);
-    recordPos(p.line, p.col, sym.ident, out_);
+    emitAt(p.line, p.col, sym, target, out_);
 }
 
 private void emitDecl(Loc loc, Dsymbol d, Dsymbol target, bool includeDecl,
