@@ -34,6 +34,10 @@ it falls back to the cached binary. Disable with `dmdLsp.autoUpdate`
 | `dmdLsp.stringImportPaths` | String import paths (`-J`) |
 | `dmdLsp.flags` | Extra dmd flags, e.g. `-preview=rvaluerefparam` |
 | `dmdLsp.debounceMs` | Diagnostics idle delay (default 300) |
+| `dmdLsp.autoCloseBrackets` | Auto-close brackets/quotes while typing (default true) |
+
+Comment toggling (`Ctrl+/`, `Shift+Alt+A`) and bracket pairs come from the
+bundled `language-configuration.json`.
 
 Project defaults belong in `dls.json` at the workspace root; it is read by
 the server and overrides these per-run.

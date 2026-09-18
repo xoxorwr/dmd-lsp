@@ -9,7 +9,49 @@ import { createDlsJson } from './config';
 
 let client: LanguageClient | undefined;
 
+// The static language-configuration.json gives the defaults (comment toggling,
+// bracket pairs); this re-applies it at runtime so `dmdLsp.autoCloseBrackets`
+// can turn auto-closing off without touching VS Code's own `editor.*` settings.
+// `notIn` is plain strings in the JSON config; pass them through unchanged
+// (older VS Code has no runtime SyntaxTokenType enum).
+function notIn(...tokens: string[]): vscode.SyntaxTokenType[] {
+  return tokens as unknown as vscode.SyntaxTokenType[];
+}
+
+function applyLanguageConfiguration(): void {
+  const autoClose = vscode.workspace
+    .getConfiguration('dmdLsp')
+    .get<boolean>('autoCloseBrackets', true);
+  const pairs: vscode.AutoClosingPair[] = [
+    { open: '{', close: '}' },
+    { open: '[', close: ']' },
+    { open: '(', close: ')' },
+    { open: '"', close: '"', notIn: notIn('string', 'comment') },
+    { open: "'", close: "'", notIn: notIn('string', 'comment') },
+    { open: '`', close: '`', notIn: notIn('string', 'comment') },
+    { open: '/*', close: ' */', notIn: notIn('string') },
+  ];
+  vscode.languages.setLanguageConfiguration('d', {
+    comments: { lineComment: '//', blockComment: ['/*', '*/'] },
+    brackets: [
+      ['{', '}'],
+      ['[', ']'],
+      ['(', ')'],
+    ],
+    autoClosingPairs: autoClose ? pairs : [],
+  });
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  applyLanguageConfiguration();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('dmdLsp.autoCloseBrackets')) {
+        applyLanguageConfiguration();
+      }
+    }),
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('dmdLsp.createConfig', async () => {
       const created = await createDlsJson();

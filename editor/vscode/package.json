@@ -37,7 +37,8 @@
         "extensions": [
           ".d",
           ".di"
-        ]
+        ],
+        "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
@@ -88,6 +89,11 @@
           "type": "number",
           "default": 500,
           "description": "Diagnostics idle delay in milliseconds."
+        },
+        "dmdLsp.autoCloseBrackets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically close brackets and quotes while typing."
         }
       }
     }
