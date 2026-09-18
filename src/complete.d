@@ -91,6 +91,17 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
                 labelDetail = arenaDupStr(a, cast(string) tp ~ fp);
             else
                 labelDetail = tp.length ? tp : fp;
+            // Show the constraint text so the user can judge applicability.
+            // It is not evaluated: filtering would require instantiating the
+            // template (semantic side effects) that completion must not do.
+            if (td.constraint)
+            {
+                import core.stdc.string : strlen;
+                const(char)* cp = td.constraint.toChars();
+                if (cp)
+                    labelDetail = arenaDupStr(a, cast(string) labelDetail
+                        ~ " if (" ~ cp[0 .. strlen(cp)] ~ ")");
+            }
             labelDesc = rt;
             return;
         }
@@ -162,14 +173,15 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
     o.items[o.nitems++] = LspCompletionItem(ls, kind, ds, dc, ss, ld, lx);
 }
 
-// Append an origin marker to a label's detail, e.g. `int (alias this)`.
+// Prefix a label's detail with its origin marker, e.g. `(alias this) int`. The
+// marker comes first so the type text is not pushed around by it.
 private const(char)[] withMarker(const(char)[] s, const(char)[] marker)
 {
     if (!marker.length)
         return s;
     if (!s.length)
         return marker;
-    return cast(const(char)[]) (cast(string) s ~ " (" ~ marker ~ ")");
+    return cast(const(char)[]) ("(" ~ marker ~ ") " ~ cast(string) s);
 }
 
 private const(char)[] arenaDupStr(Arena* a, const(char)[] s)

@@ -17,6 +17,8 @@ struct Vec2 { int width; int height; }
 struct Inner { int promoted; }
 struct Wrapper { Inner inner; alias inner this; }
 
+T fourBytes(T)(T x) if (T.sizeof == 4) { return x; }
+
 Event make_event() { return Event.init; }
 '''
 
@@ -131,6 +133,11 @@ void on_array_index()
 {
     Event[] arr2;
     arr2[0].
+}
+
+void on_template()
+{
+    four
 }
 '''
 
@@ -322,6 +329,16 @@ check('alias-this-completion',
       and (own.get('labelDetails') or {}).get('description') == 'Inner'
       and 'alias this' in ((prom.get('labelDetails') or {}).get('description') or ''),
       str(sorted(set(labels))[:12]))
+
+# 15) A constrained template shows its constraint text (it is not evaluated:
+# filtering would need instantiation).
+tl = line_of('    four')
+items = complete_items(tl, len(lines[tl]))
+titem = next((i for i in items if i['label'] == 'fourBytes'), None)
+check('template-constraint-shown',
+      titem is not None
+      and 'if (' in ((titem.get('labelDetails') or {}).get('detail') or ''),
+      str(titem))
 
 proc.stdin.close()
 proc.wait(timeout=5)
