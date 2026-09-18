@@ -316,6 +316,27 @@ trace = d.err()
 check('incomplete-marked',
       'complete=0' in trace and 'unloaded import in b' in trace, trace[-200:])
 
+# A plain function call must not be located by scanning forward for a
+# dot-preceded spelling of the name (`obj.target` in a later comment): the
+# callee's own loc is already the identifier.
+cmt = ('module cmt;\n'
+       'void target() {}\n'
+       'void f()\n{\n'
+       '    target();\n'
+       '}\n'
+       '// see obj.target() for details\n')
+cmp_ = os.path.join(root, 'cmt.d')
+open(cmp_, 'w').write(cmt)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(cmp_, cmt)
+d.drain(1.0)
+crefs2 = fmt(d.references(cmp_, 4, 4, True))
+check('callee-not-located-in-comment',
+      sorted(l for (_, l, _, _) in crefs2) == [1, 4], str(crefs2))
+d.close()
+
 # Function parameters resolve like locals (declaration + both uses).
 par = ('module par;\n'
        'void f(int alpha)\n{\n'

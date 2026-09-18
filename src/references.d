@@ -182,6 +182,23 @@ bool sameTarget(Dsymbol a, Dsymbol b)
     return keyMatches(declKey(a), declKey(b));
 }
 
+// True when `d` is a member of an aggregate (struct/class/union), i.e. a name
+// that reflective __traits (allMembers/derivedMembers/getMember) could resolve
+// without a source-level reference. Module-level symbols are not affected by
+// those enumerators, and string mixins are expanded during semantic (their
+// uses are already in the resolved AST), so they are not treated as risky.
+bool isAggregateMember(Dsymbol d)
+{
+    for (Dsymbol p = d ? d.parent : null; p; p = p.parent)
+    {
+        if (p.isModule())
+            return false;
+        if (p.isAggregateDeclaration())
+            return true;
+    }
+    return false;
+}
+
 // A declaration a rename can rewrite in place: has an identifier, a real
 // source span, and a declaring module.
 bool isRenameable(Dsymbol d)
@@ -288,15 +305,26 @@ RefLoc[] mergeRefs(RefLoc[] a, RefLoc[] b)
     return a;
 }
 
-// The declaration symbol under a 1-based (line, col) cursor, resolved from the
-// semantic AST. `text` is the module source (required for member accesses,
-// whose AST node stores the receiver's location, not the member's). Returns
-// null when the body is not semantic'd (collapsed) — the signal that rename
-// must refuse.
-Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
+// A resolved occurrence under the cursor: the symbol plus the real source span
+// of the identifier occurrence (a use site's span, not the declaration's).
+struct Occurrence
 {
+    Dsymbol sym;
+    uint line; // 1-based
+    uint col;  // 1-based
+    uint len;
+}
+
+// The identifier occurrence at a 1-based (line, col) cursor, resolved from the
+// semantic AST. `text` is the module source (required for member accesses,
+// whose AST node stores the receiver's location, not the member's). Returns a
+// null `sym` when the body is not semantic'd (collapsed) — the signal that
+// rename must refuse.
+Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
+{
+    Occurrence occ;
     if (!mod || !mod.members)
-        return null;
+        return occ;
 
     auto savedCollect = g_collect;
     auto savedHits = g_hits;
@@ -314,7 +342,6 @@ Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
     foreach (i; 0 .. (*mod.members).length)
         walkDecl((*mod.members)[i], null, false, dummy);
 
-    Dsymbol best;
     foreach (h; g_hits)
     {
         if (!h.sym || !h.sym.ident)
@@ -327,7 +354,10 @@ Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
         {
             if (!spanVerified(h.line, h.col, h.sym.ident))
                 continue; // generated symbol: not really at this position
-            best = h.sym;
+            occ.sym = h.sym;
+            occ.line = h.line;
+            occ.col = h.col;
+            occ.len = len;
             break;
         }
     }
@@ -337,7 +367,13 @@ Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
     g_refFile = savedFile;
     g_refText = savedText;
     g_refTextSet = savedSet;
-    return best;
+    return occ;
+}
+
+// The resolved declaration symbol under the cursor (see `occurrenceAt`).
+Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
+{
+    return occurrenceAt(mod, line, col, text).sym;
 }
 
 // Same identifier can be reached twice (e.g. a call's callee via both the
@@ -537,11 +573,20 @@ private bool spanVerified(uint line, uint col, Identifier ident)
     auto name = ident.toString();
     if (!name.length)
         return true;
-    size_t off = refOffset(g_refText, line, col);
-    if (off + name.length > g_refText.length)
+    return textSpells(g_refText, line, col, name);
+}
+
+// True when `text` at 1-based (line, col) spells `name` exactly. Used to reject
+// synthetic/generated spans and to detect edits computed against stale bytes.
+bool textSpells(const(char)[] text, uint line, uint col, const(char)[] name)
+{
+    if (line < 1 || col < 1 || !name.length || !text.length)
+        return false;
+    size_t off = refOffset(text, line, col);
+    if (off + name.length > text.length)
         return false;
     foreach (k; 0 .. name.length)
-        if (g_refText[off + k] != name[k])
+        if (text[off + k] != name[k])
             return false;
     return true;
 }
@@ -573,13 +618,15 @@ private struct RefPos
 }
 
 // dmd stores a member access' receiver location in `DotVarExp.loc`, not the
-// member's. Locate the member identifier as the first whole-word occurrence of
-// `ident` after the receiver that is preceded (ignoring spaces/tabs) by a `.`.
-// Falls back to the receiver location when the text is unavailable.
-private RefPos usePos(Loc recv, Dsymbol sym)
+// member's. For member-access nodes (`member` true) locate the member
+// identifier as the first whole-word occurrence of `ident` after the receiver
+// that is preceded (ignoring spaces/tabs) by a `.`. Plain identifier uses
+// already carry the identifier's own location and must not be scanned (a later
+// `.name` in a comment/other code would otherwise be latched onto).
+private RefPos usePos(Loc recv, Dsymbol sym, bool member)
 {
     RefPos r = RefPos(recv.linnum(), recv.charnum());
-    if (!sym || !sym.ident)
+    if (!member || !sym || !sym.ident)
         return r;
     ensureRefText();
     if (!g_refText.length)
@@ -639,19 +686,20 @@ private bool isTarget(Dsymbol sym, Dsymbol target)
     return sameTarget(sym, target);
 }
 
-private void emitUse(Loc recv, Dsymbol sym, Dsymbol target, ref RefLoc[] out_)
+private void emitUse(Loc recv, Dsymbol sym, Dsymbol target, ref RefLoc[] out_,
+    bool member = false)
 {
     if (!sym)
         return;
     if (g_collect)
     {
-        auto p = usePos(recv, sym);
+        auto p = usePos(recv, sym, member);
         g_hits ~= Hit(p.line, p.col, sym);
         return;
     }
     if (!isTarget(sym, target))
         return;
-    auto p = usePos(recv, sym);
+    auto p = usePos(recv, sym, member);
     recordPos(p.line, p.col, sym.ident, out_);
 }
 
@@ -882,7 +930,7 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
     if (auto ve = e.isVarExp())
         emitUse(e.loc, ve.var, target, out_);
     else if (auto dv = e.isDotVarExp())
-        emitUse(e.loc, dv.var, target, out_);
+        emitUse(e.loc, dv.var, target, out_, true);
     else if (auto so = e.isSymOffExp())
         emitUse(e.loc, so.var, target, out_);
     else if (auto ca = e.isCallExp())
@@ -891,7 +939,7 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
         // function only in `ca.f` (templates/qualified), so record at the
         // callee identifier too. Dedupe folds the two paths.
         if (ca.f && ca.e1)
-            emitUse(ca.e1.loc, ca.f, target, out_);
+            emitUse(ca.e1.loc, ca.f, target, out_, isMemberExpr(ca.e1));
         walkExpr(ca.e1, target, out_);
         if (ca.arguments)
             foreach (a; *ca.arguments)
@@ -924,13 +972,13 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
         emitUse(e.loc, te.td, target, out_);
     else if (auto dte = e.isDotTemplateExp())
     {
-        emitUse(e.loc, dte.td, target, out_);
+        emitUse(e.loc, dte.td, target, out_, true);
         walkExpr(dte.e1, target, out_);
         return;
     }
     else if (auto dti = e.isDotTemplateInstanceExp())
     {
-        emitUse(e.loc, dti.ti ? dti.ti.tempdecl : null, target, out_);
+        emitUse(e.loc, dti.ti ? dti.ti.tempdecl : null, target, out_, true);
         walkExpr(dti.e1, target, out_);
         return;
     }
@@ -964,6 +1012,14 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
         walkExpr(u.e1, target, out_);
         return;
     }
+}
+
+// True for expressions whose resolved name is a member identifier following a
+// `.` (so the AST node carries the receiver's location, not the member's).
+private bool isMemberExpr(Expression e)
+{
+    return e && (e.isDotVarExp() || e.isDotTemplateInstanceExp() ||
+        e.isDotTemplateExp());
 }
 
 // The Dsymbol a type expression denotes (struct/class/enum/instance).
