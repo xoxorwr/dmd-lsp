@@ -203,7 +203,7 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
             return true;
         if (r == worker.ExchangeResult.failed || r == worker.ExchangeResult.respawn)
         {
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         return false;
@@ -229,7 +229,7 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
             // Respawn the worker.
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -256,7 +256,7 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
             // Respawn the worker.
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -283,7 +283,7 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
             // Respawn the worker.
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -310,7 +310,7 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
             // Respawn the worker.
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -336,7 +336,7 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -364,13 +364,117 @@ private bool workerReferencesRetry(App* app, const(char)[] path,
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
             continue;
         return false;
     }
+    return false;
+}
+
+// Run a prepareRename request against the worker, respawning once if needed.
+private bool workerPrepareRenameRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref worker.WPrep prep)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerPrepareRename(app.wk, path, atext, origText, line, col,
+            prep);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// Run a rename request against the worker, respawning once if needed.
+private bool workerRenameRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] newName, ref worker.WRename res)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerRename(app.wk, path, atext, origText, line, col, newName,
+            res);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// A file is inside the project when it lives under the workspace root or one
+// of the project's declared import paths (never the builtin stdlib defaults).
+private bool pathUnder(const(char)[] file, const(char)[] root)
+{
+    if (!file.length || !root.length)
+        return false;
+    string f = absolutePath(file);
+    string r = absolutePath(root);
+    if (f == r)
+        return true;
+    if (r.length && r[$ - 1] != '/' && r[$ - 1] != '\\')
+        r ~= "/";
+    if (f.length < r.length)
+        return false;
+    foreach (i; 0 .. r.length)
+    {
+        char a = f[i];
+        char b = r[i];
+        version (Windows)
+        {
+            if (a == '\\')
+                a = '/';
+            if (b == '\\')
+                b = '/';
+            if (a >= 'A' && a <= 'Z')
+                a = cast(char)(a + 32);
+            if (b >= 'A' && b <= 'Z')
+                b = cast(char)(b + 32);
+        }
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+private bool inProject(App* app, const(char)[] file)
+{
+    if (app.root.length && pathUnder(file, app.root))
+        return true;
+    foreach (r; app.baseImports)
+        if (pathUnder(file, r))
+            return true;
+    foreach (r; app.fileCfg.imports)
+        if (pathUnder(file, r))
+            return true;
     return false;
 }
 
@@ -387,7 +491,7 @@ private bool workerBuildIndexRetry(App* app, string[] files)
         }
         if (workerBuildIndex(app.wk, files) == worker.ExchangeResult.ok)
             return true;
-        workerKill(app.wk);
+        dropWorker(app);
     }
     return false;
 }
@@ -405,14 +509,26 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
         auto r = workerWorkspaceSymbol(app.wk, query, syms);
         if (r == worker.ExchangeResult.ok)
             return true;
-        workerKill(app.wk);
+        dropWorker(app);
     }
     return false;
+}
+
+// Kill the worker and drop state that lived only in it. The workspace index is
+// per-process: a respawned worker starts with none, so a stale `indexBuilt`
+// would make later requests skip the rebuild and see an empty module map
+// ("declaring module not indexed").
+private void dropWorker(App* app)
+{
+    workerKill(app.wk);
+    app.indexBuilt = false;
 }
 
 // Build the workspace index once per worker/config generation.
 private bool ensureIndex(App* app)
 {
+    if (!app.wk.alive)
+        app.indexBuilt = false; // silent crash: the fresh worker has no index
     if (app.indexBuilt)
         return true;
     if (!app.root.length)
@@ -476,7 +592,7 @@ private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] tex
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            workerKill(app.wk);
+            dropWorker(app);
             continue;
         }
         if (!app.wk.alive)
@@ -1461,6 +1577,9 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "documentSymbolProvider", true);
         js.add_bool_to_object(caps, "workspaceSymbolProvider", true);
+        auto rp = js.create_object();
+        js.add_bool_to_object(rp, "prepareProvider", true);
+        js.add_item_to_object(caps, "renameProvider", rp);
         js.add_bool_to_object(caps, "codeActionProvider", true);
         auto legend = js.create_object();
         auto tt = js.create_array();
@@ -1747,6 +1866,146 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             else
                 lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/prepareRename")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            worker.WPrep prep;
+            if (!workerPrepareRenameRetry(app, path, atext, text, line, col, prep)
+                || !prep.ok || !inProject(app, path))
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            auto js = jmake();
+            uint sline = prep.line > 0 ? prep.line - 1 : 0;
+            uint scol = prep.col > 0 ? prep.col - 1 : 0;
+            auto range = js.create_object();
+            auto st = js.create_object();
+            js.add_number_to_object(st, "line", sline);
+            js.add_number_to_object(st, "character", scol);
+            auto en = js.create_object();
+            js.add_number_to_object(en, "line", sline);
+            js.add_number_to_object(en, "character", scol + prep.len);
+            js.add_item_to_object(range, "start", st);
+            js.add_item_to_object(range, "end", en);
+            auto res = js.create_object();
+            js.add_item_to_object(res, "range", range);
+            js.add_string_to_object(res, "placeholder", zstr(prep.name));
+            lspRespond(m.idJson, printJsonStr(res));
+            return;
+        }
+        if (m.method == "textDocument/rename")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            auto newName = jstr(jget(p, "newName"));
+            if (uri is null || newName is null)
+            {
+                lspRespondError(m.idJson, -32602, "invalid rename request");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespondError(m.idJson, -32803, "no source text");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            ensureIndex(app); // completeness needs the import graph
+            worker.WRename rn;
+            if (!workerRenameRetry(app, path, atext, text, line, col, newName, rn))
+            {
+                lspRespondError(m.idJson, -32803, "rename failed");
+                return;
+            }
+            if (!rn.ok)
+            {
+                lspRespondError(m.idJson, -32803,
+                    rn.reason.length ? rn.reason : "cannot rename");
+                return;
+            }
+            if (!rn.declFile.length || !inProject(app, rn.declFile))
+            {
+                lspRespondError(m.idJson, -32803,
+                    "declaration is outside the workspace");
+                return;
+            }
+            foreach (e; rn.edits)
+                if (!inProject(app, e.file))
+                {
+                    lspRespondError(m.idJson, -32803,
+                        "reference outside the workspace");
+                    return;
+                }
+            auto js = jmake();
+            auto changes = js.create_object();
+            bool[string] seenFile;
+            string[] files;
+            foreach (e; rn.edits)
+                if (e.file !in seenFile)
+                {
+                    seenFile[e.file] = true;
+                    files ~= e.file;
+                }
+            foreach (f; files)
+            {
+                auto arr = js.create_array();
+                foreach (e; rn.edits)
+                {
+                    if (e.file != f)
+                        continue;
+                    uint sline = e.line > 0 ? e.line - 1 : 0;
+                    uint scol = e.col > 0 ? e.col - 1 : 0;
+                    auto edit = js.create_object();
+                    auto range = js.create_object();
+                    auto st = js.create_object();
+                    js.add_number_to_object(st, "line", sline);
+                    js.add_number_to_object(st, "character", scol);
+                    auto en = js.create_object();
+                    js.add_number_to_object(en, "line", sline);
+                    js.add_number_to_object(en, "character", scol + e.len);
+                    js.add_item_to_object(range, "start", st);
+                    js.add_item_to_object(range, "end", en);
+                    js.add_item_to_object(edit, "range", range);
+                    js.add_string_to_object(edit, "newText", zstr(newName));
+                    js.add_item_to_array(arr, edit);
+                }
+                js.add_item_to_object(changes, zstr(pathToUri(f)), arr);
+            }
+            auto res = js.create_object();
+            js.add_item_to_object(res, "changes", changes);
+            lspRespond(m.idJson, printJsonStr(res));
             return;
         }
         if (m.method == "workspace/symbol")
@@ -2107,7 +2366,7 @@ private void refreshImports(App* app)
         // differently under the new paths, so drop the cache too.
         app.tokCache = null;
         app.tokHash = null;
-        workerKill(app.wk);
+        dropWorker(app);
     }
 }
 
@@ -2207,7 +2466,7 @@ int main(string[] args)
     version (Posix)
         signal(SIGPIPE, SIG_IGN); // client may close stdout
     scope (exit)
-        workerKill(app.wk);
+        dropWorker(&app);
     app.lastMsgMs = nowMs();
     version (Posix)
     {

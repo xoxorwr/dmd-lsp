@@ -435,6 +435,28 @@ bool dmdRootHasImporters(void* modp)
     return false;
 }
 
+// True when `s` is a single D identifier (and not a keyword). Uses the
+// frontend lexer so the keyword set stays in sync.
+bool dmdIsPlainIdentifier(const(char)[] s)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    if (!s.length)
+        return false;
+    auto buf = s.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    Token tok;
+    lex.scan(&tok);
+    if (tok.value != TOK.identifier)
+        return false;
+    Token t2;
+    lex.scan(&t2);
+    return t2.value == TOK.endOfFile;
+}
+
 // Fingerprint of a source's significant tokens (comments and whitespace are
 // not tokens). Two texts with the same fingerprint differ only in trivia, so
 // re-analysis can be skipped; unlike stripping whitespace/comments by hand,

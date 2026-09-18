@@ -93,6 +93,7 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_field_scope.py
 	python3 tests/test_symbols.py
 	python3 tests/test_references.py
+	python3 tests/test_rename.py
 	python3 tests/test_workspace_symbols.py
 	python3 tests/test_recovery_scope.py
 	python3 tests/test_realworld.py

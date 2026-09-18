@@ -25,13 +25,14 @@ import complete;
 import symbols : DocSymbol, documentSymbols;
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
-    mergeRefs, resolvedSymbolAt;
+    mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
+    isAggregateMember;
 
 import lexutil : ScanOut, scanIdents;
 import lint;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
-    dmdHasUnloadedImport;
+    dmdHasUnloadedImport, dmdIsPlainIdentifier;
 
 import dmd.dmodule : Module;
 
@@ -747,45 +748,69 @@ private bool hasRiskyConst(const(char)[] text, Arena* a)
     return !so.ok || so.riskyMixin || so.riskyTraits;
 }
 
-private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
+// One references computation: in-universe target resolution plus per-candidate
+// importer analysis, with completeness. Shared by references and rename.
+struct RefResult
+{
+    bool found; // target resolved
+    RefLoc[] refs;
+    bool complete = true;
+    string reason;
+    string oldName; // target identifier (for the stale-source check)
+    string declFile; // declaring file (workspace policy)
+}
+
+private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     const(char)[] path, const(char)[] orig, uint line, uint col,
     bool includeDecl)
 {
     import core.stdc.string : strlen;
     import timing : nowMs, traceMs;
 
-    ulong tStart = nowMs();
-
+    ulong tComputeStart = nowMs();
+    RefResult r;
     auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
-    if (!target || isLocalDsymbol(target))
+    if (!target)
     {
-        RefLoc[] r0;
-        if (target)
-            r0 = findReferences(cast(Module)a.module_, target, includeDecl,
-                path, orig);
-        sendReferences(r0);
-        return;
+        r.complete = false;
+        r.reason = "no symbol";
+        return r;
+    }
+    r.found = true;
+    r.oldName = target.ident ? target.ident.toString().idup : "";
+    const(char)* df = target.loc.filename();
+    r.declFile = df ? df[0 .. strlen(df)].idup : null;
+    // Reflective __traits can only hide a reference to an aggregate member;
+    // module-level symbols and string mixins are covered by the resolved AST.
+    const bool riskyMatters = isAggregateMember(target);
+
+    if (isLocalDsymbol(target))
+    {
+        // A local cannot be referenced from another module: the request
+        // universe is the whole search.
+        r.refs = findReferences(cast(Module)a.module_, target, includeDecl,
+            path, orig);
+        return r;
     }
 
     // The target identity must be copied before any reset invalidates the
     // request universe; matching below is by key only.
     auto key = declKey(target);
-    // In-universe result: covers the request closure and is the fallback for
-    // every failure path (also for local symbols, handled above).
+    // In-universe result: covers the request closure and is the fallback.
     ulong tBase0 = nowMs();
     RefLoc[] base = findReferences(cast(Module)a.module_, target, includeDecl,
         path, orig);
     traceMs("refs.wide.base", nowMs() - tBase0);
 
-    const(char)* df = target.loc.filename();
-    string declFile = df ? df[0 .. strlen(df)].idup : null;
-    string declName = declFile.length ? indexModuleOfFile(declFile) : null;
+    string declName = r.declFile.length ? indexModuleOfFile(r.declFile) : null;
     if (!declName.length)
     {
-        sendReferences(base, false, "declaring module not indexed");
-        return;
+        r.refs = base;
+        r.complete = false;
+        r.reason = "declaring module not indexed";
+        return r;
     }
-    const(char)[] ident = target.ident ? target.ident.toString().idup : null;
+    const(char)[] ident = r.oldName;
 
     // Candidate set: declaring module + request module + every transitive
     // importer, word-prefiltered (cannot contain a use otherwise).
@@ -849,24 +874,164 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
                 reason = "parse failed " ~ mn;
             continue;
         }
-        if (dmdHasUnloadedImport(ca.module_))
+        bool unloaded = dmdHasUnloadedImport(ca.module_);
+        if (unloaded)
         {
             complete = false;
             if (!reason.length)
                 reason = "unloaded import in " ~ mn;
         }
-        if (hasRiskyConst(text, &s.scratch))
+        else if (ca.errors > 0)
+        {
+            // A module that did not analyse cleanly can hide uses inside the
+            // functions dmd collapsed, so the reference set is not exhaustive.
+            complete = false;
+            if (!reason.length)
+                reason = "semantic errors in " ~ mn;
+        }
+        if (riskyMatters && hasRiskyConst(text, &s.scratch))
         {
             complete = false;
             if (!reason.length)
-                reason = "mixin/__traits in " ~ mn;
+                reason = "__traits in " ~ mn;
         }
         out_ ~= referencesForKey([cast(Module) ca.module_], key, includeDecl,
             f, text);
     }
     traceMs("refs.wide.analyze", nowMs() - tAnalyze0, "modules");
-    traceMs("refs.wide.total", nowMs() - tStart);
-    sendReferences(mergeRefs(base, out_), complete, reason);
+    traceMs("refs.wide.total", nowMs() - tComputeStart);
+    r.refs = mergeRefs(base, out_);
+    r.complete = complete;
+    r.reason = reason;
+    return r;
+}
+
+private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] path, const(char)[] orig, uint line, uint col,
+    bool includeDecl)
+{
+    auto r = computeRefs(s, a, path, orig, line, col, includeDecl);
+    sendReferences(r.refs, r.complete, r.reason);
+}
+
+// ---------- rename ----------
+
+private void sendRename(bool ok, const(char)[] reason, const(char)[] declFile,
+    const(RefLoc)[] edits)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_bool_to_object(root, "ok", ok);
+    if (reason.length)
+        js.add_string_to_object(root, "reason", zstr(reason));
+    if (declFile.length)
+        js.add_string_to_object(root, "declFile", zstr(declFile));
+    auto arr = js.create_array();
+    foreach (e; edits)
+    {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "file", zstr(e.file));
+        js.add_number_to_object(o, "line", e.line);
+        js.add_number_to_object(o, "col", e.col);
+        js.add_number_to_object(o, "len", e.len);
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "edits", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+private void sendPrepareRename(bool ok, uint line, uint col, uint len,
+    const(char)[] name, const(char)[] reason)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_bool_to_object(root, "ok", ok);
+    if (ok)
+    {
+        js.add_number_to_object(root, "line", line);
+        js.add_number_to_object(root, "col", col);
+        js.add_number_to_object(root, "len", len);
+        if (name.length)
+            js.add_string_to_object(root, "name", zstr(name));
+    }
+    if (reason.length)
+        js.add_string_to_object(root, "reason", zstr(reason));
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+// Two occurrences of the same identifier cannot overlap unless a producer
+// double-recorded a span. Refuse rather than emit a corrupting edit.
+private bool hasOverlappingEdits(const(RefLoc)[] refs)
+{
+    foreach (i; 0 .. refs.length)
+        foreach (j; i + 1 .. refs.length)
+        {
+            if (refs[i].file != refs[j].file || refs[i].line != refs[j].line)
+                continue;
+            uint a0 = refs[i].col;
+            uint a1 = a0 + refs[i].len;
+            uint b0 = refs[j].col;
+            uint b1 = b0 + refs[j].len;
+            if (a0 < b1 && b0 < a1)
+                return true;
+        }
+    return false;
+}
+
+private void renameAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] path, const(char)[] orig, uint line, uint col,
+    const(char)[] newName)
+{
+    auto occ = occurrenceAt(cast(Module)a.module_, line, col, orig);
+    if (!occ.sym)
+    {
+        sendRename(false, "no symbol under cursor", null, null);
+        return;
+    }
+    if (!isRenameable(occ.sym))
+    {
+        sendRename(false, "not a renameable declaration", null, null);
+        return;
+    }
+    if (!dmdIsPlainIdentifier(newName))
+    {
+        sendRename(false, "invalid identifier", null, null);
+        return;
+    }
+    auto r = computeRefs(s, a, path, orig, line, col, true);
+    if (!r.found)
+    {
+        sendRename(false, r.reason.length ? r.reason : "no symbol", null, null);
+        return;
+    }
+    if (!r.complete)
+    {
+        sendRename(false, r.reason.length ? r.reason : "incomplete",
+            r.declFile, null);
+        return;
+    }
+    // Stale-source guard: every edit's span must still spell the old name.
+    foreach (e; r.refs)
+    {
+        const(char)[] text;
+        if (e.file == path && orig.length)
+            text = orig; // request buffer may be ahead of disk
+        else
+            text = sessionReadDisk(e.file);
+        if (!text.length || !textSpells(text, e.line, e.col, r.oldName))
+        {
+            sendRename(false, "source changed, retry", r.declFile, null);
+            return;
+        }
+    }
+    if (hasOverlappingEdits(r.refs))
+    {
+        sendRename(false, "overlapping edits", r.declFile, null);
+        return;
+    }
+    sendRename(true, null, r.declFile, r.refs);
 }
 
     void workerMain()
@@ -1155,6 +1320,67 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
                     s.scratch.rewind(s.uni.mark);
                 referencesAndSend(s, a, path, orig, line, col, includeDecl);
                 built = true;
+                continue;
+            }
+            if (ops == "prepareRename")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                Analysis a;
+                if (built && st == UniState.reuse)
+                    a = s.uni.analysis;
+                else
+                {
+                    a = serverAnalyze(s, path, atext, orig);
+                    built = true;
+                }
+                auto occ = occurrenceAt(cast(Module)a.module_, line, col, orig);
+                if (!occ.sym || !isRenameable(occ.sym))
+                    sendPrepareRename(false, 0, 0, 0, null, "not renameable");
+                else
+                    sendPrepareRename(true, occ.line, occ.col, occ.len,
+                        occ.sym.ident.toString(), null);
+                continue;
+            }
+            if (ops == "rename")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto newName = jstr(jget(p, "newName"));
+                if (newName is null)
+                    newName = "";
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                Analysis a0;
+                if (built && st == UniState.reuse)
+                    a0 = s.uni.analysis;
+                else
+                {
+                    a0 = serverAnalyze(s, path, atext, orig);
+                    built = true;
+                }
+                if (forkRun(() {
+                    renameAndSend(s, a0, path, orig, line, col, newName);
+                }))
+                    continue;
+                // No fork (Windows) or child failed: run inline and drop the
+                // warm universe (per-candidate analysis resets it).
+                renameAndSend(s, a0, path, orig, line, col, newName);
+                built = false;
                 continue;
             }
             if (ops == "hover")
@@ -1534,6 +1760,26 @@ struct WRefs
     string reason;
 }
 
+// prepareRename result: the identifier occurrence under the cursor.
+struct WPrep
+{
+    bool ok = false;
+    uint line = 0; // 1-based
+    uint col = 0;  // 1-based
+    uint len = 0;
+    string name;
+    string reason;
+}
+
+// rename result: the full edit set (empty on refusal, with `reason`).
+struct WRename
+{
+    bool ok = false;
+    string reason;
+    string declFile; // declaring file (workspace policy)
+    WRef[] edits;
+}
+
 struct WHover
 {
     bool found = false;
@@ -1850,6 +2096,80 @@ ExchangeResult workerReferences(ref Worker w, const(char)[] path,
             out_.refs ~= ref_;
         }
     }
+    return ExchangeResult.ok;
+}
+
+private void parseEdits(JsonNode* r, ref WRef[] out_)
+{
+    out_.length = 0;
+    if (auto arr = jget(r, "edits"))
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WRef e;
+            e.file = dupOrEmpty(jstr(jget(c, "file")));
+            e.line = cast(uint)jint(jget(c, "line"));
+            e.col = cast(uint)jint(jget(c, "col"));
+            e.len = cast(uint)jint(jget(c, "len"));
+            out_ ~= e;
+        }
+}
+
+ExchangeResult workerPrepareRename(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref WPrep out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("prepareRename"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    out_ = WPrep.init;
+    out_.ok = jbool(jget(r, "ok"), false);
+    out_.line = cast(uint)jint(jget(r, "line"));
+    out_.col = cast(uint)jint(jget(r, "col"));
+    out_.len = cast(uint)jint(jget(r, "len"));
+    out_.name = dupOrEmpty(jstr(jget(r, "name")));
+    out_.reason = dupOrEmpty(jstr(jget(r, "reason")));
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerRename(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] newName, ref WRename out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("rename"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    js.add_string_to_object(root, "newName", zstr(newName));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    out_ = WRename.init;
+    out_.ok = jbool(jget(r, "ok"), false);
+    out_.reason = dupOrEmpty(jstr(jget(r, "reason")));
+    out_.declFile = dupOrEmpty(jstr(jget(r, "declFile")));
+    parseEdits(r, out_.edits);
     return ExchangeResult.ok;
 }
 

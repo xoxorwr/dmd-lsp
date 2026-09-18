@@ -27,6 +27,7 @@ Supported LSP methods:
 - signature help: `textDocument/signatureHelp`
 - goto definition: `textDocument/definition`
 - references: `textDocument/references`
+- rename: `textDocument/prepareRename`, `textDocument/rename`
 - document symbols: `textDocument/documentSymbol`
 - workspace symbols: `workspace/symbol`
 - hover: `textDocument/hover` (type + docs)
