@@ -500,6 +500,42 @@ check('qualified-static-prepare',
       str(r.get('result')))
 d.close()
 
+# Enum members are constant-folded during semantic (`Test.A` becomes an
+# IntegerExp typed as the enum, whose loc is the qualifier and whose EnumMember
+# link is gone). The enum type, its members and every `Enum.Member` use must
+# still resolve. The enum type is also recognised before `toBasetype()` (which
+# would unwrap it to the base integer type).
+en = ('module en;\n'
+      'enum Test { A, B, C }\n'
+      'Test t1 = Test.A;\n'
+      'Test t2 = Test.A;\n'
+      'Test t3 = Test.C;\n')
+enp = os.path.join(root, 'en.d')
+open(enp, 'w').write(en)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(enp, en)
+d.drain(1.0)
+erefs = fmt(d.references(enp, 1, 5, True))  # `Test` in the enum declaration
+check('enum-type-refs',
+      erefs == [('en.d', 1, 5, 9), ('en.d', 2, 0, 4), ('en.d', 2, 10, 14),
+                ('en.d', 3, 0, 4), ('en.d', 3, 10, 14), ('en.d', 4, 0, 4),
+                ('en.d', 4, 10, 14)], str(erefs))
+arefs = fmt(d.references(enp, 1, 12, True))  # `A` in the enum declaration
+check('enum-member-refs',
+      arefs == [('en.d', 1, 12, 13), ('en.d', 2, 15, 16), ('en.d', 3, 15, 16)],
+      str(arefs))
+crefs = fmt(d.references(enp, 4, 15, True))  # `C` in `Test.C`
+check('enum-member-use-refs', crefs == [('en.d', 1, 18, 19), ('en.d', 4, 15, 16)],
+      str(crefs))
+r = d.prepare(enp, 2, 15)  # cursor on a folded `Test.A`
+check('enum-member-prepare',
+      r.get('result') and r['result']['placeholder'] == 'A'
+      and r['result']['range']['start'] == {'line': 2, 'character': 15},
+      str(r.get('result')))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

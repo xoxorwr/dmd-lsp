@@ -362,6 +362,41 @@ else:
     check('rename-qualified-static', False, str(r)[:200])
 d.close()
 
+# Enum members are constant-folded (`Test.A` -> IntegerExp); rename must still
+# rewrite the declaration and every `Test.A` use, and the enum type likewise.
+EN2 = ('module en2;\n'
+       'enum Test { A, B, C }\n'
+       'Test t1 = Test.A;\n'
+       'Test t2 = Test.A;\n')
+en2p = os.path.join(root, 'en2.d')
+open(en2p, 'w').write(EN2)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(en2p, EN2)
+d.drain(1.0)
+r = d.rename(en2p, 1, 12, 'X')  # `A` in the enum declaration
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {en2p: EN2})
+    check('rename-enum-member',
+          new[en2p] == ('module en2;\n'
+                        'enum Test { X, B, C }\n'
+                        'Test t1 = Test.X;\n'
+                        'Test t2 = Test.X;\n'), repr(new[en2p]))
+else:
+    check('rename-enum-member', False, str(r)[:200])
+r = d.rename(en2p, 1, 5, 'Color')  # `Test` in the enum declaration
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {en2p: EN2})
+    check('rename-enum-type',
+          new[en2p] == ('module en2;\n'
+                        'enum Color { A, B, C }\n'
+                        'Color t1 = Color.A;\n'
+                        'Color t2 = Color.A;\n'), repr(new[en2p]))
+else:
+    check('rename-enum-type', False, str(r)[:200])
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

@@ -15,15 +15,15 @@ import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
 import dmd.declaration : VarDeclaration, AliasDeclaration;
 import dmd.func : FuncDeclaration;
-import dmd.denum : EnumDeclaration;
+import dmd.denum : EnumDeclaration, EnumMember;
 import dmd.dtemplate : TemplateDeclaration;
 import dmd.expression : Expression, VarExp, DotVarExp, SymOffExp, CallExp,
     NewExp, TypeExp, ScopeExp, FuncExp, TemplateExp, DotTemplateExp,
-    DotTemplateInstanceExp, ThisExp, StructLiteralExp, SliceExp;
+    DotTemplateInstanceExp, ThisExp, StructLiteralExp, SliceExp, IntegerExp;
 import dmd.visitor : SemanticTimeTransitiveVisitor;
 import dmd.dstruct : StructDeclaration, UnionDeclaration;
 import dmd.dclass : ClassDeclaration, InterfaceDeclaration;
-import dmd.mtype : Type;
+import dmd.mtype : Type, TypeEnum;
 import dmd.identifier : Identifier;
 import dmd.location : Loc;
 import dmd.typesem : toBasetype;
@@ -972,6 +972,26 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     // continues dmd's traversal into children.
     override void visit(VarExp e) { use(e.loc, e.var, false); super.visit(e); }
     override void visit(DotVarExp e) { use(e.loc, e.var, true); super.visit(e); }
+
+    // dmd constant-folds an enum member access (`Test.A`) during semantic: the
+    // `VarExp` is replaced by an `IntegerExp` typed as the enum, whose loc is
+    // the *qualifier* (`Test`), and the EnumMember link is lost. Recover both
+    // the enum type (the qualifier) and the member (the identifier after the
+    // dot) from the source. Member values inside the enum declaration are not
+    // uses: their loc spells the member name, not the enum, so they are skipped.
+    override void visit(IntegerExp e)
+    {
+        if (e.type)
+            if (auto te = e.type.isTypeEnum())
+                emitEnumAccess(e.loc, te, target, out_);
+        super.visit(e);
+    }
+
+    override void visit(EnumMember em)
+    {
+        decl(em);
+        super.visit(em);
+    }
     override void visit(SymOffExp e) { use(e.loc, e.var, false); super.visit(e); }
     override void visit(CallExp e)
     {
@@ -1081,11 +1101,15 @@ private bool isMemberExpr(Expression e)
         e.isDotTemplateExp());
 }
 
-// The Dsymbol a type expression denotes (struct/class/enum/instance).
+// The Dsymbol a type expression denotes (struct/class/enum/instance). An enum
+// type must be recognised *before* `toBasetype()` (which unwraps it to its base
+// integer type, hiding the enum).
 private Dsymbol typeSymbol(Type t)
 {
     if (!t)
         return null;
+    if (auto te = t.isTypeEnum())
+        return te.sym;
     Type b = t.toBasetype();
     if (!b)
         return null;
@@ -1099,6 +1123,49 @@ private Dsymbol typeSymbol(Type t)
         if (ti.tempinst)
             return ti.tempinst.tempdecl;
     return null;
+}
+
+// `Test.A` is folded to an `IntegerExp` (see visit(IntegerExp)); recover the
+// enum type at the qualifier and the member after the dot. Only positions whose
+// source actually spells the expected identifier are emitted (recordPos /
+// occurrenceAt verify the span), so unrelated folded enum constants drop out.
+private void emitEnumAccess(Loc qual, TypeEnum te, Dsymbol target,
+    ref RefLoc[] out_)
+{
+    if (!te || !te.sym || !te.sym.ident)
+        return;
+    ensureRefText();
+    if (g_refText.length &&
+        !spellsAtFast(qual.linnum(), qual.charnum(), te.sym.ident.toString()))
+        return; // not an `Enum.member` qualifier (e.g. a member's own value)
+    emitAt(qual.linnum(), qual.charnum(), te.sym, target, out_);
+    if (!g_refText.length)
+        return;
+    size_t i = refOffsetFast(qual.linnum(), qual.charnum());
+    while (i < g_refText.length && g_refText[i] != '.' &&
+        g_refText[i] != '\n' && g_refText[i] != ';')
+        i++;
+    if (i >= g_refText.length || g_refText[i] != '.')
+        return;
+    i++;
+    while (i < g_refText.length && (g_refText[i] == ' ' || g_refText[i] == '\t'))
+        i++;
+    size_t s = i;
+    while (i < g_refText.length && isIdentChar(g_refText[i]))
+        i++;
+    if (i == s || !te.sym.members)
+        return;
+    auto name = g_refText[s .. i];
+    foreach (m; *te.sym.members)
+    {
+        auto em = m ? m.isEnumMember() : null;
+        if (!em || !em.ident || em.ident.toString() != name)
+            continue;
+        uint line, col;
+        offsetLineColFast(s, line, col);
+        emitAt(line, col, em, target, out_);
+        break;
+    }
 }
 
 private void recordPos(uint line, uint col, Identifier ident, ref RefLoc[] out_)
