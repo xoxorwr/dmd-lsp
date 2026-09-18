@@ -20,7 +20,7 @@ PLATFORM_EXTRA = root/strtold.d
 
 SRC = src/main.d src/arena.d src/lsp.d src/session.d \
       src/dmdwrap.d src/lexutil.d src/lint.d src/complete.d src/server.d \
-      src/semantic.d src/worker.d src/json.d src/pathutil.d
+      src/semantic.d src/worker.d src/json.d src/pathutil.d src/symbols.d
 
 # Same versions as dmd's own `frontend` dub package, plus DMDLIB for the
 # tooling-oriented lexer API. -preview=dip1000 matches the dmd build.
@@ -90,6 +90,7 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_completion_prefix.py
 	python3 tests/test_completion_scope.py
 	python3 tests/test_field_scope.py
+	python3 tests/test_symbols.py
 	python3 tests/test_recovery_scope.py
 	python3 tests/test_realworld.py
 	python3 tests/test_broken_body.py

@@ -22,6 +22,7 @@ import lsp;
 import session;
 import server;
 import complete;
+import symbols : DocSymbol, documentSymbols;
 import lint;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash;
@@ -261,8 +262,58 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendSemantic(const(SemTok)[] toks)
+    // Recursively emit one DocumentSymbol (LSP shape) into `arr`.
+    private void addDocSymbol(Json js, JsonNode* arr, ref DocSymbol d)
     {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "name", zstr(d.name));
+        if (d.detail.length)
+            js.add_string_to_object(o, "detail", zstr(d.detail));
+        js.add_number_to_object(o, "kind", d.kind);
+        auto range = js.create_object();
+        auto st = js.create_object();
+        js.add_number_to_object(st, "line", d.line);
+        js.add_number_to_object(st, "character", d.col);
+        auto en = js.create_object();
+        js.add_number_to_object(en, "line", d.endLine);
+        js.add_number_to_object(en, "character", d.endCol);
+        js.add_item_to_object(range, "start", st);
+        js.add_item_to_object(range, "end", en);
+        js.add_item_to_object(o, "range", range);
+        auto sel = js.create_object();
+        auto ss = js.create_object();
+        js.add_number_to_object(ss, "line", d.selLine);
+        js.add_number_to_object(ss, "character", d.selCol);
+        auto se = js.create_object();
+        js.add_number_to_object(se, "line", d.selEndLine);
+        js.add_number_to_object(se, "character", d.selEndCol);
+        js.add_item_to_object(sel, "start", ss);
+        js.add_item_to_object(sel, "end", se);
+        js.add_item_to_object(o, "selectionRange", sel);
+        if (d.children.length)
+        {
+            auto kids = js.create_array();
+            foreach (ref c; d.children)
+                addDocSymbol(js, kids, c);
+            js.add_item_to_object(o, "children", kids);
+        }
+        js.add_item_to_array(arr, o);
+    }
+
+    private void sendDocumentSymbol(const ref Analysis a, const(char)[] text)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        DocSymbol[] syms = documentSymbols(cast(Module)a.module_, text);
+        foreach (ref d; syms)
+            addDocSymbol(js, arr, d);
+        js.add_item_to_object(root, "result", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
+    private void sendSemantic(const(SemTok)[] toks)    {
         auto js = jmake();
         auto root = js.create_object();
         auto arr = js.create_array();
@@ -641,6 +692,30 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 hoverAndSend(s, a, orig, line, col);
+                built = true;
+                continue;
+            }
+            if (ops == "documentSymbol")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto text = jstr(jget(p, "text"));
+                if (text is null)
+                    text = "";
+                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, text, null);
+                    sendDocumentSymbol(a, text);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                sendDocumentSymbol(a, text);
                 built = true;
                 continue;
             }
@@ -1169,5 +1244,27 @@ ExchangeResult workerSemantic(ref Worker w, const(char)[] path, const(char)[] te
             toks ~= t;
         }
     }
+    return ExchangeResult.ok;
+}
+
+// documentSymbol is forwarded as raw LSP JSON: the tree is built in the child
+// (which owns the Module) and the parent re-serializes the `result` subtree.
+ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
+    const(char)[] text, ref string resultJson)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("documentSymbol"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "text", zstr(text));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    resultJson = printJsonStr(jget(r, "result"));
     return ExchangeResult.ok;
 }

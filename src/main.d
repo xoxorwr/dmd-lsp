@@ -316,10 +316,35 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     return false;
 }
 
+// Run a documentSymbol request against the worker, respawning once if needed.
+private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
+    const(char)[] text, ref string resultJson)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerDocumentSymbol(app.wk, path, text, resultJson);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 // Run a semantic-tokens request against the worker, respawning once if needed.
 private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] text,
-    ref worker.WToken[] toks)
-{
+    ref worker.WToken[] toks){
     for (int attempt = 0; attempt < 2; attempt++)
     {
         if (!app.wk.alive)
@@ -1304,6 +1329,7 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_item_to_object(caps, "signatureHelpProvider", sh);
         js.add_bool_to_object(caps, "definitionProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
+        js.add_bool_to_object(caps, "documentSymbolProvider", true);
         js.add_bool_to_object(caps, "codeActionProvider", true);
         auto legend = js.create_object();
         auto tt = js.create_array();
@@ -1508,9 +1534,35 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
             return;
         }
-        if (m.method == "textDocument/hover")
+        if (m.method == "textDocument/documentSymbol")
         {
             const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "[]");
+                return;
+            }
+            string resultJson = "[]";
+            if (workerDocumentSymbolRetry(app, path, text, resultJson))
+                lspRespond(m.idJson, resultJson);
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/hover")
+        {            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
             if (uri is null)
             {
                 lspRespond(m.idJson, "null");
