@@ -1578,6 +1578,98 @@ private void pushArrayProperties(Arena* a, ref CompleteOut o,
     }
 }
 
+// The struct/class declaration a (possibly qualified/aliased) type denotes, or
+// null for pointers/arrays/primitives.
+private Dsymbol aggregateSym(Type t)
+{
+    if (!t)
+        return null;
+    Type tb = t.toBasetype();
+    if (!tb)
+        return null;
+    if (auto ts = tb.isTypeStruct())
+        return ts.sym;
+    if (auto tc = tb.isTypeClass())
+        return tc.sym;
+    return null;
+}
+
+// Cap on UFCS candidates: without semantic overload/constraint filtering a
+// large project offers thousands, which bloats the response (and the client's
+// list) for little value. Real members are emitted first and are never capped
+// by this.
+private enum size_t ufcsCap = 100;
+
+// UFCS candidates for `expr.`: free functions whose first parameter accepts
+// `expr`'s aggregate type. dmd resolves these calls semantically (references
+// already follow them, see `Visit(CallExp)`), but completion is heuristic, so
+// only non-template functions with a directly matching first parameter are
+// offered; real members were emitted first and win via `seen`.
+private void addUfcsMembers(Arena* a, Module mod, Dsymbol[] rootMembers,
+    Type lhsType, Dsymbol lhsAgg, const(char)[] prefix,
+    ref bool[const(char)[]] seen, ref CompleteOut o)
+{
+    auto agg = aggregateSym(lhsType);
+    if (!agg)
+        agg = lhsAgg;
+    if (!agg)
+        return;
+    foreach (m; rootMembers)
+    {
+        if (o.nitems >= ufcsCap)
+            return;
+        addUfcsCandidate(a, m, agg, prefix, seen, o);
+    }
+    // Direct imports only (no recursive public-import closure): the map-based
+    // `indexImportInterfaces` walk was ~9 ms/request on a 60-module project.
+    if (!mod || !mod.members)
+        return;
+    Dsymbol[] flat;
+    flattenMembers(mod.members, flat);
+    foreach (s; flat)
+    {
+        if (o.nitems >= ufcsCap)
+            return;
+        auto imp = s.isImport();
+        if (!imp || imp.isstatic || !imp.mod || !imp.mod.members)
+            continue;
+        foreach (m; scopeMembers(imp.mod))
+        {
+            if (o.nitems >= ufcsCap)
+                return;
+            if (m.visible().kind == Visibility.Kind.private_)
+                continue; // not callable from here
+            addUfcsCandidate(a, m, agg, prefix, seen, o);
+        }
+    }
+}
+
+private void addUfcsCandidate(Arena* a, Dsymbol s, Dsymbol agg,
+    const(char)[] prefix, ref bool[const(char)[]] seen, ref CompleteOut o)
+{
+    if (!s || !s.ident || o.nitems >= ufcsCap)
+        return;
+    auto fd = s.isFuncDeclaration();
+    if (!fd)
+        return; // template UFCS needs constraint evaluation; too noisy here
+    auto tf = fd.type ? fd.type.isTypeFunction() : null;
+    if (!tf || !tf.parameterList.parameters ||
+        (*tf.parameterList.parameters).length == 0)
+        return;
+    auto p = (*tf.parameterList.parameters)[0];
+    if (!p || !p.type)
+        return;
+    Type pt = p.type.toBasetype();
+    Dsymbol psym = pt ? (pt.isTypeStruct() ? pt.isTypeStruct().sym
+        : pt.isTypeClass() ? pt.isTypeClass().sym : null) : null;
+    if (psym !is agg)
+        return;
+    auto nm = s.ident.toString();
+    if (nm in seen || !hasPrefix(nm, prefix))
+        return;
+    pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(s), "1", seen, s);
+}
+
 private Dsymbol findMember(Dsymbol[] members, const(char)[] name)
 {
     foreach (m; members)
@@ -1600,7 +1692,7 @@ struct NameType
 // Resolve the scope denoted by `lhs` chain segments.
 private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
     Dsymbol[] rootMembers, NameType[] locals, int depth = 0,
-    Type* valueType = null)
+    Type* valueType = null, Dsymbol* valueSym = null)
 {
     if (!segs.length)
         return null;
@@ -1628,7 +1720,11 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
                 if (!m)
                     m = findImportMember(root, v.typeName);
                 if (m)
+                {
                     cm = stepInto(m, depth + 1, root, rootMembers);
+                    if (valueSym)
+                        *valueSym = m;
+                }
             }
             curMembers = cm;
             if (valueType)
@@ -1650,6 +1746,8 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
         curMembers = stepInto(cur, depth + 1, root, rootMembers);
         if (valueType)
             *valueType = symType(cur);
+        if (valueSym && cur.isAggregateDeclaration())
+            *valueSym = cur;
         if (!curMembers.length)
             return null;
     }
@@ -1663,6 +1761,8 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
             return null;
         if (valueType)
             *valueType = symType(m);
+        if (valueSym && m.isAggregateDeclaration())
+            *valueSym = m;
         curMembers = stepInto(m, depth + 1, root, rootMembers);
         if (k + 1 < segs.length && !curMembers.length)
             return null;
@@ -3394,7 +3494,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         if (importPathCompletion(arena, mod, segs, prefix, out_, seen))
             return;
         Type lhsType;
-        auto scope_ = resolveLhs(mod, segs, rootMembers, slots, 0, &lhsType);
+        Dsymbol lhsAgg;
+        auto scope_ = resolveLhs(mod, segs, rootMembers, slots, 0, &lhsType,
+            &lhsAgg);
         // A plain `arr.` is the array itself, so offer the built-in properties;
         // `followTypeDepth` unwraps arrays only for indexed access (`arr[i].`).
         bool indexedLast = segs.length &&
@@ -3404,7 +3506,7 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             pushArrayProperties(arena, out_, seen, prefix, lhsType);
             return;
         }
-        if (!scope_.length)
+        if (!scope_.length && !aggregateSym(lhsType) && !lhsAgg)
         {
             out_.incomplete = true;
             return;
@@ -3423,6 +3525,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             if (out_.nitems >= 500)
                 break;
         }
+        // UFCS: free functions callable as `expr.name(...)`.
+        addUfcsMembers(arena, mod, rootMembers, lhsType, lhsAgg, prefix, seen,
+            out_);
         return;
     }
 

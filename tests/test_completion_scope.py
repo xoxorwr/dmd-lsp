@@ -22,9 +22,17 @@ MAIN = '''module main;
 import mod;
 import evmod = mod;
 
+void helper(Event e) { }
+void helperInt(int n) { }
+
 void on_ref(ref Event arg)
 {
     ar
+}
+
+void on_ufcs(Event ev)
+{
+    ev.
 }
 
 void on_alias_import()
@@ -241,6 +249,15 @@ items = complete_items(ml, len(lines[ml]))
 mitem = next((i for i in items if i['label'] == 'evmod'), None)
 check('renamed-import',
       mitem is not None and mitem.get('detail') == 'mod', str(mitem))
+
+# 11) UFCS: `ev.` offers free functions whose first parameter accepts Event
+# (`helper`), not ones whose first parameter does not (`helperInt`).
+ul = line_of('void on_ufcs')
+el = ul + 2  # the `    ev.` line
+labels = complete(el, len(lines[el]))
+check('ufcs-completion',
+      'helper' in labels and 'helperInt' not in labels,
+      str(sorted(set(labels))[:10]))
 
 proc.stdin.close()
 proc.wait(timeout=5)
