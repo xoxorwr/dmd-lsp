@@ -448,6 +448,28 @@ check('mixin-generated-decl-excluded',
       mixrefs == [('main_test.d', 15, 9, 19)], str(mixrefs))
 d.close()
 
+# A default-constructed struct literal `S()` is a StructLiteralExp whose loc is
+# the `(`; the type name before it must still be a reference.
+slit = ('module slit;\n'
+        'struct S { int f; }\n'
+        'S make() { return S(); }\n')
+slp = os.path.join(root, 'slit.d')
+open(slp, 'w').write(slit)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(slp, slit)
+d.drain(1.0)
+srefs = fmt(d.references(slp, 1, 7, True))
+check('struct-literal-type',
+      ('slit.d', 1, 7, 8) in srefs and ('slit.d', 2, 0, 1) in srefs
+      and ('slit.d', 2, 18, 19) in srefs, str(srefs))
+r = d.prepare(slp, 2, 18)
+check('struct-literal-prepare',
+      r.get('result') and r['result']['placeholder'] == 'S',
+      str(r.get('result')))
+d.close()
+
 # A qualified static member access: dmd resolves `Camera.ortho` to a direct
 # `VarExp(ortho)` whose loc is the *qualifier*, dropping the scope node. Both
 # the type qualifier and the member must still be found.

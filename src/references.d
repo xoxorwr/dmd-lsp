@@ -965,9 +965,14 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
             return;
         auto old = e.stageflags;
         e.stageflags |= StructLiteralExp.StageFlags.apply;
-        // `S(...)` is a struct literal; its type name is at the literal's loc.
-        if (e.sd)
-            use(e.loc, e.sd, false);
+        // `S(...)` is a struct literal whose `loc` is the `(`, not the type
+        // name; locate the name just before it (like a type annotation).
+        if (e.sd && e.sd.ident)
+        {
+            auto p = typeBackPos(e.loc, e.sd.ident);
+            if (p.line >= 1)
+                emitAt(p.line, p.col, e.sd, target, out_);
+        }
         if (e.elements)
             foreach (el; *e.elements)
                 if (el)

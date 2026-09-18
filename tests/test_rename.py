@@ -318,6 +318,28 @@ else:
     check('rename-type-annotations', False, str(r)[:200])
 d.close()
 
+# A default-constructed struct literal `S()` must be renamed too.
+SLIT = ('module slit2;\n'
+        'struct S { int f; }\n'
+        'S make() { return S(); }\n')
+slp2 = os.path.join(root, 'slit2.d')
+open(slp2, 'w').write(SLIT)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(slp2, SLIT)
+d.drain(1.0)
+r = d.rename(slp2, 1, 7, 'T')
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {slp2: SLIT})
+    check('rename-struct-literal',
+          new[slp2] == ('module slit2;\n'
+                        'struct T { int f; }\n'
+                        'T make() { return T(); }\n'), repr(new[slp2]))
+else:
+    check('rename-struct-literal', False, str(r)[:200])
+d.close()
+
 # Qualified static access: renaming the type must rewrite the qualifier too.
 QUAL = ('module qual2;\n'
         'struct Camera { static Camera ortho(); }\n'
