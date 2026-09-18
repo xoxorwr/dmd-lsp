@@ -91,6 +91,7 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_lsp.py
 	python3 tests/test_semantic.py
 	python3 tests/test_semantic_hints.py
+	python3 tests/test_lint.py
 	python3 tests/test_completion_burst.py
 	python3 tests/test_completion_prefix.py
 	python3 tests/test_completion_scope.py

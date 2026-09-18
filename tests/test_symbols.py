@@ -173,6 +173,43 @@ check('broken-still-partial', any(s['name'] == 'Good' for s in syms),
       str([s['name'] for s in syms]))
 d.close()
 
+# Edge cases for the visitor walk: templates, nested aggregates, attribute
+# blocks (`private:`), anonymous aggregate members (flattened), and static-if.
+EDGE = ('module edge;\n'
+        'template Tmpl(T) { T value; }\n'
+        'struct Outer\n{\n'
+        '    struct Inner { int z; }\n'
+        '    int a;\n'
+        '    private:\n'
+        '    int b;\n'
+        '}\n'
+        'enum Anon { A, B }\n'
+        'static if (true) { int condvar; }\n'
+        'struct { int anonfield; } anon;\n')
+epath = os.path.join(root, 'edge.d')
+open(epath, 'w').write(EDGE)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(epath, EDGE)
+d.drain(1.0)
+syms = d.document_symbols(epath)
+by = {s['name']: s for s in syms}
+check('edge-template-present', 'Tmpl' in by, str(list(by)))
+check('edge-nested-aggregate',
+      any(c['name'] == 'Inner' and any(g['name'] == 'z'
+          for g in c.get('children', [])) for c in by.get('Outer', {}).get('children', [])),
+      str([c['name'] for c in by.get('Outer', {}).get('children', [])]))
+check('edge-attribute-block',
+      any(c['name'] == 'b' for c in by.get('Outer', {}).get('children', [])),
+      str([c['name'] for c in by.get('Outer', {}).get('children', [])]))
+check('edge-enum-members',
+      [c['name'] for c in by['Anon'].get('children', [])] == ['A', 'B'],
+      str(by['Anon'].get('children')))
+check('edge-static-if-member', 'condvar' in by, str(list(by)))
+check('edge-anon-aggregate-flattened', 'anonfield' in by, str(list(by)))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(empty, ignore_errors=True)
 shutil.rmtree(broken, ignore_errors=True)
