@@ -401,8 +401,11 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
     }
     else if (auto ca = e.isCallExp())
     {
-        // The callee is `e1` (walked below), so the reference is recorded
-        // there; `e.loc` is the call/`(`, not the identifier.
+        // The callee is `e1` (walked below); some calls carry the resolved
+        // function only in `ca.f` (templates/qualified), so record at the
+        // callee identifier too. Dedupe folds the two paths.
+        if (ca.f && ca.e1 && sameTarget(ca.f, target))
+            record(ca.e1.loc, name, out_);
         walkExpr(ca.e1, target, out_);
         if (ca.arguments)
             foreach (a; *ca.arguments)
@@ -507,6 +510,11 @@ private bool sameTarget(Dsymbol a, Dsymbol b)
     if (auto ti = b.isTemplateInstance())
         if (ti.tempdecl)
             return sameTarget(ti.tempdecl, a);
+    // A function that is a template's single member stands in for the template.
+    if (a.parent is b && b.isTemplateDeclaration() && a.isFuncDeclaration())
+        return true;
+    if (b.parent is a && a.isTemplateDeclaration() && b.isFuncDeclaration())
+        return true;
     // Overload group: same name in the same scope (a call picks one overload,
     // but references/rename operate on the name).
     if (a.ident && b.ident && a.ident is b.ident && a.parent && a.parent is b.parent)

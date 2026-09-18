@@ -510,7 +510,7 @@ private void buildIndexNow(ref ServerState s, string[] files)
         flattenIndex(documentSymbols(mod, text), f, null, g_index);
         WFileInfo fi;
         fi.file = f.idup;
-        const(char)* mn = mod.toChars();
+        const(char)* mn = mod.toPrettyChars();
         if (mn)
             fi.moduleName = mn[0 .. strlen(mn)].idup;
         if (mod.members)
@@ -780,7 +780,8 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
     want[declName] = true;
     if (reqName.length)
         want[reqName] = true;
-    foreach (mn; importerModules(declName))
+    auto imp = importerModules(declName);
+    foreach (mn; imp)
     {
         if (mn in want)
             continue;
