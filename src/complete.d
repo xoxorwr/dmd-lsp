@@ -3106,6 +3106,74 @@ void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     out_.len = lastSegLen(chainUnderCursor(text, ctx.line, ctx.character));
 }
 
+// The declaration a symbol is *typed* as, for `textDocument/typeDefinition`:
+// a variable/field -> its type, a function -> its return type, an alias ->
+// through. Aggregates/enums are already types.
+private Dsymbol typeDeclOf(Dsymbol s)
+{
+    if (!s)
+        return null;
+    if (s.isAggregateDeclaration() || s.isEnumDeclaration())
+        return s;
+    if (auto vd = s.isVarDeclaration())
+        return typeDeclSymbol(vd.type);
+    if (auto fd = s.isFuncDeclaration())
+    {
+        auto tf = fd.type ? fd.type.isTypeFunction() : null;
+        if (tf && tf.next)
+            return typeDeclSymbol(tf.next);
+        return null;
+    }
+    if (auto al = s.isAliasDeclaration())
+    {
+        auto t = al.toAlias();
+        if (t && t !is s)
+            return typeDeclOf(t);
+        return typeDeclSymbol(al.type);
+    }
+    return null;
+}
+
+private Dsymbol typeDeclSymbol(Type t)
+{
+    if (!t)
+        return null;
+    if (auto te = t.isTypeEnum()) // before toBasetype(): it unwraps the enum
+        return te.sym;
+    Type b = t.toBasetype();
+    if (!b)
+        return null;
+    if (auto ts = b.isTypeStruct())
+        return ts.sym;
+    if (auto tc = b.isTypeClass())
+        return tc.sym;
+    if (auto te = b.isTypeEnum())
+        return te.sym;
+    if (auto ti = b.isTypeInstance())
+        if (ti.tempinst)
+            return ti.tempinst.tempdecl;
+    return null;
+}
+
+void typeDefinitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+{
+    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
+    auto target = typeDeclOf(sym);
+    if (!target)
+        return;
+    auto loc = target.loc;
+    const(char)* f = loc.filename();
+    if (!f)
+        return;
+    import core.stdc.string : strlen;
+    out_.found = true;
+    out_.file = arenaDupStr(arena, f[0 .. strlen(f)]);
+    out_.line = loc.linnum();
+    out_.col = loc.charnum();
+    out_.len = target.ident ? target.ident.toString().length : 0;
+}
+
 // ---------- hover ----------
 struct HoverInfo
 {

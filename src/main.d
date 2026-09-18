@@ -293,6 +293,33 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
     return false;
 }
 
+// Same, for `textDocument/typeDefinition`.
+private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref worker.WDef def)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerTypeDefinition(app.wk, path, atext, origText, line, col, def);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 // Run a hover request against the worker, respawning once if needed.
 private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     const(char)[] origText, uint line, uint col, ref worker.WHover hov)
@@ -1573,6 +1600,8 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_item_to_object(sh, "triggerCharacters", sht);
         js.add_item_to_object(caps, "signatureHelpProvider", sh);
         js.add_bool_to_object(caps, "definitionProvider", true);
+        js.add_bool_to_object(caps, "declarationProvider", true);
+        js.add_bool_to_object(caps, "typeDefinitionProvider", true);
         js.add_bool_to_object(caps, "referencesProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "documentSymbolProvider", true);
@@ -1734,8 +1763,11 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, `{"signatures":[]}`);
             return;
         }
-        if (m.method == "textDocument/definition")
+        if (m.method == "textDocument/definition" ||
+            m.method == "textDocument/declaration" ||
+            m.method == "textDocument/typeDefinition")
         {
+            bool typeDef = m.method == "textDocument/typeDefinition";
             const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
             if (uri is null)
             {
@@ -1759,7 +1791,10 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             string atext = analysisText(text, line, col);
             worker.WDef def;
-            if (workerDefinitionRetry(app, path, atext, text, line, col, def) && def.found)
+            bool ok = typeDef
+                ? workerTypeDefinitionRetry(app, path, atext, text, line, col, def)
+                : workerDefinitionRetry(app, path, atext, text, line, col, def);
+            if (ok && def.found)
             {
                 auto js = jmake();
                 auto loc = js.create_object();

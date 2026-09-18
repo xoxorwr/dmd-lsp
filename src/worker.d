@@ -472,13 +472,16 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
     }
 
     private void definitionAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col)
+        const(char)[] orig, uint line, uint col, bool typeDef = false)
     {
         CompleteCtx ctx;
         ctx.line = line;
         ctx.character = col;
         DefLoc def;
-        definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        if (typeDef)
+            typeDefinitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        else
+            definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
         sendDefinition(def);
     }
 
@@ -1250,10 +1253,11 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
+                bool typeDef = jbool(jget(p, "type"), false);
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    definitionAndSend(s, a, orig, line, col);
+                    definitionAndSend(s, a, orig, line, col, typeDef);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
@@ -1264,7 +1268,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                definitionAndSend(s, a, orig, line, col);
+                definitionAndSend(s, a, orig, line, col, typeDef);
                 built = true;
                 continue;
             }
@@ -1956,6 +1960,37 @@ ExchangeResult workerDefinition(ref Worker w, const(char)[] path, const(char)[] 
     js.add_string_to_object(root, "origText", zstr(origText));
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    out_.found = jbool(jget(r, "found"), false);
+    if (out_.found)
+    {
+        out_.file = dupOrEmpty(jstr(jget(r, "file")));
+        out_.line = cast(uint)jint(jget(r, "line"));
+        out_.col = cast(uint)jint(jget(r, "col"));
+        out_.len = cast(size_t)jint(jget(r, "len"));
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerTypeDefinition(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col, ref WDef out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("definition"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    js.add_bool_to_object(root, "type", true);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;

@@ -335,6 +335,24 @@ check('def-local',
       def_at(duri, 6, 8)[0]['range']['start'] == {'line': 6, 'character': 8},
       '')
 
+def _req_at(method, uri, line, ch):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0], "method": method,
+          "params": {"textDocument": {"uri": uri},
+                     "position": {"line": line, "character": ch}}})
+    return read_msg()['result']
+
+# typeDefinition: a variable goes to its type's declaration; declaration is the
+# definition target.
+tdef = _req_at('textDocument/typeDefinition', duri, 5, 10)  # `p`
+check('typedef-local',
+      bool(tdef) and tdef[0]['range']['start'] == {'line': 1, 'character': 0},
+      str(tdef))
+dcla = _req_at('textDocument/declaration', duri, 6, 13)  # `add`
+check('declaration-fn',
+      bool(dcla) and dcla[0]['range']['start'] == {'line': 2, 'character': 4},
+      str(dcla))
+
 xuri = open_doctype('usedef.d',
     'module usedef;\nimport autolib;\nvoid f() { auto c = globalCfg; }\n')
 xdef = def_at(xuri, 2, 25)
