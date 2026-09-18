@@ -83,6 +83,9 @@ Then point any LSP client at `dmd-lsp` over stdio (see [Features](#features)).
 ./dmd-lsp --version
 ```
 
+Set `DMD_LSP_TIMING=1` to print phase timings (discovery, index build,
+analysis, workspace-wide references) to stderr.
+
 ## Configuration
 
 Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.

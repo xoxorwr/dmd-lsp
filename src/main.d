@@ -86,10 +86,12 @@ private ulong nowMs()
 {
     // core.time.MonoTime is portable (clock_gettime on Linux, which
     // core.sys.posix.time does not expose on macOS, mach_absolute_time on
-    // Darwin, QPC on Windows). Duration ticks are hectonanoseconds.
+    // Darwin, QPC on Windows). `ticks` is in platform-defined units
+    // (`ticksPerSecond`), so derive ticks-per-ms rather than assuming
+    // hectonanoseconds.
     import core.time : MonoTime;
 
-    return cast(ulong)(MonoTime.currTime.ticks / 10_000);
+    return cast(ulong)(MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1_000));
 }
 
 private bool hasPending(App* app, const(char)[] path)
@@ -415,10 +417,48 @@ private bool ensureIndex(App* app)
         return true;
     if (!app.root.length)
         return false;
-    if (!workerBuildIndexRetry(app, findDFiles(app.root)))
+    import timing : nowMs, traceMs;
+    ulong t0 = nowMs();
+    auto files = indexFiles(app);
+    traceMs("index.discovery", nowMs() - t0);
+    if (!workerBuildIndexRetry(app, files))
         return false;
+    traceMs("index.build", nowMs() - t0);
     app.indexBuilt = true;
     return true;
+}
+
+// Files to index: the project's declared import paths (CLI/editor + dls.json),
+// not the builtin stdlib defaults. This follows the project's module graph
+// instead of scanning the whole checkout (whose test fixtures / vendored trees
+// are not part of it). Falls back to the workspace root when none are declared.
+private string[] indexFiles(App* app)
+{
+    string[] roots = app.baseImports.dup;
+    roots ~= app.fileCfg.imports;
+    if (!roots.length)
+        return app.root.length ? findDFiles(app.root) : null;
+    bool[string] rseen;
+    string[] files;
+    foreach (r; roots)
+    {
+        if (!r.length)
+            continue;
+        auto abs = absolutePath(r);
+        if (abs in rseen)
+            continue;
+        rseen[abs] = true;
+        files ~= findDFiles(abs);
+    }
+    bool[string] fseen;
+    string[] uniq;
+    foreach (f; files)
+        if (f !in fseen)
+        {
+            fseen[f] = true;
+            uniq ~= f;
+        }
+    return uniq;
 }
 
 // Run a semantic-tokens request against the worker, respawning once if needed.

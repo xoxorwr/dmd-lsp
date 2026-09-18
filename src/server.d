@@ -363,6 +363,8 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
         return s.uni.analysis;
     }
     Analysis a;
+    import timing : nowMs, traceMs;
+    ulong t0 = nowMs();
     s.scratch.reset();
     dmdResetRequest(s.dmd, &s.sink);
     StdoutGuard og;
@@ -372,6 +374,7 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
         a.syn = snapshotModule(cast(Module)pr.module_, text);
     auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
     stdoutRestore(og);
+    traceMs("analyze.full", nowMs() - t0, path);
     a.module_ = pr.module_;
     a.ok = pr.ok;
     a.errors = errs;
