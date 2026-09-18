@@ -93,6 +93,7 @@ else version (Windows)
     {
         import core.sys.windows.winbase;
         import core.sys.windows.windef;
+        import core.stdc.string : strlen;
 
         if (depth > maxDepth)
             return;
