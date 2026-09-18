@@ -110,6 +110,19 @@ private Module moduleOf(Dsymbol d)
     return null;
 }
 
+// Declaring module of a symbol.
+Module symbolModule(Dsymbol d) => moduleOf(d);
+
+// True for a symbol whose parent chain crosses a function (local/param), i.e.
+// not something another module could reference.
+bool isLocalDsymbol(Dsymbol d)
+{
+    for (Dsymbol p = d ? d.parent : null; p; p = p.parent)
+        if (p.isFuncDeclaration())
+            return true;
+    return false;
+}
+
 private Module[] importClosure(Module root)
 {
     Module[] out_;

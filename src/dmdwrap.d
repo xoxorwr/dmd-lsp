@@ -197,6 +197,41 @@ uint dmdSemantic(void* modp)
     return global.errors;
 }
 
+// Run semantic3 (function bodies) for every module in the import closure.
+// Analyzing a synthetic root only semantic3's the root itself; modules pulled
+// in as imports keep unresolved bodies, so cross-file uses cannot be matched
+// until their bodies are analyzed.
+void dmdSemantic3Closure(void* modp)
+{
+    import dmd.dmodule : Module;
+    import dmd.dimport : Import;
+
+    auto root = cast(Module)modp;
+    if (!root)
+        return;
+    Module[] stack = [root];
+    bool[Module] seen;
+    seen[root] = true;
+    while (stack.length)
+    {
+        auto m = stack[$ - 1];
+        stack.length--;
+        semantic3(m, null);
+        runDeferredSemantic3();
+        if (!m.members)
+            continue;
+        foreach (i; 0 .. (*m.members).length)
+        {
+            auto imp = (*m.members)[i].isImport();
+            if (imp && imp.mod && !(imp.mod in seen))
+            {
+                seen[imp.mod] = true;
+                stack ~= imp.mod;
+            }
+        }
+    }
+}
+
 // Reset the error counters (and nothing else) so an incremental re-analysis
 // can be measured the same way dmdResetRequest measures a full one. Does not
 // touch the live universe.

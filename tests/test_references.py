@@ -117,6 +117,12 @@ got3 = fmt(d.references(appp, 4, 13, True))
 check('function-refs',
       ('lib.d', 2, 4, 7) in got3 and ('app.d', 4, 13, 16) in got3,
       str(got3))
+# From the *declaration* file, importer uses must still be found (index-wide).
+got4 = fmt(d.references(libp, 1, 4, True))
+check('decl-finds-importers',
+      ('lib.d', 1, 4, 10) in got4 and ('app.d', 4, 4, 10) in got4
+      and ('app.d', 4, 17, 23) in got4,
+      str(got4))
 d.close()
 
 # Sibling scopes reuse a name; each resolves to its own declaration.

@@ -23,10 +23,10 @@ import session;
 import server;
 import complete;
 import symbols : DocSymbol, documentSymbols;
-import references : RefLoc, findReferences;
+import references : RefLoc, findReferences, isLocalDsymbol;
 import lint;
 import semantic : SemTok, semanticTokens;
-import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly;
+import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly, dmdSemantic3Closure;
 
 import dmd.dmodule : Module;
 
@@ -71,6 +71,16 @@ struct WIndexSym
 }
 private WIndexSym[] g_index;
 private bool g_indexBuilt = false;
+
+// Per-file module name + direct imports (parse-only), for locating importer
+// modules when searching references workspace-wide.
+struct WFileInfo
+{
+    string file;
+    string moduleName;
+    string[] imports;
+}
+private WFileInfo[] g_files;
 
 private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
 {
@@ -483,7 +493,10 @@ private void flattenIndex(const(DocSymbol)[] syms, const(char)[] file,
 // drop the warm universe (the op branch sets `built = false`).
 private void buildIndexNow(ref ServerState s, string[] files)
 {
+    import core.stdc.string : strlen;
+
     g_index = null;
+    g_files = null;
     dmdResetRequest(s.dmd, &s.sink);
     foreach (f; files)
     {
@@ -491,11 +504,80 @@ private void buildIndexNow(ref ServerState s, string[] files)
         if (!text)
             continue;
         auto pr = dmdParseOnly(f, text);
-        if (pr.ok && pr.module_)
-            flattenIndex(documentSymbols(cast(Module)pr.module_, text), f, null,
-                g_index);
+        if (!pr.ok || !pr.module_)
+            continue;
+        auto mod = cast(Module)pr.module_;
+        flattenIndex(documentSymbols(mod, text), f, null, g_index);
+        WFileInfo fi;
+        fi.file = f.idup;
+        const(char)* mn = mod.toChars();
+        if (mn)
+            fi.moduleName = mn[0 .. strlen(mn)].idup;
+        if (mod.members)
+            foreach (i; 0 .. (*mod.members).length)
+            {
+                auto imp = (*mod.members)[i].isImport();
+                if (!imp || !imp.id)
+                    continue;
+                string name;
+                foreach (p; imp.packages)
+                {
+                    name ~= p.toString();
+                    name ~= ".";
+                }
+                name ~= imp.id.toString();
+                if (name.length)
+                    fi.imports ~= name.idup;
+            }
+        g_files ~= fi;
     }
     g_indexBuilt = true;
+}
+
+// File of a recorded module name, or null.
+private string indexFileOf(const(char)[] moduleName)
+{
+    foreach (fi; g_files)
+        if (fi.moduleName == moduleName)
+            return fi.file;
+    return null;
+}
+
+// Recorded module name of a file, or null.
+private string indexModuleOfFile(const(char)[] file)
+{
+    foreach (fi; g_files)
+        if (fi.file == file)
+            return fi.moduleName;
+    return null;
+}
+
+// Module names that can see `declName` through imports (declName included).
+private string[] importerModules(const(char)[] declName)
+{
+    bool[string] canSee;
+    canSee[declName] = true;
+    bool changed = true;
+    while (changed)
+    {
+        changed = false;
+        foreach (fi; g_files)
+        {
+            if (fi.moduleName in canSee)
+                continue;
+            foreach (i; fi.imports)
+                if (i in canSee)
+                {
+                    canSee[fi.moduleName] = true;
+                    changed = true;
+                    break;
+                }
+        }
+    }
+    string[] out_;
+    foreach (k, v; canSee)
+        out_ ~= k;
+    return out_;
 }
 
 private char lowerChar(char c) pure nothrow @nogc @safe
@@ -595,16 +677,145 @@ private void sendWorkspaceSymbols(const(WIndexSym)[] syms)
 
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
     const(char)[] orig, uint line, uint col, bool includeDecl)
+{
+    CompleteCtx ctx;
+    ctx.line = line;
+    ctx.character = col;
+    auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
+    RefLoc[] refs;
+    if (target)
+        refs = findReferences(cast(Module)a.module_, target, includeDecl);
+    sendReferences(refs);
+}
+
+// ---- workspace-wide references ----
+// When the index is warm, extend the search to importer modules outside the
+// request universe: build a synthetic root importing the request module, the
+// declaring module and every (word-prefiltered) importer, re-analyze it, then
+// match by declaration identity inside that combined universe. Must run in a
+// fork (serverAnalyze resets the state).
+private Module findModuleByFile(Module root, const(char)[] file)
+{
+    if (!root)
+        return null;
+    Module[] stack = [root];
+    bool[Module] seen;
+    seen[root] = true;
+    while (stack.length)
     {
-        CompleteCtx ctx;
-        ctx.line = line;
-        ctx.character = col;
-        auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
-        RefLoc[] refs;
-        if (target)
-            refs = findReferences(cast(Module)a.module_, target, includeDecl);
-        sendReferences(refs);
+        auto m = stack[$ - 1];
+        stack.length--;
+        if (m.srcfile.toString() == file || m.arg == file)
+            return m;
+        if (!m.members)
+            continue;
+        foreach (i; 0 .. (*m.members).length)
+        {
+            auto imp = (*m.members)[i].isImport();
+            if (imp && imp.mod && !(imp.mod in seen))
+            {
+                seen[imp.mod] = true;
+                stack ~= imp.mod;
+            }
+        }
     }
+    return null;
+}
+
+private bool isIdChar(char c) pure nothrow @nogc @safe
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
+private bool containsWord(const(char)[] text, const(char)[] word)
+{
+    if (!word.length || text.length < word.length)
+        return false;
+    foreach (i; 0 .. text.length - word.length + 1)
+    {
+        if (text[i .. i + word.length] != word)
+            continue;
+        if (i > 0 && isIdChar(text[i - 1]))
+            continue;
+        if (i + word.length < text.length && isIdChar(text[i + word.length]))
+            continue;
+        return true;
+    }
+    return false;
+}
+
+private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] path, const(char)[] orig, uint line, uint col,
+    bool includeDecl)
+{
+    import core.stdc.string : strlen;
+
+    CompleteCtx ctx;
+    ctx.line = line;
+    ctx.character = col;
+    auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
+    if (!target || isLocalDsymbol(target))
+    {
+        RefLoc[] r0;
+        if (target)
+            r0 = findReferences(cast(Module)a.module_, target, includeDecl);
+        sendReferences(r0);
+        return;
+    }
+    // Universe-scoped result is computed before the synthetic re-analysis
+    // below invalidates `a`; it is the fallback for every failure path.
+    RefLoc[] base = findReferences(cast(Module)a.module_, target, includeDecl);
+    const(char)* df = target.loc.filename();
+    string declFile = df ? df[0 .. strlen(df)].idup : null;
+    string declName = declFile.length ? indexModuleOfFile(declFile) : null;
+    if (!declName.length)
+    {
+        sendReferences(base);
+        return;
+    }
+    const(char)[] ident = target.ident ? target.ident.toString() : null;
+    string reqName = indexModuleOfFile(path);
+    bool[string] want;
+    want[declName] = true;
+    if (reqName.length)
+        want[reqName] = true;
+    foreach (mn; importerModules(declName))
+    {
+        if (mn in want)
+            continue;
+        auto f = indexFileOf(mn);
+        if (!f.length)
+            continue;
+        auto t = sessionReadDisk(f);
+        if (ident.length && t && !containsWord(t, ident))
+            continue;
+        want[mn] = true;
+    }
+    string synth = "module __dmd_lsp_ws;\n";
+    foreach (mn, _; want)
+        synth ~= "import " ~ mn ~ ";\n";
+    auto a2 = serverAnalyze(s, "/tmp/dmd-lsp-ws/__dmd_lsp_ws.d", synth);
+    dmdSemantic3Closure(a2.module_); // resolve importer bodies
+    auto reqMod = findModuleByFile(cast(Module)a2.module_, path);
+    auto reqText = sessionReadDisk(path);
+    if (!reqMod || !reqText)
+    {
+        sendReferences(base);
+        return;
+    }
+    SynMod empty;
+    CompleteCtx rctx;
+    rctx.line = line;
+    rctx.character = col;
+    auto t2 = symbolAt(reqMod, &rctx, reqText, empty);
+    if (!t2)
+    {
+        sendReferences(base);
+        return;
+    }
+    sendReferences(findReferences(cast(Module)a2.module_, t2, includeDecl));
+}
 
     void workerMain()
     {
@@ -854,6 +1065,27 @@ private void referencesAndSend(ref ServerState s, const ref Analysis a,
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 bool includeDecl = jbool(jget(p, "includeDeclaration"), true);
+                if (g_indexBuilt)
+                {
+                    // Workspace-wide: ensure the request universe, then fork
+                    // (the wide walk re-analyzes a synthetic importer root and
+                    // would otherwise clobber the warm universe).
+                    auto st0 = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                    Analysis a0;
+                    if (built && st0 == UniState.reuse)
+                        a0 = s.uni.analysis;
+                    else
+                    {
+                        a0 = serverAnalyze(s, path, atext, orig);
+                        built = true;
+                    }
+                    if (forkRun(() {
+                        wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
+                    }))
+                        continue;
+                    wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
+                    continue;
+                }
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);

@@ -408,6 +408,19 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
     return false;
 }
 
+// Build the workspace index once per worker/config generation.
+private bool ensureIndex(App* app)
+{
+    if (app.indexBuilt)
+        return true;
+    if (!app.root.length)
+        return false;
+    if (!workerBuildIndexRetry(app, findDFiles(app.root)))
+        return false;
+    app.indexBuilt = true;
+    return true;
+}
+
 // Run a semantic-tokens request against the worker, respawning once if needed.
 private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] text,
     ref worker.WToken[] toks){
@@ -1665,6 +1678,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
+            ensureIndex(app); // enables workspace-wide references
             worker.WRef[] refs;
             if (workerReferencesRetry(app, path, atext, text, line, col,
                 includeDecl, refs))
@@ -1701,11 +1715,7 @@ private void handleMessage(App* app, ref RawMsg m)
             if (q is null)
                 q = "";
             if (!app.indexBuilt)
-            {
-                string[] files = findDFiles(app.root);
-                if (workerBuildIndexRetry(app, files))
-                    app.indexBuilt = true;
-            }
+                ensureIndex(app);
             worker.WIndexSym[] syms;
             if (workerWorkspaceSymbolRetry(app, q, syms))
             {
