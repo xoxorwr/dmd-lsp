@@ -179,6 +179,10 @@ bool sameTarget(Dsymbol a, Dsymbol b)
         return false;
     if (a is b)
         return true;
+    // Interned identifiers make a cheap reject before building (allocating)
+    // keys; folding never changes the identifier.
+    if (a.ident && b.ident && a.ident !is b.ident)
+        return false;
     return keyMatches(declKey(a), declKey(b));
 }
 
@@ -286,6 +290,7 @@ RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl
     g_collect = false;
     g_keyMode = true;
     g_key = key;
+    g_keyIdent = key.name.length ? Identifier.idPool(key.name) : null;
     foreach (m; mods)
     {
         if (!m)
@@ -294,6 +299,7 @@ RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl
     }
     dedupe(out_);
     g_keyMode = false;
+    g_keyIdent = null;
     return out_;
 }
 
@@ -331,12 +337,16 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
     auto savedFile = g_refFile;
     auto savedText = g_refText;
     auto savedSet = g_refTextSet;
+    auto savedLines = g_lineStart;
+    auto savedLinesReady = g_lineStartReady;
 
     g_collect = true;
     g_hits = null;
     g_refFile = modulePath(mod);
     g_refText = text;
     g_refTextSet = true;
+    g_lineStart = null;
+    g_lineStartReady = false;
 
     RefLoc[] dummy;
     scope RefWalker w = new RefWalker();
@@ -371,6 +381,8 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
     g_refFile = savedFile;
     g_refText = savedText;
     g_refTextSet = savedSet;
+    g_lineStart = savedLines;
+    g_lineStartReady = savedLinesReady;
     return occ;
 }
 
@@ -512,12 +524,16 @@ private string modulePath(Module m)
 private const(char)[] g_refFile;
 private const(char)[] g_refText;
 private bool g_refTextSet;
+private size_t[] g_lineStart; // per-module line starts (lazy)
+private bool g_lineStartReady;
 
 private void scopeRefText(Module m, const(char)[] rootPath, const(char)[] rootText)
 {
     g_refFile = modulePath(m);
     g_refText = null;
     g_refTextSet = false;
+    g_lineStart = null;
+    g_lineStartReady = false;
     if (rootPath !is null && rootText !is null && g_refFile == rootPath)
     {
         g_refText = rootText;
@@ -532,6 +548,71 @@ private void ensureRefText()
     g_refTextSet = true;
     if (g_refFile.length)
         g_refText = sessionReadDisk(g_refFile);
+    g_lineStart = null;
+    g_lineStartReady = false;
+}
+
+// Line-start offsets for `g_refText`, built once per module so (line,col) <->
+// offset is cheap. The old scan-from-zero per lookup made references quadratic
+// on large files (seconds and heavy allocation churn on the dmd frontend).
+private void ensureLineStarts()
+{
+    if (g_lineStartReady)
+        return;
+    g_lineStartReady = true;
+    ensureRefText();
+    g_lineStart = null;
+    if (!g_refText.length)
+        return;
+    g_lineStart ~= size_t(0);
+    foreach (i, c; g_refText)
+        if (c == '\n')
+            g_lineStart ~= i + 1;
+}
+
+private size_t refOffsetFast(uint line, uint col)
+{
+    ensureLineStarts();
+    if (line < 1 || col < 1 || !g_lineStart.length)
+        return 0;
+    if (line > g_lineStart.length)
+        return g_refText.length;
+    size_t o = g_lineStart[line - 1] + (col - 1);
+    return o < g_refText.length ? o : g_refText.length;
+}
+
+private void offsetLineColFast(size_t off, out uint line, out uint col)
+{
+    ensureLineStarts();
+    if (off > g_refText.length)
+        off = g_refText.length;
+    size_t lo = 0;
+    size_t hi = g_lineStart.length;
+    while (lo + 1 < hi)
+    {
+        size_t mid = (lo + hi) / 2;
+        if (g_lineStart[mid] <= off)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    line = cast(uint)(lo + 1);
+    col = cast(uint)(off - g_lineStart[lo] + 1);
+}
+
+// True when `g_refText` at 1-based (line, col) spells `name`.
+private bool spellsAtFast(uint line, uint col, const(char)[] name)
+{
+    ensureRefText();
+    if (!g_refText.length)
+        return true; // cannot tell
+    size_t off = refOffsetFast(line, col);
+    if (off + name.length > g_refText.length)
+        return false;
+    foreach (k; 0 .. name.length)
+        if (g_refText[off + k] != name[k])
+            return false;
+    return true;
 }
 
 // 1-based (line, col) -> byte offset.
@@ -582,7 +663,7 @@ private bool spanVerified(uint line, uint col, Identifier ident)
     auto name = ident.toString();
     if (!name.length)
         return true;
-    return textSpells(g_refText, line, col, name);
+    return spellsAtFast(line, col, name);
 }
 
 // True when `text` at 1-based (line, col) spells `name` exactly. Used to reject
@@ -643,7 +724,7 @@ private RefPos usePos(Loc recv, Dsymbol sym, bool member)
     auto name = sym.ident.toString();
     if (!name.length)
         return r;
-    size_t start = refOffset(g_refText, recv.linnum(), recv.charnum());
+    size_t start = refOffsetFast(recv.linnum(), recv.charnum());
     size_t i = start;
     while (i < g_refText.length)
     {
@@ -659,7 +740,7 @@ private RefPos usePos(Loc recv, Dsymbol sym, bool member)
         bool afterDot = k > 0 && g_refText[k - 1] == '.';
         if (okL && okR && afterDot)
         {
-            offsetLineCol(g_refText, j, r.line, r.col);
+            offsetLineColFast(j, r.line, r.col);
             return r;
         }
         i = j + name.length;
@@ -680,9 +761,9 @@ private RefPos declPos(Loc loc, Identifier ident)
     if (!g_refText.length)
         return r;
     auto name = ident.toString();
-    if (!name.length || textSpells(g_refText, loc.linnum(), loc.charnum(), name))
+    if (!name.length || spellsAtFast(loc.linnum(), loc.charnum(), name))
         return r;
-    size_t start = refOffset(g_refText, loc.linnum(), loc.charnum());
+    size_t start = refOffsetFast(loc.linnum(), loc.charnum());
     size_t i = start;
     while (i < g_refText.length)
     {
@@ -694,7 +775,7 @@ private RefPos declPos(Loc loc, Identifier ident)
             !isIdentChar(g_refText[j + name.length]);
         if (okL && okR)
         {
-            offsetLineCol(g_refText, j, r.line, r.col);
+            offsetLineColFast(j, r.line, r.col);
             return r;
         }
         i = j + name.length;
@@ -718,7 +799,7 @@ private RefPos typeBackPos(Loc anchor, Identifier ident)
     auto name = ident.toString();
     if (!name.length)
         return none;
-    size_t off = refOffset(g_refText, anchor.linnum(), anchor.charnum());
+    size_t off = refOffsetFast(anchor.linnum(), anchor.charnum());
     size_t ls = off;
     while (ls > 0 && g_refText[ls - 1] != '\n')
         ls--;
@@ -741,7 +822,7 @@ private RefPos typeBackPos(Loc anchor, Identifier ident)
     if (best == size_t.max)
         return none;
     RefPos r;
-    offsetLineCol(g_refText, best, r.line, r.col);
+    offsetLineColFast(best, r.line, r.col);
     return r;
 }
 
@@ -757,6 +838,7 @@ private struct Hit
 private Hit[] g_hits; // collect mode (resolvedSymbolAt)
 private bool g_collect;
 private DeclKey g_key; // key mode (referencesForKey)
+private Identifier g_keyIdent; // interned target name (O(1) reject)
 private bool g_keyMode;
 
 private bool isTarget(Dsymbol sym, Dsymbol target)
@@ -765,8 +847,8 @@ private bool isTarget(Dsymbol sym, Dsymbol target)
         return false;
     if (g_keyMode)
     {
-        // Cheap name filter before the allocating key comparison.
-        if (sym.ident.toString() != g_key.name)
+        // Interned-identifier pointer check before the allocating key compare.
+        if (g_keyIdent !is null && sym.ident !is g_keyIdent)
             return false;
         return keyMatches(declKey(sym), g_key);
     }

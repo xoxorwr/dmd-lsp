@@ -785,16 +785,13 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     // The target identity must be copied before any reset invalidates the
     // request universe; matching below is by key only.
     auto key = declKey(target);
-    // In-universe result: covers the request closure and is the fallback.
-    ulong tBase0 = nowMs();
-    RefLoc[] base = findReferences(cast(Module)a.module_, target, includeDecl,
-        path, orig);
-    traceMs("refs.wide.base", nowMs() - tBase0);
 
     string declName = r.declFile.length ? indexModuleOfFile(r.declFile) : null;
     if (!declName.length)
     {
-        r.refs = base;
+        // No index mapping: fall back to the in-universe closure walk (rare).
+        r.refs = findReferences(cast(Module)a.module_, target, includeDecl,
+            path, orig);
         r.complete = false;
         r.reason = "declaring module not indexed";
         return r;
@@ -889,7 +886,7 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     }
     traceMs("refs.wide.analyze", nowMs() - tAnalyze0, "modules");
     traceMs("refs.wide.total", nowMs() - tComputeStart);
-    r.refs = mergeRefs(base, out_);
+    r.refs = mergeRefs(out_, null);
     r.complete = complete;
     r.reason = reason;
     return r;

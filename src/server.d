@@ -367,6 +367,10 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
     ulong t0 = nowMs();
     s.scratch.reset();
     dmdResetRequest(s.dmd, &s.sink);
+    // The dropped universe is unreferenced now: reclaim it before parsing the
+    // next one, so analysing a batch of candidate roots stays at ~one universe
+    // of peak memory instead of two.
+    GC.collect();
     StdoutGuard og;
     stdoutToStderr(og);
     auto pr = dmdParseOnly(path, text);
