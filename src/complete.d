@@ -106,7 +106,8 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
 private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte kind,
     const(char)[] detail, const(char)[] doc, const(char)[] sortPrefix,
     ref bool[const(char)[]] seen,
-    Dsymbol sym = null, const(char)[] desc = null)
+    Dsymbol sym = null, const(char)[] desc = null, const(char)[] marker = null,
+    const(char)[] labelDetailOverride = null)
 {
     if (label.length == 0 || label in seen)
         return;
@@ -117,7 +118,7 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
     lp[0 .. label.length] = label[];
     lp[label.length] = 0;
     const(char)[] ls = lp[0 .. label.length];
-    const(char)[] ds = arenaDupStr(a, detail);
+    const(char)[] ds = detail;
     const(char)[] dc = arenaDupStr(a, doc);
     const(char)[] ld = null;
     const(char)[] lx = null;
@@ -125,6 +126,17 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
         itemParts(a, sym, ld, lx);
     else if (desc.length)
         lx = desc;
+    if (labelDetailOverride.length)
+        ld = labelDetailOverride;
+    if (marker.length)
+    {
+        // Surface where the item comes from (UFCS, alias this) in the
+        // labelDetails line the editor shows inline, and in `detail` for
+        // clients that do not support labelDetails.
+        ds = withMarker(ds, marker);
+        lx = withMarker(lx, marker);
+    }
+    ds = arenaDupStr(a, ds);
     ld = arenaDupStr(a, ld);
     lx = arenaDupStr(a, lx);
     string sort = (cast(string)sortPrefix ~ label.idup);
@@ -148,6 +160,16 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
         o.capItems = ncap;
     }
     o.items[o.nitems++] = LspCompletionItem(ls, kind, ds, dc, ss, ld, lx);
+}
+
+// Append an origin marker to a label's detail, e.g. `int (alias this)`.
+private const(char)[] withMarker(const(char)[] s, const(char)[] marker)
+{
+    if (!marker.length)
+        return s;
+    if (!s.length)
+        return marker;
+    return cast(const(char)[]) (cast(string) s ~ " (" ~ marker ~ ")");
 }
 
 private const(char)[] arenaDupStr(Arena* a, const(char)[] s)
@@ -328,7 +350,8 @@ private const(char)[] qualifiedName(Dsymbol s)
 
 // Function label parts for LSP 3.17 `labelDetails`: the parameter list
 // (e.g. "(int, string)") and the return type. Empty for non-functions.
-private const(char)[] funcParamList(Arena* a, TypeFunction tf, bool withNames)
+private const(char)[] funcParamList(Arena* a, TypeFunction tf, bool withNames,
+    bool skipFirst = false)
 {
     import core.stdc.string : strlen;
     string buf = "(";
@@ -338,6 +361,9 @@ private const(char)[] funcParamList(Arena* a, TypeFunction tf, bool withNames)
         {
             auto p = (*tf.parameterList.parameters)[i];
             if (!p)
+                continue;
+            // UFCS: the receiver fills the first parameter, so it is not shown.
+            if (skipFirst && i == 0)
                 continue;
             if (!first)
                 buf ~= ", ";
@@ -1554,12 +1580,12 @@ private Dsymbol[] followTypeDepth(Type t, Module root, Dsymbol[] rootMembers, in
     if (auto ts = tb.isTypeStruct())
     {
         if (ts.sym)
-            return scopeMembers(ts.sym);
+            return aggregateMembers(ts.sym, depth, root, rootMembers);
     }
     else if (auto tc = tb.isTypeClass())
     {
         if (tc.sym)
-            return scopeMembers(tc.sym);
+            return aggregateMembers(tc.sym, depth, root, rootMembers);
     }
     else if (auto te = tb.isTypeEnum())
     {
@@ -1567,6 +1593,22 @@ private Dsymbol[] followTypeDepth(Type t, Module root, Dsymbol[] rootMembers, in
             return scopeMembers(te.sym);
     }
     return null;
+}
+
+// An aggregate's own members plus those promoted by `alias this` (`w.field`
+// for a field of `w`'s subobject). `aliasthis.sym` is the resolved target
+// member; `depth` keeps a cyclic `alias this` finite.
+private Dsymbol[] aggregateMembers(AggregateDeclaration ad, int depth,
+    Module root, Dsymbol[] rootMembers)
+{
+    auto mem = scopeMembers(ad);
+    if (ad.aliasthis && ad.aliasthis.sym)
+    {
+        auto more = stepInto(ad.aliasthis.sym, depth + 1, root, rootMembers);
+        if (more.length)
+            mem ~= more;
+    }
+    return mem;
 }
 
 // A built-in array / associative-array type (not a user aggregate). D exposes
@@ -1703,7 +1745,10 @@ private void addUfcsCandidate(Arena* a, Dsymbol s, Dsymbol agg,
     auto nm = s.ident.toString();
     if (nm in seen || !hasPrefix(nm, prefix))
         return;
-    pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(s), "1", seen, s);
+    // The receiver is passed as the first argument, so it is not part of the
+    // signature the user sees (`ev.helper()` for `void helper(Event e)`).
+    pushItem(a, o, nm, 3, typeDetail(fd.type), docOf(s), "1", seen, s, null,
+        "UFCS", funcParamList(a, tf, false, true));
 }
 
 private Dsymbol findMember(Dsymbol[] members, const(char)[] name)
@@ -3547,6 +3592,29 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             out_.incomplete = true;
             return;
         }
+        // Names reachable only through `alias this`: marked so the editor can
+        // show which suggestions are promoted from the subobject.
+        bool[const(char)[]] promoted;
+        {
+            Dsymbol aggM = aggregateSym(lhsType);
+            if (!aggM)
+                aggM = lhsAgg;
+            if (auto ad = aggM ? aggM.isAggregateDeclaration() : null)
+                if (ad.aliasthis && ad.aliasthis.sym)
+                {
+                    bool[const(char)[]] own;
+                    foreach (m; scopeMembers(ad))
+                        if (m.ident)
+                            own[m.ident.toString()] = true;
+                    foreach (m; stepInto(ad.aliasthis.sym, 0, mod, rootMembers))
+                        if (m.ident)
+                        {
+                            auto pn = m.ident.toString();
+                            if (pn !in own)
+                                promoted[pn] = true;
+                        }
+                }
+        }
         foreach (m; scope_)
         {
             if (!m.ident)
@@ -3556,8 +3624,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             const(char)[] nm = m.ident.toString();
             if (!hasPrefix(nm, prefix))
                 continue;
+            const(char)[] marker = (nm in promoted) ? "alias this" : null;
             pushItem(arena, out_, nm, kindOf(m), typeDetail(symType(m)),
-                docOf(m), "1", seen, m);
+                docOf(m), "1", seen, m, null, marker);
             if (out_.nitems >= 500)
                 break;
         }

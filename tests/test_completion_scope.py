@@ -14,6 +14,9 @@ enum EventType { GFX_RESIZE, INPUT_KEY_DOWN }
 struct Event { EventType type; int consumed; Vec2 resize; }
 struct Vec2 { int width; int height; }
 
+struct Inner { int promoted; }
+struct Wrapper { Inner inner; alias inner this; }
+
 Event make_event() { return Event.init; }
 '''
 
@@ -43,6 +46,12 @@ void on_with_nested()
     {
         width;
     }
+}
+
+void on_alias_this()
+{
+    Wrapper w;
+    auto x = w.promoted;
 }
 
 void on_ref(ref Event arg)
@@ -274,10 +283,15 @@ check('renamed-import',
 # (`helper`), not ones whose first parameter does not (`helperInt`).
 ul = line_of('void on_ufcs')
 el = ul + 2  # the `    ev.` line
-labels = complete(el, len(lines[el]))
+items = complete_items(el, len(lines[el]))
+labels = [i['label'] for i in items]
+helper = next((i for i in items if i['label'] == 'helper'), None)
 check('ufcs-completion',
-      'helper' in labels and 'helperInt' not in labels,
-      str(sorted(set(labels))[:10]))
+      'helper' in labels and 'helperInt' not in labels
+      and helper is not None
+      and (helper.get('labelDetails') or {}).get('detail') == '()'
+      and 'UFCS' in ((helper.get('labelDetails') or {}).get('description') or ''),
+      str(helper))
 
 # 12) `with (e) { ... }`: Event's fields are in scope unqualified (complete at
 # the line start, empty prefix, so every field is offered).
@@ -293,6 +307,20 @@ nl = line_of('        width;')
 labels = complete(nl, 8)
 check('with-nested-scope',
       'width' in labels and 'height' in labels and 'consumed' in labels,
+      str(sorted(set(labels))[:12]))
+
+# 14) `alias this`: `w.` offers the wrapper's own member and the subobject's
+# promoted members, the latter marked as such.
+atl = line_of('auto x = w.promoted;')
+items = complete_items(atl, lines[atl].index('w.') + 2)
+labels = [i['label'] for i in items]
+own = next((i for i in items if i['label'] == 'inner'), None)
+prom = next((i for i in items if i['label'] == 'promoted'), None)
+check('alias-this-completion',
+      'inner' in labels and 'promoted' in labels and own is not None
+      and prom is not None
+      and (own.get('labelDetails') or {}).get('description') == 'Inner'
+      and 'alias this' in ((prom.get('labelDetails') or {}).get('description') or ''),
       str(sorted(set(labels))[:12]))
 
 proc.stdin.close()

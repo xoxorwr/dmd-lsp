@@ -614,6 +614,24 @@ check('ufcs-property-refs',
       prefs == [('uf.d', 4, 4, 8), ('uf.d', 10, 15, 19)], str(prefs))
 d.close()
 
+# `alias this`: a use through the promoted member (`w.promoted`) resolves to the
+# subobject's field, so references/rename already follow it.
+at = ('module al;\n'
+      'struct Inner { int promoted; }\n'
+      'struct Wrapper { Inner inner; alias inner this; }\n'
+      'void f() { Wrapper w; auto x = w.promoted; }\n')
+atp = os.path.join(root, 'al.d')
+open(atp, 'w').write(at)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(atp, at)
+d.drain(1.0)
+atrefs = fmt(d.references(atp, 1, 19, True))  # `promoted`
+check('alias-this-refs',
+      atrefs == [('al.d', 1, 19, 27), ('al.d', 3, 33, 41)], str(atrefs))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)
