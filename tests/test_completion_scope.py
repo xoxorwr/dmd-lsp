@@ -72,6 +72,18 @@ void on_factory()
 {
     auto ev = make_event().
 }
+
+void on_array()
+{
+    Event[] arr;
+    arr.
+}
+
+void on_array_index()
+{
+    Event[] arr2;
+    arr2[0].
+}
 '''
 
 os.makedirs(SRC)
@@ -188,6 +200,20 @@ cl = line_of('make_event().')
 labels = complete(cl, len(lines[cl]))
 check('call-result-members', 'resize' in labels and 'type' in labels,
       str(sorted(set(labels))[:8]))
+
+# 8) a dynamic array local: `arr.` offers the built-in properties, not the
+# element's fields (`Event`'s `type`/`consumed` must not appear).
+al = line_of('    arr.')
+labels = complete(al, len(lines[al]))
+check('array-member-properties',
+      'length' in labels and 'ptr' in labels and 'dup' in labels
+      and 'type' not in labels and 'consumed' not in labels,
+      str(sorted(set(labels))[:8]))
+# Indexing on the same array completes on the *element* type.
+ail = line_of('arr2[0].')
+labels = complete(ail, len(lines[ail]))
+check('array-index-element-members',
+      'type' in labels and 'consumed' in labels, str(sorted(set(labels))[:8]))
 
 proc.stdin.close()
 proc.wait(timeout=5)

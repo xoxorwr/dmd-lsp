@@ -1499,6 +1499,51 @@ private Dsymbol[] followTypeDepth(Type t, Module root, Dsymbol[] rootMembers, in
     return null;
 }
 
+// A built-in array / associative-array type (not a user aggregate). D exposes
+// the element's members only through an index (`arr[i].field`), never `arr.`.
+private bool isBuiltinArrayType(Type t)
+{
+    if (!t)
+        return false;
+    Type tb = t.toBasetype();
+    if (!tb)
+        return false;
+    return tb.ty == TY.Tsarray || tb.ty == TY.Tarray || tb.ty == TY.Taarray;
+}
+
+// Built-in array properties/methods for `arr.`. Labels only: the heuristic
+// engine has no `Dsymbol` for them, which is fine for completion.
+private void pushArrayProperties(Arena* a, ref CompleteOut o,
+    ref bool[const(char)[]] seen, const(char)[] prefix, Type t)
+{
+    Type tb = t ? t.toBasetype() : null;
+    if (!tb)
+        return;
+    const(char)[][] names;
+    switch (tb.ty)
+    {
+    case TY.Tarray:
+        names = ["length", "ptr", "dup", "idup", "capacity", "reserve",
+            "reverse", "sort"];
+        break;
+    case TY.Tsarray:
+        names = ["length", "ptr", "dup", "idup", "reverse", "sort"];
+        break;
+    case TY.Taarray:
+        names = ["length", "keys", "values", "byKey", "byValue", "byKeyValue",
+            "rehash", "dup", "get", "require", "update"];
+        break;
+    default:
+        return;
+    }
+    foreach (nm; names)
+    {
+        if (!hasPrefix(nm, prefix))
+            continue;
+        pushItem(a, o, nm, 10, "property", null, "1", seen);
+    }
+}
+
 private Dsymbol findMember(Dsymbol[] members, const(char)[] name)
 {
     foreach (m; members)
@@ -1520,7 +1565,8 @@ struct NameType
 
 // Resolve the scope denoted by `lhs` chain segments.
 private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
-    Dsymbol[] rootMembers, NameType[] locals, int depth = 0)
+    Dsymbol[] rootMembers, NameType[] locals, int depth = 0,
+    Type* valueType = null)
 {
     if (!segs.length)
         return null;
@@ -1551,6 +1597,8 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
                     cm = stepInto(m, depth + 1, root, rootMembers);
             }
             curMembers = cm;
+            if (valueType)
+                *valueType = v.type ? v.type : (v.sym ? symType(v.sym) : null);
         }
     }
     if (!shadowed)
@@ -1566,6 +1614,8 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
         if (!cur)
             return null;
         curMembers = stepInto(cur, depth + 1, root, rootMembers);
+        if (valueType)
+            *valueType = symType(cur);
         if (!curMembers.length)
             return null;
     }
@@ -1577,6 +1627,8 @@ private Dsymbol[] resolveLhs(Module root, const(char)[][] segs,
         auto m = findMember(curMembers, baseName(segs[k]));
         if (!m)
             return null;
+        if (valueType)
+            *valueType = symType(m);
         curMembers = stepInto(m, depth + 1, root, rootMembers);
         if (k + 1 < segs.length && !curMembers.length)
             return null;
@@ -3307,7 +3359,17 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         // its members), for both plain and `static import`.
         if (importPathCompletion(arena, mod, segs, prefix, out_, seen))
             return;
-        auto scope_ = resolveLhs(mod, segs, rootMembers, slots);
+        Type lhsType;
+        auto scope_ = resolveLhs(mod, segs, rootMembers, slots, 0, &lhsType);
+        // A plain `arr.` is the array itself, so offer the built-in properties;
+        // `followTypeDepth` unwraps arrays only for indexed access (`arr[i].`).
+        bool indexedLast = segs.length &&
+            baseName(segs[$ - 1]).length != segs[$ - 1].length;
+        if (lhsType && !indexedLast && isBuiltinArrayType(lhsType))
+        {
+            pushArrayProperties(arena, out_, seen, prefix, lhsType);
+            return;
+        }
         if (!scope_.length)
         {
             out_.incomplete = true;
