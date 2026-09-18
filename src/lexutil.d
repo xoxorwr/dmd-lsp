@@ -1,9 +1,8 @@
 module lexutil;
 
-// Minimal D identifier scanner for lint use-sets.
-// Struct-only. Skips comments/strings/numbers. Bails (returns false)
-// on token-string / heredoc / quote-delimited forms we don't model,
-// so callers can conservatively skip the file instead of misreporting.
+// Identifier scanner for lint use-sets, backed by dmd's own `Lexer` (comments,
+// strings, token strings and raw strings are the frontend's problem, not ours).
+// `ok` is false only if the arena could not grow.
 
 struct IdentHit
 {
@@ -20,16 +19,6 @@ struct ScanOut
     bool ok = true;
     bool riskyMixin = false;   // mixin("...") string form seen
     bool riskyTraits = false;  // __traits(allMembers|derivedMembers|getMember|compiles)
-}
-
-private bool isIdentStart(char c) pure nothrow @nogc @safe
-{
-    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-private bool isIdentChar(char c) pure nothrow @nogc @safe
-{
-    return isIdentStart(c) || (c >= '0' && c <= '9') || c == '$';
 }
 
 private void pushHit(ref ScanOut o, Arena* a, const(char)[] name, uint line, uint col)
@@ -57,254 +46,58 @@ import arena;
 // Lines reported as baseLine + internal offset.
 bool scanIdents(Arena* arena, const(char)[] src, uint baseLine, ref ScanOut out_)
 {
+    out_.hits = null;
+    out_.nhits = 0;
+    out_.capHits = 0;
     out_.ok = true;
-    size_t i = 0;
-    uint line = baseLine;
-    uint col = 1;
-    const n = src.length;
+    out_.riskyMixin = false;
+    out_.riskyTraits = false;
+    if (!src.length)
+        return true;
 
-    // helper to peek identifier ahead without emitting (for mixin/__traits checks)
-    while (i < n)
+    // Use dmd's own lexer: it handles comments, strings, token strings and
+    // raw strings correctly, so no tolerant hand-rolled scanner is needed.
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    auto buf = src.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+
+    // Tokenise once so the risky-construct checks can look ahead.
+    Token[] toks;
+    while (true)
     {
-        char c = src[i];
-        // newlines
-        if (c == '\n')
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        toks ~= t;
+    }
+
+    foreach (i, t; toks)
+    {
+        if (t.value == TOK.identifier)
         {
-            i++;
-            line++;
-            col = 1;
-            continue;
-        }
-        if (c == '\r')
-        {
-            i++;
-            continue;
-        }
-        // whitespace
-        if (c == ' ' || c == '\t' || c == '\v' || c == '\f')
-        {
-            i++;
-            col++;
-            continue;
-        }
-        // line comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '/')
-        {
-            i += 2;
-            col += 2;
-            while (i < n && src[i] != '\n')
-            {
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // block /+ +/ nested comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '+')
-        {
-            i += 2;
-            col += 2;
-            uint depth = 1;
-            while (i < n && depth > 0)
-            {
-                if (src[i] == '\n')
-                {
-                    i++;
-                    line++;
-                    col = 1;
-                    continue;
-                }
-                if (src[i] == '/' && i + 1 < n && src[i + 1] == '+')
-                {
-                    depth++;
-                    i += 2;
-                    col += 2;
-                    continue;
-                }
-                if (src[i] == '+' && i + 1 < n && src[i + 1] == '/')
-                {
-                    depth--;
-                    i += 2;
-                    col += 2;
-                    continue;
-                }
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // block /* */ comment
-        if (c == '/' && i + 1 < n && src[i + 1] == '*')
-        {
-            i += 2;
-            col += 2;
-            while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/'))
-            {
-                if (src[i] == '\n')
-                {
-                    line++;
-                    col = 1;
-                }
-                else
-                    col++;
-                i++;
-            }
-            if (i + 1 < n)
-            {
-                i += 2;
-                col += 2;
-            }
-            continue;
-        }
-        // wysiwyg r"..." and alternate W"..."? only r prefix: r"..."
-        if ((c == 'r' || c == 'R') && i + 1 < n && src[i + 1] == '"')
-        {
-            i += 2;
-            col += 2;
-            while (i < n && src[i] != '"')
-            {
-                if (src[i] == '\n')
-                {
-                    line++;
-                    col = 1;
-                }
-                else
-                    col++;
-                i++;
-            }
-            if (i < n)
-            {
-                i++;
-                col++;
-            }
-            // trailing postfix like "c"? skip one ident char run? keep simple:
-            continue;
-        }
-        // plain double-quoted string
-        if (c == '"')
-        {
-            i++;
-            col++;
-            while (i < n && src[i] != '"' && src[i] != '\n')
-            {
-                if (src[i] == '\\' && i + 1 < n)
-                {
-                    i += 2;
-                    col += 2;
-                    continue;
-                }
-                i++;
-                col++;
-            }
-            if (i < n && src[i] == '"')
-            {
-                i++;
-                col++;
-            }
-            // string postfix (c,w,d)? skip attached ident chars
-            while (i < n && (src[i] == 'c' || src[i] == 'w' || src[i] == 'd') && !isIdentChar(i + 1 < n ? src[i + 1] : 0))
-                break; // only single-char postfix; keep simple: do nothing
-            continue;
-        }
-        // char literal
-        if (c == '\'')
-        {
-            i++;
-            col++;
-            if (i < n && src[i] == '\\')
-            {
-                i += 2;
-                col += 2;
-            }
-            while (i < n && src[i] != '\'' && src[i] != '\n')
-            {
-                i++;
-                col++;
-            }
-            if (i < n && src[i] == '\'')
-            {
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // backtick strings / token strings / delimited strings: bail (conservative)
-        if (c == '`')
-        {
-            out_.ok = false;
-            return false;
-        }
-        // numbers (incl. hexfloat): skip alnum run + dots
-        if (c >= '0' && c <= '9')
-        {
-            while (i < n && (isIdentChar(src[i]) || src[i] == '.' || src[i] == '_'))
-            {
-                i++;
-                col++;
-            }
-            continue;
-        }
-        // identifiers / keywords
-        if (isIdentStart(c))
-        {
-            size_t s = i;
-            uint scol = col;
-            while (i < n && isIdentChar(src[i]))
-            {
-                i++;
-                col++;
-            }
-            auto name = src[s .. i];
-            // token-string / delimited-string opener: q{ q( q[ q< q" -> bail
-            if ((name == "q" || name == "Q") && i < n &&
-                (src[i] == '{' || src[i] == '(' || src[i] == '[' || src[i] == '<' || src[i] == '"'))
-            {
-                out_.ok = false;
-                return false;
-            }
-            pushHit(out_, arena, name, line, scol);
+            uint line = baseLine + t.loc.linnum() - 1;
+            pushHit(out_, arena, t.ident.toString(), line, t.loc.charnum());
             if (!out_.ok)
                 return false;
-            // mixin("...") risk: mixin keyword followed by ( " — check ahead
-            if (name == "mixin")
-            {
-                size_t j = i;
-                while (j < n && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n' || src[j] == '\r'))
-                    j++;
-                if (j < n && src[j] == '(')
-                {
-                    j++;
-                    while (j < n && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n' || src[j] == '\r'))
-                        j++;
-                    if (j < n && (src[j] == '"' || src[j] == '`' ||
-                            ((src[j] == 'q' || src[j] == 'Q') && j + 1 < n)))
-                        out_.riskyMixin = true;
-                }
-            }
-            if (name == "__traits")
-            {
-                size_t j = i;
-                while (j < n && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n' || src[j] == '\r'))
-                    j++;
-                if (j < n && src[j] == '(')
-                {
-                    j++;
-                    while (j < n && (src[j] == ' ' || src[j] == '\t' || src[j] == '\n' || src[j] == '\r'))
-                        j++;
-                    size_t k = j;
-                    while (k < n && isIdentChar(src[k]))
-                        k++;
-                    auto inner = src[j .. k];
-                    if (inner == "allMembers" || inner == "derivedMembers" ||
-                        inner == "getMember" || inner == "compiles")
-                        out_.riskyTraits = true;
-                }
-            }
-            continue;
         }
-        // anything else
-        i++;
-        col++;
+        else if (t.value == TOK.mixin_ && i + 2 < toks.length &&
+            toks[i + 1].value == TOK.leftParenthesis &&
+            toks[i + 2].value == TOK.string_)
+            out_.riskyMixin = true; // mixin("...") string mixin
+        else if (t.value == TOK.traits && i + 2 < toks.length &&
+            toks[i + 1].value == TOK.leftParenthesis &&
+            toks[i + 2].value == TOK.identifier)
+        {
+            auto tr = toks[i + 2].ident.toString();
+            if (tr == "allMembers" || tr == "derivedMembers" ||
+                tr == "getMember" || tr == "compiles")
+                out_.riskyTraits = true;
+        }
     }
     return true;
 }
