@@ -657,6 +657,42 @@ check('opdispatch-no-wrong-location',
       and not any(l == 8 for (_, l, _, _) in oprefs), str(oprefs))
 d.close()
 
+# textDocument/implementation: derived classes for an interface, and overrides
+# for an interface method. The importer is on disk so the workspace index finds
+# it (the request universe alone does not contain it).
+imb = 'module ibase;\ninterface Ii\n{\n    void run();\n}\n'
+imm = 'module imain;\nimport ibase;\nclass Impl : Ii\n{\n    void run() {}\n}\n'
+ibp = os.path.join(root, 'ibase.d')
+imp = os.path.join(root, 'imain.d')
+open(ibp, 'w').write(imb)
+open(imp, 'w').write(imm)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(ibp, imb)
+d.drain(1.0)
+
+def implementation(path, line, ch):
+    d.send({"jsonrpc": "2.0", "id": 120,
+            "method": "textDocument/implementation",
+            "params": {"textDocument": {"uri": 'file://' + path},
+                       "position": {"line": line, "character": ch}}})
+    return d.read_msg().get('result')
+
+irefs = implementation(ibp, 1, 10)  # `Ii`
+check('implementation-interface',
+      bool(irefs) and any(r['uri'].endswith('/imain.d')
+                          and r['range']['start']['line'] == 2 for r in irefs),
+      str(irefs))
+mrefs = implementation(ibp, 3, 9)  # `Ii.run`
+check('implementation-method',
+      bool(mrefs) and any(r['uri'].endswith('/imain.d')
+                          and r['range']['start']['line'] == 4 for r in mrefs),
+      str(mrefs))
+d.close()
+os.remove(ibp)
+os.remove(imp)
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

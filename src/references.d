@@ -29,6 +29,7 @@ import dmd.location : Loc;
 import dmd.typesem : toBasetype;
 import core.stdc.string : strlen;
 import session : sessionReadDisk;
+import complete : appendScopeSubs;
 
 // ---------- declaration identity ----------
 // A declaration's identity, independent of the live pointer/universe it was
@@ -301,6 +302,93 @@ RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl
     g_keyMode = false;
     g_keyIdent = null;
     return out_;
+}
+
+// Recursively collect class/interface declarations, descending through
+// attribute/conditional blocks and nested aggregate scopes.
+private void collectClassDecls(Dsymbol[] members, ref ClassDeclaration[] out_)
+{
+    foreach (s; members)
+    {
+        if (!s)
+            continue;
+        if (auto cd = s.isClassDeclaration())
+        {
+            out_ ~= cd;
+            if (cd.members)
+            {
+                Dsymbol[] sub;
+                foreach (i; 0 .. (*cd.members).length)
+                    sub ~= (*cd.members)[i];
+                collectClassDecls(sub, out_);
+            }
+        }
+        else
+        {
+            Dsymbol[] subs;
+            appendScopeSubs(s, subs);
+            if (subs.length)
+                collectClassDecls(subs, out_);
+        }
+    }
+}
+
+// Locations in `mod` that implement `classKey`: derived classes (when
+// `methodName` is empty) or methods overriding `methodName`. The base is found
+// by key *within this universe*, so the caller can analyse each candidate
+// module independently.
+void implementationLocs(Module mod, ref const DeclKey classKey,
+    const(char)[] methodName, ref RefLoc[] out_)
+{
+    if (!mod)
+        return;
+    // The base may be imported, so scan the whole closure of this root: all
+    // symbols then come from the same universe (`isBaseOf` needs that).
+    ClassDeclaration[] classes;
+    foreach (m; importClosure(mod))
+    {
+        if (!m || !m.members)
+            continue;
+        Dsymbol[] top;
+        foreach (i; 0 .. (*m.members).length)
+            top ~= (*m.members)[i];
+        collectClassDecls(top, classes);
+    }
+    ClassDeclaration base = null;
+    foreach (cd; classes)
+        if (keyMatches(declKey(cd), classKey))
+        {
+            base = cd;
+            break;
+        }
+    if (!base)
+        return;
+    foreach (cd; classes)
+    {
+        if (cd is base)
+            continue;
+        if (!base.isBaseOf(cd, null))
+            continue;
+        auto cm = moduleOf(cd);
+        auto f = cm ? modulePath(cm) : null;
+        if (!f.length)
+            continue;
+        if (methodName.length)
+        {
+            if (!cd.members)
+                continue;
+            foreach (i; 0 .. (*cd.members).length)
+            {
+                auto fd = (*cd.members)[i].isFuncDeclaration();
+                if (fd && fd.ident && fd.ident.toString() == methodName)
+                    out_ ~= RefLoc(f.idup, fd.loc.linnum(), fd.loc.charnum(),
+                        cast(uint)methodName.length);
+            }
+        }
+        else
+            out_ ~= RefLoc(f.idup, cd.loc.linnum(), cd.loc.charnum(),
+                cast(uint)classKey.name.length);
+    }
 }
 
 // Merge two location lists, dropping duplicates.

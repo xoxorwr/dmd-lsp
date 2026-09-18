@@ -26,7 +26,7 @@ import symbols : DocSymbol, documentSymbols;
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
-    isAggregateMember;
+    isAggregateMember, implementationLocs;
 
 import lint;
 import semantic : SemTok, semanticTokens;
@@ -34,6 +34,7 @@ import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnl
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
 
 import dmd.dmodule : Module;
+import dmd.dsymbol : Dsymbol;
 
 version (Posix)
 {
@@ -293,6 +294,25 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
+    private void sendImplementations(RefLoc[] locs)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        foreach (r; locs)
+        {
+            auto o = js.create_object();
+            addStrOpt(js, o, "file", r.file);
+            js.add_number_to_object(o, "line", r.line);
+            js.add_number_to_object(o, "col", r.col);
+            js.add_number_to_object(o, "len", r.len);
+            js.add_item_to_array(arr, o);
+        }
+        js.add_item_to_object(root, "locs", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
     // Recursively emit one DocumentSymbol (LSP shape) into `arr`.
     private void addDocSymbol(Json js, JsonNode* arr, ref DocSymbol d)
     {
@@ -483,6 +503,67 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         else
             definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
         sendDefinition(def);
+    }
+
+    // Best-effort `textDocument/implementation`: derived classes for a class/
+    // interface, overrides for a method. Each candidate module is analysed on
+    // its own and the base is matched by key (symbols do not cross universes).
+    private void implementationAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] path, const(char)[] orig, uint line, uint col)
+    {
+        import core.stdc.string : strlen;
+        auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
+        Dsymbol cls = null;
+        const(char)[] methodName = null;
+        if (target)
+        {
+            if (auto fd = target.isFuncDeclaration())
+            {
+                if (fd.parent)
+                    cls = fd.parent.isClassDeclaration();
+                if (cls)
+                    methodName = target.ident ? target.ident.toString().idup : null;
+            }
+            else if (target.isClassDeclaration())
+                cls = target;
+        }
+        if (!cls)
+        {
+            sendImplementations(null);
+            return;
+        }
+        auto classKey = declKey(cls);
+        const(char)* df = cls.loc.filename();
+        string declFile = df ? df[0 .. strlen(df)].idup : null;
+        string declName = declFile.length ? indexModuleOfFile(declFile) : null;
+        RefLoc[] out_;
+        if (!declName.length)
+        {
+            implementationLocs(cast(Module)a.module_, classKey, methodName, out_);
+            sendImplementations(out_);
+            return;
+        }
+        bool[string] want;
+        want[declName] = true;
+        string reqName = indexModuleOfFile(path);
+        if (reqName.length)
+            want[reqName] = true;
+        foreach (mn; importerModules(declName))
+            want[mn] = true;
+        foreach (mn, _; want)
+        {
+            auto f = indexFileOf(mn);
+            if (!f.length)
+                continue;
+            const(char)[] text = (f == path && orig.length) ? orig : sessionReadDisk(f);
+            if (!text.length)
+                continue;
+            auto ca = serverAnalyze(s, f, text);
+            if (!ca.ok || !ca.module_)
+                continue;
+            implementationLocs(cast(Module)ca.module_, classKey, methodName, out_);
+        }
+        sendImplementations(mergeRefs(out_, null));
     }
 
     private void hoverAndSend(ref ServerState s, const ref Analysis a,
@@ -1272,6 +1353,39 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 built = true;
                 continue;
             }
+            if (ops == "implementation")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    implementationAndSend(s, a, path, orig, line, col);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                if (forkRun(() {
+                    implementationAndSend(s, a, path, orig, line, col);
+                }))
+                    continue;
+                sendImplementations(null);
+                built = true;
+                continue;
+            }
             if (ops == "references")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
@@ -2007,6 +2121,40 @@ ExchangeResult workerTypeDefinition(ref Worker w, const(char)[] path,
         out_.col = cast(uint)jint(jget(r, "col"));
         out_.len = cast(size_t)jint(jget(r, "len"));
     }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref WRef[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("implementation"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto la = jget(r, "locs"))
+        if ((la.type & 0xFF) == JsonArray)
+            for (auto c = la.child; c; c = c.next)
+            {
+                WRef l;
+                l.file = dupOrEmpty(jstr(jget(c, "file")));
+                l.line = cast(uint)jint(jget(c, "line"));
+                l.col = cast(uint)jint(jget(c, "col"));
+                l.len = cast(uint)jint(jget(c, "len"));
+                out_ ~= l;
+            }
     return ExchangeResult.ok;
 }
 

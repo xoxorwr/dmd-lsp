@@ -320,6 +320,33 @@ private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
     return false;
 }
 
+// Same, for `textDocument/implementation` (returns every location).
+private bool workerImplementationRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref worker.WRef[] locs)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerImplementation(app.wk, path, atext, origText, line, col, locs);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 // Run a hover request against the worker, respawning once if needed.
 private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     const(char)[] origText, uint line, uint col, ref worker.WHover hov)
@@ -1602,6 +1629,7 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "definitionProvider", true);
         js.add_bool_to_object(caps, "declarationProvider", true);
         js.add_bool_to_object(caps, "typeDefinitionProvider", true);
+        js.add_bool_to_object(caps, "implementationProvider", true);
         js.add_bool_to_object(caps, "referencesProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "documentSymbolProvider", true);
@@ -1761,6 +1789,60 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             else
                 lspRespond(m.idJson, `{"signatures":[]}`);
+            return;
+        }
+        if (m.method == "textDocument/implementation")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            ensureIndex(app); // enables workspace-wide implementation search
+            worker.WRef[] locs;
+            if (workerImplementationRetry(app, path, atext, text, line, col, locs))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (l; locs)
+                {
+                    auto loc = js.create_object();
+                    js.add_string_to_object(loc, "uri", zstr(pathToUri(l.file)));
+                    uint sline = l.line > 0 ? l.line - 1 : 0;
+                    uint scol = l.col > 0 ? l.col - 1 : 0;
+                    auto range = js.create_object();
+                    auto st = js.create_object();
+                    js.add_number_to_object(st, "line", sline);
+                    js.add_number_to_object(st, "character", scol);
+                    auto en = js.create_object();
+                    js.add_number_to_object(en, "line", sline);
+                    js.add_number_to_object(en, "character", scol + l.len);
+                    js.add_item_to_object(range, "start", st);
+                    js.add_item_to_object(range, "end", en);
+                    js.add_item_to_object(loc, "range", range);
+                    js.add_item_to_array(arr, loc);
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
             return;
         }
         if (m.method == "textDocument/definition" ||
