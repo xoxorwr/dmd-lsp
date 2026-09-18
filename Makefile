@@ -20,7 +20,7 @@ PLATFORM_EXTRA = root/strtold.d
 
 SRC = src/main.d src/arena.d src/lsp.d src/session.d \
       src/dmdwrap.d src/lexutil.d src/lint.d src/complete.d src/server.d \
-      src/semantic.d src/worker.d src/json.d
+      src/semantic.d src/worker.d src/json.d src/pathutil.d
 
 # Same versions as dmd's own `frontend` dub package, plus DMDLIB for the
 # tooling-oriented lexer API. -preview=dip1000 matches the dmd build.
@@ -80,7 +80,7 @@ deps:
 	@$(DC) $(DFLAGS) $(SRC) -of/dev/null -deps 2>/dev/null | sort -u | head -100
 
 # Regression: struct-only guard + batch checks + LSP loop tests.
-check: $(BIN) check-no-oop
+check: $(BIN) check-no-oop unittest
 	./$(BIN) --check --import=tests tests/u1.d
 	./$(BIN) --check --import=tests tests/u2.d
 	./$(BIN) --check tests/ok.d || true
@@ -101,7 +101,13 @@ check: $(BIN) check-no-oop
 	python3 tests/test_spawn.py
 	python3 tests/test_sync.py
 
-clean:
-	rm -f $(BIN) *.o
+# D unittests for the pure path helpers (no dmd, so the vendored frontend's
+# unittests don't run). `-main` generates a runner that executes them.
+unittest: src/pathutil.d
+	$(DC) -unittest -main src/pathutil.d -of$(BIN)-ut
+	./$(BIN)-ut
 
-.PHONY: all clean check-no-oop deps vendor vscode vsix
+clean:
+	rm -f $(BIN) $(BIN)-ut *.o
+
+.PHONY: all clean check check-no-oop unittest deps vendor vscode vsix

@@ -21,6 +21,7 @@ import lsp;
 import server;
 import session;
 import worker;
+import pathutil : dirOf, isDlsJson, resolveCfgPath, sameDir;
 import complete : extractPrefix;
 import semantic : tokenTypes, tokenModifiers;
 
@@ -58,6 +59,8 @@ struct App
     ulong[string] tokHash;
     bool wantSemantic = false; // client supports textDocument/semanticTokens
     bool semanticRefresh = false; // client supports workspace/semanticTokens/refresh
+    bool watchFiles = false; // client supports workspace/didChangeWatchedFiles
+    string root; // workspace root from initialize (scopes the config watcher)
     ulong nextReqId = 0; // ids for our own server->client requests
 }
 
@@ -119,6 +122,7 @@ private JsonNode* jpos(Json js, uint l, uint c)
     auto o = js.create_object();
     js.add_number_to_object(o, "line", cast(double)l);
     js.add_number_to_object(o, "character", cast(double)c);
+
     return o;
 }
 
@@ -371,6 +375,26 @@ private void sendSemanticRefresh(App* app)
         `,"method":"workspace/semanticTokens/refresh","params":null}`);
 }
 
+// Ask the client to watch the project config file (LSP
+// workspace/didChangeWatchedFiles, dynamically registered). The watching is
+// done by the client, so this is portable and needs no native file watcher.
+// The glob is recursive (`**`) because some clients only report nested
+// patterns reliably; the handler filters to the workspace-root `dls.json`
+// (the server is single-root, initRoot takes the first folder) and ignores
+// nested configs. The client's response (id, no method) is ignored in
+// handleMessage.
+private void sendWatchRegistration(App* app)
+{
+    if (!app.watchFiles || !app.root.length)
+        return;
+    app.nextReqId++;
+    lspWrite(`{"jsonrpc":"2.0","id":` ~ ulongStr(app.nextReqId) ~
+        `,"method":"client/registerCapability","params":{"registrations":[{` ~
+        `"id":"dmd-lsp-watch-dls-json",` ~
+        `"method":"workspace/didChangeWatchedFiles",` ~
+        `"registerOptions":{"watchers":[{"globPattern":"**/dls.json"}]}}]}}`);
+}
+
 // LSP SemanticTokens result (delta-encoded data) for a token list.
 private string tokensResultJson(worker.WToken[] toks)
 {
@@ -569,19 +593,6 @@ private string initRoot(JsonNode* p)
     return null;
 }
 
-// Resolve a dls.json path: absolute stays, relative joins the file's dir.
-private string resolveCfgPath(const(char)[] root, const(char)[] p)
-{
-    if (!p.length)
-        return null;
-    if (p[0] == '/' || (p.length > 2 && p[1] == ':'))
-        return p.idup;
-    string r = root.idup;
-    while (r.length && r[$ - 1] == '/')
-        r = r[0 .. $ - 1];
-    return r ~ "/" ~ p.idup;
-}
-
 struct Notice
 {
     bool have = false;
@@ -687,23 +698,21 @@ private Notice loadFileConfig(App* app, const(char)[] root)
     return n;
 }
 
-// dls.json is config, not D: never analyze it (else JSON gets D squiggles).
-// Basename match also covers creating it after initialize.
-private bool isDlsJson(const(char)[] path)
+// The project config vanished from disk (watched-file delete): drop it and
+// invalidate the worker so analysis falls back to the defaults layer.
+private void clearFileConfig(App* app)
 {
-    size_t i = path.length;
-    while (i > 0 && path[i - 1] != '/')
-        i--;
-    return path[i .. $] == "dls.json";
+    if (!app.fileCfg.loaded)
+        return;
+    app.fileCfg = FileConfig.init;
+    refreshImports(app);
+    Notice n;
+    n.have = true;
+    n.type = 4;
+    n.text = "dls.json: removed, using defaults";
+    notifyNotice(n);
 }
 
-private string dirOf(const(char)[] path)
-{
-    size_t i = path.length;
-    while (i > 0 && path[i - 1] != '/')
-        i--;
-    return i > 0 ? path[0 .. i].idup : null;
-}
 // After a dot, replace the partial member ending at the cursor (empty for a
 // bare `s.`) with a placeholder call (for completion analysis only). The
 // call resolves via an appended unconstrained UFCS template, so the
@@ -1073,7 +1082,13 @@ private void handleMessage(App* app, ref RawMsg m)
     if (!m.hasId)
     {
         // notifications
-        if (m.method == "initialized" || m.method == "$/cancelRequest")
+        if (m.method == "initialized")
+        {
+            // The handshake is complete; now dynamic registration is allowed.
+            sendWatchRegistration(app);
+            return;
+        }
+        if (m.method == "$/cancelRequest")
             return;
         if (m.method == "exit")
         {
@@ -1199,6 +1214,32 @@ private void handleMessage(App* app, ref RawMsg m)
                     publishFor(app, path, disk, true);
                 }
             }
+            else if (m.method == "workspace/didChangeWatchedFiles")
+            {
+                // Client-side watcher for the root dls.json (see
+                // sendWatchRegistration). Reload on change/create, drop on
+                // delete. Nested configs are ignored: the server is single-root.
+                if (app.root.length)
+                {
+                    auto changes = jget(p, "changes");
+                    if (changes && (changes.type & 0xFF) == JsonArray)
+                    {
+                        for (auto c = changes.child; c; c = c.next)
+                        {
+                            const(char)[] uri = jstr(jget(c, "uri"));
+                            if (uri is null)
+                                continue;
+                            string path = uriToPath(uri);
+                            if (!isDlsJson(path) || !sameDir(dirOf(path), app.root))
+                                continue;
+                            if (fileExists(path))
+                                notifyNotice(loadFileConfig(app, app.root));
+                            else
+                                clearFileConfig(app);
+                        }
+                    }
+                }
+            }
         }
         catch (Exception)
         {
@@ -1229,12 +1270,20 @@ private void handleMessage(App* app, ref RawMsg m)
             // workspace/semanticTokens/refresh: lets us defer token pulls to
             // the debounced build instead of rebuilding on every keystroke.
             if (auto ws = jget(capsIn, "workspace"))
+            {
                 if (auto st = jget(ws, "semanticTokens"))
                     app.semanticRefresh = jbool(jget(st, "refreshSupport"), false);
+                // File watching is client-side; we only register the glob.
+                if (auto wf = jget(ws, "didChangeWatchedFiles"))
+                    app.watchFiles = jbool(jget(wf, "dynamicRegistration"), false);
+            }
         }
         Notice note;
         if (auto root = initRoot(p))
+        {
+            app.root = root.idup;
             note = loadFileConfig(app, root);
+        }
         auto js = jmake();
         auto trig = js.create_array();
         js.add_item_to_array(trig, js.create_string("."));

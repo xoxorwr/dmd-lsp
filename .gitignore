@@ -1,5 +1,6 @@
 # Build artifacts (see Makefile `clean`)
 /dmd-lsp
+/dmd-lsp-ut
 *.o
 *.obj
 *.a

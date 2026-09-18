@@ -47,8 +47,12 @@ class Daemon:
             out.append(self.read_msg())
         return out
 
-    def init(self, root=None, options=None):
-        params = {"rootUri": None, "capabilities": {}}
+    def init(self, root=None, options=None, watch=False):
+        caps = {}
+        if watch:
+            caps["workspace"] = {
+                "didChangeWatchedFiles": {"dynamicRegistration": True}}
+        params = {"rootUri": None, "capabilities": caps}
         if root:
             params["rootUri"] = 'file://' + root
         if options:
@@ -58,6 +62,19 @@ class Daemon:
         r = self.read_msg()
         assert r['result']['serverInfo']['version'] == '0.3.0', r
         self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        if watch:
+            # Dynamic registration arrives after `initialized` (a dls.json
+            # notice may precede it); answer the request so the server stops
+            # expecting a reply.
+            for _ in range(5):
+                reg = self.read_msg()
+                if reg.get('method') == 'client/registerCapability':
+                    self.watch = reg
+                    self.send({"jsonrpc": "2.0", "id": reg['id'],
+                               "result": None})
+                    break
+            else:
+                raise AssertionError('no watch registration: %r' % (reg,))
 
     def open_doc(self, path, text, ver=1):
         self.send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
@@ -274,6 +291,66 @@ d.drain(1.0)
 d.open_doc(root9b + '/app.d', open(root9b + '/app.d').read())
 msgs = [x['message'] for x in d.read_msg()['params']['diagnostics']]
 check('cfg-flags-on-clean', not any('not callable' in m for m in msgs), str(msgs))
+d.close()
+
+# 10. workspace/didChangeWatchedFiles reloads the root dls.json without a
+# save/open (the client watches; the file may be closed or edited externally).
+# Nested dls.json files are ignored (server is single-root).
+root10 = mkroot({
+    'dls.json': '{"importPaths": ["libs/"]}',
+    'libs/dep1.d': 'module dep1;\nstruct D1 { int one; }\n',
+    'app.d': 'module app;\nimport dep1;\nvoid main() {\n    D1 d;\n    auto q = d.one;\n}\n',
+})
+d = Daemon(['--debounce-ms=0'])
+d.init(root=root10, watch=True)
+d.drain(1.0)
+check('cfg-watch-registers',
+      d.watch['params']['registrations'][0]['registerOptions']['watchers'][0]
+      ['globPattern'] == '**/dls.json',
+      str(d.watch['params']))
+d.open_doc(root10 + '/app.d', open(root10 + '/app.d').read())
+d.read_msg()
+check('cfg-watch-base', 'one' in d.complete(root10 + '/app.d', 4, 'd.o'), '')
+os.makedirs(os.path.join(root10, 'more'))
+with open(os.path.join(root10, 'more/dep2.d'), 'w') as f:
+    f.write('module dep2;\nstruct D2 { int two; }\n')
+with open(os.path.join(root10, 'dls.json'), 'w') as f:
+    f.write('{"importPaths": ["libs/", "more/"]}')
+d.send({"jsonrpc": "2.0", "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": 'file://' + root10 + '/dls.json',
+                                "type": 2}]}})
+msgs = d.drain(1.0)
+check('cfg-watch-reload-notice',
+      any(m.get('method') == 'window/showMessage' and
+          'dls.json: 2 import paths' in m['params']['message'] for m in msgs),
+      str([m.get('params') for m in msgs if m.get('method')]))
+with open(os.path.join(root10, 'app.d'), 'w') as f:
+    f.write('module app;\nimport dep2;\nvoid main() {\n    D2 d;\n    auto q = d.two;\n}\n')
+d.open_doc(root10 + '/app.d', open(root10 + '/app.d').read())
+diags = d.read_msg()['params']['diagnostics']
+check('cfg-watch-resolves', diags == [], str(diags))
+# deleting the config drops it and falls back to the defaults layer
+os.remove(os.path.join(root10, 'dls.json'))
+d.send({"jsonrpc": "2.0", "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": 'file://' + root10 + '/dls.json',
+                                "type": 3}]}})
+msgs = d.drain(1.0)
+check('cfg-watch-delete-notice',
+      any(m.get('method') == 'window/showMessage' and
+          'removed' in m['params']['message'] for m in msgs),
+      str([m.get('params') for m in msgs if m.get('method')]))
+# nested config change must not reload the root
+os.makedirs(os.path.join(root10, 'nested'))
+with open(os.path.join(root10, 'nested/dls.json'), 'w') as f:
+    f.write('{"importPaths": ["nope/"]}')
+d.send({"jsonrpc": "2.0", "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": 'file://' + root10 +
+                               '/nested/dls.json', "type": 1}]}})
+msgs = d.drain(0.5)
+check('cfg-watch-nested-ignored',
+      not any(m.get('method') == 'window/showMessage' and
+              'dls.json:' in m['params']['message'] for m in msgs),
+      str([m.get('params') for m in msgs if m.get('method')]))
 d.close()
 
 print('FAILURES: %s' % (fails if fails else 'none'))
