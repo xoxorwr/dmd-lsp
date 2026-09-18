@@ -22,7 +22,7 @@ import lsp;
 import session;
 import server;
 import complete;
-import symbols : DocSymbol, documentSymbols;
+import symbols : DocSymbol, documentSymbols, FoldRange, foldingRanges;
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
@@ -294,7 +294,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendImplementations(RefLoc[] locs)
+    private void sendLocs(RefLoc[] locs)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -309,6 +309,24 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "locs", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
+    private void sendFolds(FoldRange[] folds)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        foreach (f; folds)
+        {
+            auto o = js.create_object();
+            js.add_number_to_object(o, "start", f.startLine);
+            js.add_number_to_object(o, "end", f.endLine);
+            addStrOpt(js, o, "kind", f.kind);
+            js.add_item_to_array(arr, o);
+        }
+        js.add_item_to_object(root, "folds", arr);
         js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
@@ -505,6 +523,18 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         sendDefinition(def);
     }
 
+    // `textDocument/documentHighlight`: every occurrence of the cursor's symbol
+    // in the current file (the request universe is that one module).
+    private void documentHighlightAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] path, const(char)[] orig, uint line, uint col)
+    {
+        auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
+        RefLoc[] locs;
+        if (target)
+            locs = findReferences(cast(Module)a.module_, target, true, path, orig);
+        sendLocs(locs);
+    }
+
     // Best-effort `textDocument/implementation`: derived classes for a class/
     // interface, overrides for a method. Each candidate module is analysed on
     // its own and the base is matched by key (symbols do not cross universes).
@@ -529,7 +559,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         }
         if (!cls)
         {
-            sendImplementations(null);
+            sendLocs(null);
             return;
         }
         auto classKey = declKey(cls);
@@ -540,7 +570,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         if (!declName.length)
         {
             implementationLocs(cast(Module)a.module_, classKey, methodName, out_);
-            sendImplementations(out_);
+            sendLocs(out_);
             return;
         }
         bool[string] want;
@@ -563,7 +593,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                 continue;
             implementationLocs(cast(Module)ca.module_, classKey, methodName, out_);
         }
-        sendImplementations(mergeRefs(out_, null));
+        sendLocs(mergeRefs(out_, null));
     }
 
     private void hoverAndSend(ref ServerState s, const ref Analysis a,
@@ -1353,6 +1383,43 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 built = true;
                 continue;
             }
+            if (ops == "foldingRange")
+            {
+                auto text = jstr(jget(p, "text"));
+                if (text is null)
+                    text = "";
+                sendFolds(foldingRanges(text));
+                continue;
+            }
+            if (ops == "documentHighlight")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    documentHighlightAndSend(s, a, path, orig, line, col);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                documentHighlightAndSend(s, a, path, orig, line, col);
+                built = true;
+                continue;
+            }
             if (ops == "implementation")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
@@ -1382,7 +1449,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     implementationAndSend(s, a, path, orig, line, col);
                 }))
                     continue;
-                sendImplementations(null);
+                sendLocs(null);
                 built = true;
                 continue;
             }
@@ -1867,6 +1934,13 @@ struct WRef
     uint len = 0;
 }
 
+struct WFold
+{
+    uint start = 0; // 0-based line
+    uint end = 0;   // 0-based line
+    string kind;
+}
+
 // References result plus whether the search is believed exhaustive. `complete`
 // gates rename (all-or-nothing); references themselves are best-effort.
 struct WRefs
@@ -2131,6 +2205,67 @@ ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
     auto js = jmake();
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("implementation"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto la = jget(r, "locs"))
+        if ((la.type & 0xFF) == JsonArray)
+            for (auto c = la.child; c; c = c.next)
+            {
+                WRef l;
+                l.file = dupOrEmpty(jstr(jget(c, "file")));
+                l.line = cast(uint)jint(jget(c, "line"));
+                l.col = cast(uint)jint(jget(c, "col"));
+                l.len = cast(uint)jint(jget(c, "len"));
+                out_ ~= l;
+            }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerFolding(ref Worker w, const(char)[] text, ref WFold[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("foldingRange"));
+    js.add_string_to_object(root, "text", zstr(text));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto fa = jget(r, "folds"))
+        if ((fa.type & 0xFF) == JsonArray)
+            for (auto c = fa.child; c; c = c.next)
+            {
+                WFold f;
+                f.start = cast(uint)jint(jget(c, "start"));
+                f.end = cast(uint)jint(jget(c, "end"));
+                f.kind = dupOrEmpty(jstr(jget(c, "kind")));
+                out_ ~= f;
+            }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerDocumentHighlight(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref WRef[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("documentHighlight"));
     js.add_string_to_object(root, "path", zstr(path));
     js.add_string_to_object(root, "atext", zstr(atext));
     js.add_string_to_object(root, "origText", zstr(origText));

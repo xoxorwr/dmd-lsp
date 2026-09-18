@@ -353,6 +353,31 @@ check('declaration-fn',
       bool(dcla) and dcla[0]['range']['start'] == {'line': 2, 'character': 4},
       str(dcla))
 
+# documentHighlight: every occurrence of the cursor's symbol in the file.
+dhuri = open_doctype('dh.d',
+    'module dh;\nvoid f(int a)\n{\n    a = a + 1;\n    int b = a;\n}\n')
+dhl = _req_at('textDocument/documentHighlight', dhuri, 1, 11)  # `a`
+check('document-highlight',
+      bool(dhl) and sorted((r['range']['start']['line'],
+                            r['range']['start']['character']) for r in dhl)
+      == [(1, 11), (3, 4), (3, 8), (4, 12)], str(dhl))
+
+# foldingRange: brace blocks, comment runs, import runs.
+def _req(uri, method):
+    _sid[0] += 1
+    send({"jsonrpc": "2.0", "id": _sid[0], "method": method,
+          "params": {"textDocument": {"uri": uri}}})
+    return read_msg()['result']
+
+folduri = open_doctype('fold.d',
+    'module fold;\nvoid f()\n{\n    if (true)\n    {\n        int x;\n    }\n}\n'
+    '// a\n// b\nimport os;\nimport std.stdio;\n')
+folds = _req(folduri, 'textDocument/foldingRange')
+fset = sorted((r['startLine'], r['endLine'], r.get('kind')) for r in (folds or []))
+check('folding-range',
+      (2, 7, 'region') in fset and (4, 6, 'region') in fset
+      and (8, 9, 'comment') in fset and (10, 11, 'imports') in fset, str(fset))
+
 xuri = open_doctype('usedef.d',
     'module usedef;\nimport autolib;\nvoid f() { auto c = globalCfg; }\n')
 xdef = def_at(xuri, 2, 25)

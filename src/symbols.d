@@ -47,6 +47,100 @@ struct DocSymbol
     DocSymbol[] children;
 }
 
+// ---------- folding ----------
+
+struct FoldRange
+{
+    uint startLine; // 0-based
+    uint endLine;   // 0-based
+    const(char)[] kind; // "region" | "comment" | "imports"
+}
+
+// Lexer-based folding: brace pairs, plus runs of `//` comments and `import`
+// lines. Lexing (not semantic) is enough, so this is cheap and works on
+// broken/unanalyzable buffers.
+FoldRange[] foldingRanges(const(char)[] text)
+{
+    FoldRange[] out_;
+    if (!text.length)
+        return out_;
+    {
+        import dmd.lexer : Lexer;
+        import dmd.tokens : Token, TOK;
+        import dmd.globals : global;
+        auto buf = text.dup ~ '\0';
+        scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+            false, false, global.errorSinkNull, &global.compileEnv);
+        uint[] open;
+        while (true)
+        {
+            Token tok;
+            lex.scan(&tok);
+            if (tok.value == TOK.endOfFile)
+                break;
+            if (tok.value == TOK.leftCurly)
+                open ~= tok.loc.linnum();
+            else if (tok.value == TOK.rightCurly && open.length)
+            {
+                uint ol = open[$ - 1];
+                open.length--;
+                uint cl = tok.loc.linnum();
+                if (cl > ol)
+                    out_ ~= FoldRange(ol - 1, cl - 1, "region");
+            }
+        }
+    }
+
+    // Consecutive `//` comment lines and `import` lines.
+    uint nlines = 1;
+    foreach (c; text)
+        if (c == '\n')
+            nlines++;
+    int runKind = 0;
+    uint runStart = 0;
+    size_t i = 0;
+    foreach (lineNo; 0 .. nlines)
+    {
+        size_t e = i;
+        while (e < text.length && text[e] != '\n')
+            e++;
+        auto ln = text[i .. e];
+        size_t s = 0;
+        while (s < ln.length && (ln[s] == ' ' || ln[s] == '\t'))
+            s++;
+        auto t = ln[s .. $];
+        int kind = 0;
+        if (t.length >= 2 && t[0] == '/' && t[1] == '/')
+            kind = 1;
+        else if (t.length >= 6 && t[0 .. 6] == "import")
+        {
+            if (t.length == 6 || !identChar(t[6]))
+                kind = 2;
+        }
+        if (kind != runKind)
+        {
+            if (runKind != 0 && lineNo - runStart >= 2)
+                out_ ~= FoldRange(runStart, lineNo - 1,
+                    runKind == 1 ? "comment" : "imports");
+            runKind = kind;
+            runStart = lineNo;
+        }
+        if (e >= text.length)
+            break;
+        i = e + 1;
+    }
+    if (runKind != 0 && nlines - runStart >= 2)
+        out_ ~= FoldRange(runStart, nlines - 1,
+            runKind == 1 ? "comment" : "imports");
+    return out_;
+}
+
+private bool identChar(char c) pure nothrow @nogc @safe
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
 // Top-level symbols of a module, in source order, with nested members.
 // `text` is used only to point `selectionRange` at the identifier (dmd's
 // aggregate `loc` is the declaration keyword, not the name).
