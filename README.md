@@ -26,7 +26,9 @@ Supported LSP methods:
 - completion: `textDocument/completion` (LSP 3.17 `labelDetails` when opted in)
 - signature help: `textDocument/signatureHelp`
 - goto definition: `textDocument/definition`
+- references: `textDocument/references`
 - document symbols: `textDocument/documentSymbol`
+- workspace symbols: `workspace/symbol`
 - hover: `textDocument/hover` (type + docs)
 - code action: `textDocument/codeAction` (remove unused import)
 - semantic highlighting: `textDocument/semanticTokens/full`

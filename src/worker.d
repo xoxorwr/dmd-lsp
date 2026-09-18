@@ -23,9 +23,10 @@ import session;
 import server;
 import complete;
 import symbols : DocSymbol, documentSymbols;
+import references : RefLoc, findReferences;
 import lint;
 import semantic : SemTok, semanticTokens;
-import dmdwrap : dmdRootHasImporters, dmdTokenHash;
+import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly;
 
 import dmd.dmodule : Module;
 
@@ -55,6 +56,21 @@ struct Chan
 
 private __gshared Chan inChan;   // child: requests
 private __gshared Chan outChan;  // child: responses
+
+// Workspace symbol index (worker process). Parse-only declarations collected
+// from the parent's file discovery. Built lazily, invalidated on watched
+// changes; rebuilding resets the warm universe (see the `buildIndex` op).
+struct WIndexSym
+{
+    string name;
+    ubyte kind;
+    string file;
+    uint line; // 0-based
+    uint col;
+    string container;
+}
+private WIndexSym[] g_index;
+private bool g_indexBuilt = false;
 
 private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
 {
@@ -313,7 +329,27 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendSemantic(const(SemTok)[] toks)    {
+    private void sendReferences(const(RefLoc)[] refs)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        foreach (r; refs)
+        {
+            auto o = js.create_object();
+            js.add_string_to_object(o, "file", zstr(r.file));
+            js.add_number_to_object(o, "line", r.line);
+            js.add_number_to_object(o, "col", r.col);
+            js.add_number_to_object(o, "len", r.len);
+            js.add_item_to_array(arr, o);
+        }
+        js.add_item_to_object(root, "refs", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
+    private void sendSemantic(const(SemTok)[] toks)
+    {
         auto js = jmake();
         auto root = js.create_object();
         auto arr = js.create_array();
@@ -428,6 +464,146 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         HoverInfo h;
         hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
         sendHover(h);
+    }
+
+// ---------- workspace symbol index ----------
+private void flattenIndex(const(DocSymbol)[] syms, const(char)[] file,
+    const(char)[] container, ref WIndexSym[] out_)
+{
+    foreach (ref d; syms)
+    {
+        out_ ~= WIndexSym(d.name.idup, d.kind, file.idup, d.line, d.col,
+            container.idup);
+        if (d.children.length)
+            flattenIndex(d.children, file, d.name, out_);
+    }
+}
+
+// Parse-only index build. Resets the dmd request state, so the caller must
+// drop the warm universe (the op branch sets `built = false`).
+private void buildIndexNow(ref ServerState s, string[] files)
+{
+    g_index = null;
+    dmdResetRequest(s.dmd, &s.sink);
+    foreach (f; files)
+    {
+        auto text = sessionReadDisk(f);
+        if (!text)
+            continue;
+        auto pr = dmdParseOnly(f, text);
+        if (pr.ok && pr.module_)
+            flattenIndex(documentSymbols(cast(Module)pr.module_, text), f, null,
+                g_index);
+    }
+    g_indexBuilt = true;
+}
+
+private char lowerChar(char c) pure nothrow @nogc @safe
+{
+    return (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
+}
+
+// -1 no match, 0 prefix, 1 substring, 2 subsequence (case-insensitive).
+private int indexRank(const(char)[] name, const(char)[] q)
+{
+    if (!q.length)
+        return 1;
+    if (name.length >= q.length)
+    {
+        bool prefix = true;
+        foreach (i; 0 .. q.length)
+            if (lowerChar(name[i]) != lowerChar(q[i]))
+            {
+                prefix = false;
+                break;
+            }
+        if (prefix)
+            return 0;
+        foreach (start; 0 .. name.length - q.length + 1)
+        {
+            bool hit = true;
+            foreach (i; 0 .. q.length)
+                if (lowerChar(name[start + i]) != lowerChar(q[i]))
+                {
+                    hit = false;
+                    break;
+                }
+            if (hit)
+                return 1;
+        }
+    }
+    size_t j = 0;
+    foreach (c; name)
+    {
+        if (lowerChar(c) == lowerChar(q[j]))
+        {
+            j++;
+            if (j == q.length)
+                return 2;
+        }
+    }
+    return -1;
+}
+
+private WIndexSym[] queryIndex(const(char)[] q, size_t cap = 200)
+{
+    WIndexSym[] out_;
+    foreach (r; 0 .. 3)
+        foreach (s; g_index)
+        {
+            if (indexRank(s.name, q) == r)
+            {
+                out_ ~= s;
+                if (out_.length >= cap)
+                    return out_;
+            }
+        }
+    return out_;
+}
+
+private void sendIndexBuilt(size_t count)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_bool_to_object(root, "ok", true);
+    js.add_number_to_object(root, "count", count);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+private void sendWorkspaceSymbols(const(WIndexSym)[] syms)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    foreach (s; syms)
+    {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "name", zstr(s.name));
+        js.add_number_to_object(o, "kind", s.kind);
+        js.add_string_to_object(o, "file", zstr(s.file));
+        js.add_number_to_object(o, "line", s.line);
+        js.add_number_to_object(o, "col", s.col);
+        if (s.container.length)
+            js.add_string_to_object(o, "container", zstr(s.container));
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "syms", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+private void referencesAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] orig, uint line, uint col, bool includeDecl)
+    {
+        CompleteCtx ctx;
+        ctx.line = line;
+        ctx.character = col;
+        auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
+        RefLoc[] refs;
+        if (target)
+            refs = findReferences(cast(Module)a.module_, target, includeDecl);
+        sendReferences(refs);
     }
 
     void workerMain()
@@ -666,6 +842,36 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                 built = true;
                 continue;
             }
+            if (ops == "references")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                bool includeDecl = jbool(jget(p, "includeDeclaration"), true);
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    referencesAndSend(s, a, orig, line, col, includeDecl);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                referencesAndSend(s, a, orig, line, col, includeDecl);
+                built = true;
+                continue;
+            }
             if (ops == "hover")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
@@ -717,6 +923,42 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
                     s.scratch.rewind(s.uni.mark);
                 sendDocumentSymbol(a, text);
                 built = true;
+                continue;
+            }
+            if (ops == "buildIndex")
+            {
+                string[] files;
+                if (auto a = jget(p, "files"))
+                    if ((a.type & 0xFF) == JsonArray)
+                        for (auto c = a.child; c; c = c.next)
+                        {
+                            auto v = jstr(c);
+                            if (v.length)
+                                files ~= v.idup;
+                        }
+                buildIndexNow(s, files);
+                built = false; // reset above invalidated the warm universe
+                s.uni.valid = false;
+                sendIndexBuilt(g_index.length);
+                continue;
+            }
+            if (ops == "workspaceSymbol")
+            {
+                auto q = jstr(jget(p, "query"));
+                if (q is null)
+                    q = "";
+                sendWorkspaceSymbols(queryIndex(q));
+                continue;
+            }
+            if (ops == "invalidateIndex")
+            {
+                g_index = null;
+                g_indexBuilt = false;
+                auto js = jmake();
+                auto root = js.create_object();
+                js.add_bool_to_object(root, "ok", true);
+                js.add_bool_to_object(root, "needRespawn", false);
+                writeFrame(outChan, printJsonStr(root));
                 continue;
             }
             if (ops == "semantic")
@@ -988,6 +1230,14 @@ struct WDef
     uint line = 0; // 1-based
     uint col = 0;  // 1-based
     size_t len = 0;
+}
+
+struct WRef
+{
+    string file;
+    uint line = 0; // 1-based
+    uint col = 0;  // 1-based
+    uint len = 0;
 }
 
 struct WHover
@@ -1266,5 +1516,107 @@ ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
     if (jbool(jget(r, "needRespawn"), false))
         return ExchangeResult.respawn;
     resultJson = printJsonStr(jget(r, "result"));
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerReferences(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    bool includeDecl, ref WRef[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("references"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    js.add_bool_to_object(root, "includeDeclaration", includeDecl);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "refs"))
+    {
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WRef ref_;
+            ref_.file = dupOrEmpty(jstr(jget(c, "file")));
+            ref_.line = cast(uint)jint(jget(c, "line"));
+            ref_.col = cast(uint)jint(jget(c, "col"));
+            ref_.len = cast(uint)jint(jget(c, "len"));
+            out_ ~= ref_;
+        }
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerBuildIndex(ref Worker w, string[] files)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("buildIndex"));
+    auto arr = js.create_array();
+    foreach (f; files)
+        js.add_item_to_array(arr, js.create_string(zstr(f)));
+    js.add_item_to_object(root, "files", arr);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerWorkspaceSymbol(ref Worker w, const(char)[] query,
+    ref WIndexSym[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("workspaceSymbol"));
+    js.add_string_to_object(root, "query", zstr(query));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "syms"))
+    {
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WIndexSym s;
+            s.name = dupOrEmpty(jstr(jget(c, "name")));
+            s.kind = cast(ubyte)jint(jget(c, "kind"));
+            s.file = dupOrEmpty(jstr(jget(c, "file")));
+            s.line = cast(uint)jint(jget(c, "line"));
+            s.col = cast(uint)jint(jget(c, "col"));
+            s.container = dupOrEmpty(jstr(jget(c, "container")));
+            out_ ~= s;
+        }
+    }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerInvalidateIndex(ref Worker w)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("invalidateIndex"));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
     return ExchangeResult.ok;
 }

@@ -21,7 +21,8 @@ import lsp;
 import server;
 import session;
 import worker;
-import pathutil : dirOf, isDlsJson, resolveCfgPath, sameDir;
+import pathutil : dirOf, isDFilePath, isDlsJson, resolveCfgPath, sameDir;
+import fsutil : findDFiles;
 import complete : extractPrefix;
 import semantic : tokenTypes, tokenModifiers;
 
@@ -61,6 +62,7 @@ struct App
     bool semanticRefresh = false; // client supports workspace/semanticTokens/refresh
     bool watchFiles = false; // client supports workspace/didChangeWatchedFiles
     string root; // workspace root from initialize (scopes the config watcher)
+    bool indexBuilt = false; // workspace symbol index is warm in the worker
     ulong nextReqId = 0; // ids for our own server->client requests
 }
 
@@ -342,6 +344,70 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
     return false;
 }
 
+// Run a references request against the worker, respawning once if needed.
+private bool workerReferencesRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    bool includeDecl, ref worker.WRef[] refs)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerReferences(app.wk, path, atext, origText, line, col,
+            includeDecl, refs);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            workerKill(app.wk);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// Workspace symbol index: build (parse-only; resets the warm universe in the
+// worker), query, invalidate.
+private bool workerBuildIndexRetry(App* app, string[] files)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        if (workerBuildIndex(app.wk, files) == worker.ExchangeResult.ok)
+            return true;
+        workerKill(app.wk);
+    }
+    return false;
+}
+
+private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
+    ref worker.WIndexSym[] syms)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerWorkspaceSymbol(app.wk, query, syms);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        workerKill(app.wk);
+    }
+    return false;
+}
+
 // Run a semantic-tokens request against the worker, respawning once if needed.
 private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] text,
     ref worker.WToken[] toks){
@@ -417,7 +483,8 @@ private void sendWatchRegistration(App* app)
         `,"method":"client/registerCapability","params":{"registrations":[{` ~
         `"id":"dmd-lsp-watch-dls-json",` ~
         `"method":"workspace/didChangeWatchedFiles",` ~
-        `"registerOptions":{"watchers":[{"globPattern":"**/dls.json"}]}}]}}`);
+        `"registerOptions":{"watchers":[{"globPattern":"**/dls.json"},` ~
+        `{"globPattern":"**/*.d"},{"globPattern":"**/*.di"}]}}]}}`);
 }
 
 // LSP SemanticTokens result (delta-encoded data) for a token list.
@@ -1254,13 +1321,22 @@ private void handleMessage(App* app, ref RawMsg m)
                             const(char)[] uri = jstr(jget(c, "uri"));
                             if (uri is null)
                                 continue;
-                            string path = uriToPath(uri);
-                            if (!isDlsJson(path) || !sameDir(dirOf(path), app.root))
-                                continue;
-                            if (fileExists(path))
-                                notifyNotice(loadFileConfig(app, app.root));
-                            else
-                                clearFileConfig(app);
+                        string path = uriToPath(uri);
+                        if (!sameDir(dirOf(path), app.root))
+                            continue;
+                        if (isDFilePath(path))
+                        {
+                            // A workspace source changed: the symbol index is
+                            // stale. Rebuild lazily on the next query.
+                            app.indexBuilt = false;
+                            continue;
+                        }
+                        if (!isDlsJson(path))
+                            continue;
+                        if (fileExists(path))
+                            notifyNotice(loadFileConfig(app, app.root));
+                        else
+                            clearFileConfig(app);
                         }
                     }
                 }
@@ -1328,8 +1404,10 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_item_to_object(sh, "triggerCharacters", sht);
         js.add_item_to_object(caps, "signatureHelpProvider", sh);
         js.add_bool_to_object(caps, "definitionProvider", true);
+        js.add_bool_to_object(caps, "referencesProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "documentSymbolProvider", true);
+        js.add_bool_to_object(caps, "workspaceSymbolProvider", true);
         js.add_bool_to_object(caps, "codeActionProvider", true);
         auto legend = js.create_object();
         auto tt = js.create_array();
@@ -1557,6 +1635,107 @@ private void handleMessage(App* app, ref RawMsg m)
             string resultJson = "[]";
             if (workerDocumentSymbolRetry(app, path, text, resultJson))
                 lspRespond(m.idJson, resultJson);
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/references")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            auto pos = jget(p, "position");
+            uint line = cast(uint)jint(jget(pos, "line")) + 1;
+            uint col = cast(uint)jint(jget(pos, "character")) + 1;
+            bool includeDecl = jbool(
+                jget(jget(p, "context"), "includeDeclaration"), false);
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string atext = analysisText(text, line, col);
+            worker.WRef[] refs;
+            if (workerReferencesRetry(app, path, atext, text, line, col,
+                includeDecl, refs))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (r; refs)
+                {
+                    auto loc = js.create_object();
+                    js.add_string_to_object(loc, "uri", zstr(pathToUri(r.file)));
+                    uint sline = r.line > 0 ? r.line - 1 : 0;
+                    uint scol = r.col > 0 ? r.col - 1 : 0;
+                    auto range = js.create_object();
+                    auto st = js.create_object();
+                    js.add_number_to_object(st, "line", sline);
+                    js.add_number_to_object(st, "character", scol);
+                    auto en = js.create_object();
+                    js.add_number_to_object(en, "line", sline);
+                    js.add_number_to_object(en, "character", scol + r.len);
+                    js.add_item_to_object(range, "start", st);
+                    js.add_item_to_object(range, "end", en);
+                    js.add_item_to_object(loc, "range", range);
+                    js.add_item_to_array(arr, loc);
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "workspace/symbol")
+        {
+            auto q = jstr(jget(p, "query"));
+            if (q is null)
+                q = "";
+            if (!app.indexBuilt)
+            {
+                string[] files = findDFiles(app.root);
+                if (workerBuildIndexRetry(app, files))
+                    app.indexBuilt = true;
+            }
+            worker.WIndexSym[] syms;
+            if (workerWorkspaceSymbolRetry(app, q, syms))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (s; syms)
+                {
+                    auto o = js.create_object();
+                    js.add_string_to_object(o, "name", zstr(s.name));
+                    js.add_number_to_object(o, "kind", s.kind);
+                    if (s.container.length)
+                        js.add_string_to_object(o, "containerName", zstr(s.container));
+                    auto loc = js.create_object();
+                    js.add_string_to_object(loc, "uri", zstr(pathToUri(s.file)));
+                    auto range = js.create_object();
+                    auto st = js.create_object();
+                    js.add_number_to_object(st, "line", s.line);
+                    js.add_number_to_object(st, "character", s.col);
+                    auto en = js.create_object();
+                    js.add_number_to_object(en, "line", s.line);
+                    js.add_number_to_object(en, "character",
+                        s.col + cast(uint) s.name.length);
+                    js.add_item_to_object(range, "start", st);
+                    js.add_item_to_object(range, "end", en);
+                    js.add_item_to_object(loc, "range", range);
+                    js.add_item_to_object(o, "location", loc);
+                    js.add_item_to_array(arr, o);
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
             else
                 lspRespond(m.idJson, "null");
             return;
@@ -1871,6 +2050,8 @@ private void refreshImports(App* app)
         app.stringPaths = seff;
         app.flags = feff;
         app.configGen++;
+        // The workspace index is rebuilt from the new import paths' files.
+        app.indexBuilt = false;
         // Host bakes paths in at init; drop it so the next request
         // respawns with the new configuration. Tokens may resolve
         // differently under the new paths, so drop the cache too.

@@ -1895,6 +1895,18 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
                 return true;
         return false;
     }
+    // Semantic locals shadow by scope: a nearer same-named declaration replaces
+    // the outer one (source order, so the last write wins for a name).
+    void put(NameType nt)
+    {
+        foreach (i, ref sl; slots)
+            if (sl.name == nt.name)
+            {
+                slots[i] = nt;
+                return;
+            }
+        slots ~= nt;
+    }
     // An AST function range can be recovery-extended over following functions
     // (and its body left un-collapsed), so the semantic slots path can leak
     // across the boundary just like the snapshot did. If the cursor is outside
@@ -1912,20 +1924,14 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
             if (v.loc.linnum() > line)
                 continue;
             const(char)[] nm = v.ident.toString();
-            if (has(nm))
-                continue;
-            slots ~= NameType(nm, v.type, null, v);
+            put(NameType(nm, v.type, null, v));
         }
     if (fd && fd.fbody)
     {
         NameType[] surv;
         collectSemSlots(fd.fbody, line, surv);
         foreach (ref sl; surv)
-        {
-            if (has(sl.name))
-                continue;
-            slots ~= sl;
-        }
+            put(sl);
     }
     auto sfn = synFuncAt(syn, line);
     if (sfn)
@@ -2673,6 +2679,13 @@ private size_t lastSegLen(const(char)[] chain)
     while (s > 0 && chain[s - 1] != '.')
         s--;
     return baseName(chain[s .. $]).length;
+}
+
+// Public: the declaration symbol under the cursor, for references/rename.
+Dsymbol symbolAt(Module mod, const CompleteCtx* ctx, const(char)[] text,
+    const ref SynMod syn)
+{
+    return resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
 }
 
 void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,

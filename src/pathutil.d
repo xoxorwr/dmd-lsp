@@ -31,6 +31,26 @@ bool isDlsJson(const(char)[] path)
     return path[i .. $] == "dls.json";
 }
 
+// True for a `.d` / `.di` source path.
+bool isDFilePath(const(char)[] path)
+{
+    if (path.length >= 2 && path[$ - 1] == 'd' && path[$ - 2] == '.')
+        return true; // .d
+    if (path.length >= 3 && path[$ - 1] == 'i' && path[$ - 2] == 'd' &&
+        path[$ - 3] == '.')
+        return true; // .di
+    return false;
+}
+
+unittest
+{
+    assert(isDFilePath("/a/b.d"));
+    assert(isDFilePath("x.di"));
+    assert(!isDFilePath("x.dc"));
+    assert(!isDFilePath("dls.json"));
+    assert(!isDFilePath("d"));
+}
+
 unittest
 {
     assert(isDlsJson("/a/b/dls.json"));
