@@ -1,13 +1,18 @@
 module references;
 
-// textDocument/references: find uses of a declaration across the loaded
-// closure. Matching is by resolved declaration identity (pointers in the live
-// universe), so it is shadowing-correct. Aggregates/aliases walk via
-// `appendScopeSubs`; bodies are walked statement-by-statement.
+// textDocument/references + target resolution, semantic-only (PLAN.md Phase A).
+//
+// Identity comes exclusively from dmd's resolved AST. A use is a node that
+// carries a resolved Dsymbol; a declaration is an AST declaration. Matching is
+// by `refs.DeclKey` so it is shadowing/overload correct and independent of the
+// universe a symbol was resolved in. There is deliberately no lexer/scope
+// re-resolution fallback: when a body collapsed, its uses are simply not
+// reported (a false negative is acceptable; a guessed location is not).
+//
+// Struct-only, no phobos.
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
-import dmd.dimport : Import;
 import dmd.declaration : Declaration, VarDeclaration;
 import dmd.func : FuncDeclaration;
 import dmd.aggregate : AggregateDeclaration;
@@ -19,8 +24,10 @@ import dmd.mtype : Type;
 import dmd.init : Initializer;
 import dmd.identifier : Identifier;
 import dmd.location : Loc;
-import dmd.dsymbolsem : toAlias;
 import dmd.typesem : toBasetype;
+import arena : Arena;
+import refs;
+import session : sessionReadDisk;
 import complete : appendScopeSubs;
 
 struct RefLoc
@@ -31,14 +38,24 @@ struct RefLoc
     uint len;
 }
 
+private bool isIdentChar(char c) pure nothrow @nogc @safe
+{
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9');
+}
+
 // Uses of `target` reachable from `root`. Only modules that (transitively)
 // import the target's declaring module can reference it, so the walk is
-// narrowed to those plus the declaring module.
-RefLoc[] findReferences(Module root, Dsymbol target, bool includeDeclaration)
+// narrowed to those plus the declaring module. Matching is by resolved
+// declaration identity (see refs.keyMatches).
+RefLoc[] findReferences(Module root, Dsymbol target, bool includeDeclaration,
+    const(char)[] rootPath = null, const(char)[] rootText = null)
 {
     RefLoc[] out_;
     if (!root || !target)
         return out_;
+    g_collect = false;
+    g_keyMode = false;
     Module declMod = moduleOf(target);
     if (!declMod)
         declMod = root;
@@ -66,10 +83,97 @@ RefLoc[] findReferences(Module root, Dsymbol target, bool includeDeclaration)
     canSee[root] = true;
 
     foreach (m; closure)
-        if (m in canSee)
-            walkModule(m, target, includeDeclaration, out_);
+    {
+        if (!(m in canSee))
+            continue;
+        walkModule(m, target, includeDeclaration, out_, rootPath, rootText);
+    }
     dedupe(out_);
     return out_;
+}
+
+// Uses of the declaration described by `key` in `mods`. Matching is by
+// `DeclKey` only (no live `Dsymbol`), so the target can be resolved in one
+// universe (the request) and the uses found in independently analysed ones
+// (per-candidate-module workspace references).
+RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl,
+    const(char)[] rootPath = null, const(char)[] rootText = null)
+{
+    RefLoc[] out_;
+    if (!key.valid)
+        return out_;
+    g_collect = false;
+    g_keyMode = true;
+    g_key = key;
+    foreach (m; mods)
+    {
+        if (!m)
+            continue;
+        walkModule(m, null, includeDecl, out_, rootPath, rootText);
+    }
+    dedupe(out_);
+    g_keyMode = false;
+    return out_;
+}
+
+// Merge two location lists, dropping duplicates.
+RefLoc[] mergeRefs(RefLoc[] a, RefLoc[] b)
+{
+    a ~= b;
+    dedupe(a);
+    return a;
+}
+
+// The declaration symbol under a 1-based (line, col) cursor, resolved from the
+// semantic AST. `text` is the module source (required for member accesses,
+// whose AST node stores the receiver's location, not the member's). Returns
+// null when the body is not semantic'd (collapsed) — the signal that rename
+// must refuse.
+Dsymbol resolvedSymbolAt(Module mod, uint line, uint col, const(char)[] text)
+{
+    if (!mod || !mod.members)
+        return null;
+
+    auto savedCollect = g_collect;
+    auto savedHits = g_hits;
+    auto savedFile = g_refFile;
+    auto savedText = g_refText;
+    auto savedSet = g_refTextSet;
+
+    g_collect = true;
+    g_hits = null;
+    g_refFile = modulePath(mod);
+    g_refText = text;
+    g_refTextSet = true;
+
+    RefLoc[] dummy;
+    foreach (i; 0 .. (*mod.members).length)
+        walkDecl((*mod.members)[i], null, false, dummy);
+
+    Dsymbol best;
+    foreach (h; g_hits)
+    {
+        if (!h.sym || !h.sym.ident)
+            continue;
+        if (h.line != line)
+            continue;
+        uint start = h.col;
+        uint len = cast(uint) h.sym.ident.toString().length;
+        if (start >= 1 && col >= start && col < start + len)
+        {
+            if (!spanVerified(h.line, h.col, h.sym.ident))
+                continue; // generated symbol: not really at this position
+            best = h.sym;
+            break;
+        }
+    }
+
+    g_collect = savedCollect;
+    g_hits = savedHits;
+    g_refFile = savedFile;
+    g_refText = savedText;
+    g_refTextSet = savedSet;
+    return best;
 }
 
 // Same identifier can be reached twice (e.g. a call's callee via both the
@@ -109,9 +213,6 @@ private Module moduleOf(Dsymbol d)
             return m;
     return null;
 }
-
-// Declaring module of a symbol.
-Module symbolModule(Dsymbol d) => moduleOf(d);
 
 // True for a symbol whose parent chain crosses a function (local/param), i.e.
 // not something another module could reference.
@@ -164,12 +265,245 @@ private bool importsAny(Module m, bool[Module] set)
     return false;
 }
 
-private void walkModule(Module m, Dsymbol target, bool includeDecl, ref RefLoc[] out_)
+private void walkModule(Module m, Dsymbol target, bool includeDecl, ref RefLoc[] out_,
+    const(char)[] rootPath, const(char)[] rootText)
 {
     if (!m.members)
         return;
+    scopeRefText(m, rootPath, rootText);
     foreach (i; 0 .. (*m.members).length)
         walkDecl((*m.members)[i], target, includeDecl, out_);
+}
+
+// Canonical source path of a module: `arg` first (what dmd parsed), then the
+// resolved `srcfile`. Backslashes are normalised to `/`.
+private string modulePath(Module m)
+{
+    auto p = m.arg;
+    if (!p.length)
+        p = m.srcfile.toString();
+    bool back = false;
+    foreach (c; p)
+        if (c == '\\')
+        {
+            back = true;
+            break;
+        }
+    if (!back)
+        return p.idup;
+    char[] o;
+    o.reserve(p.length);
+    foreach (c; p)
+        o ~= (c == '\\' ? '/' : c);
+    return o.idup;
+}
+
+// ---------- current-module source scope (single-threaded worker) ----------
+
+private const(char)[] g_refFile;
+private const(char)[] g_refText;
+private bool g_refTextSet;
+
+private void scopeRefText(Module m, const(char)[] rootPath, const(char)[] rootText)
+{
+    g_refFile = modulePath(m);
+    g_refText = null;
+    g_refTextSet = false;
+    if (rootPath !is null && rootText !is null && g_refFile == rootPath)
+    {
+        g_refText = rootText;
+        g_refTextSet = true;
+    }
+}
+
+private void ensureRefText()
+{
+    if (g_refTextSet)
+        return;
+    g_refTextSet = true;
+    if (g_refFile.length)
+        g_refText = sessionReadDisk(g_refFile);
+}
+
+// 1-based (line, col) -> byte offset.
+private size_t refOffset(const(char)[] text, uint line, uint col)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    for (uint c = 1; c < col && i < text.length && text[i] != '\n'; c++)
+        i++;
+    return i;
+}
+
+private void offsetLineCol(const(char)[] text, size_t off, out uint line, out uint col)
+{
+    line = 1;
+    col = 1;
+    size_t n = off < text.length ? off : text.length;
+    foreach (i; 0 .. n)
+    {
+        if (text[i] == '\n')
+        {
+            line++;
+            col = 1;
+        }
+        else
+            col++;
+    }
+}
+
+// A source span is trustworthy only if the text at (line, col) actually
+// spells `ident`. Mixin/CTFE-generated symbols get synthetic `Loc`s that point
+// at unrelated source (e.g. a generated `printValue` reported inside `main`),
+// which are valid-looking but have no real span. When the module text is
+// unavailable we cannot check, so we keep the location (callers fall back).
+private bool spanVerified(uint line, uint col, Identifier ident)
+{
+    if (line < 1 || col < 1 || !ident)
+        return false;
+    ensureRefText();
+    if (!g_refText.length)
+        return true;
+    auto name = ident.toString();
+    if (!name.length)
+        return true;
+    size_t off = refOffset(g_refText, line, col);
+    if (off + name.length > g_refText.length)
+        return false;
+    foreach (k; 0 .. name.length)
+        if (g_refText[off + k] != name[k])
+            return false;
+    return true;
+}
+
+private size_t indexOfFrom(const(char)[] hay, const(char)[] needle, size_t from)
+{
+    if (!needle.length || hay.length < needle.length)
+        return size_t.max;
+    for (size_t i = from; i + needle.length <= hay.length; i++)
+    {
+        bool ok = true;
+        foreach (k; 0 .. needle.length)
+            if (hay[i + k] != needle[k])
+            {
+                ok = false;
+                break;
+            }
+        if (ok)
+            return i;
+    }
+    return size_t.max;
+}
+
+// A 1-based source position.
+private struct RefPos
+{
+    uint line;
+    uint col;
+}
+
+// dmd stores a member access' receiver location in `DotVarExp.loc`, not the
+// member's. Locate the member identifier as the first whole-word occurrence of
+// `ident` after the receiver that is preceded (ignoring spaces/tabs) by a `.`.
+// Falls back to the receiver location when the text is unavailable.
+private RefPos usePos(Loc recv, Dsymbol sym)
+{
+    RefPos r = RefPos(recv.linnum(), recv.charnum());
+    if (!sym || !sym.ident)
+        return r;
+    ensureRefText();
+    if (!g_refText.length)
+        return r;
+    auto name = sym.ident.toString();
+    if (!name.length)
+        return r;
+    size_t start = refOffset(g_refText, recv.linnum(), recv.charnum());
+    size_t i = start;
+    while (i < g_refText.length)
+    {
+        size_t j = indexOfFrom(g_refText, name, i);
+        if (j == size_t.max)
+            break;
+        bool okL = j == 0 || !isIdentChar(g_refText[j - 1]);
+        bool okR = j + name.length >= g_refText.length ||
+            !isIdentChar(g_refText[j + name.length]);
+        size_t k = j;
+        while (k > 0 && (g_refText[k - 1] == ' ' || g_refText[k - 1] == '\t'))
+            k--;
+        bool afterDot = k > 0 && g_refText[k - 1] == '.';
+        if (okL && okR && afterDot)
+        {
+            offsetLineCol(g_refText, j, r.line, r.col);
+            return r;
+        }
+        i = j + name.length;
+    }
+    return r;
+}
+
+// ---------- semantic walk ----------
+
+private struct Hit
+{
+    uint line;
+    uint col;
+    Dsymbol sym;
+}
+
+private Hit[] g_hits; // collect mode (resolvedSymbolAt)
+private bool g_collect;
+private DeclKey g_key; // key mode (referencesForKey)
+private bool g_keyMode;
+
+private bool isTarget(Dsymbol sym, Dsymbol target)
+{
+    if (!sym || !sym.ident)
+        return false;
+    if (g_keyMode)
+    {
+        // Cheap name filter before the allocating key comparison.
+        if (sym.ident.toString() != g_key.name)
+            return false;
+        return refs.keyMatches(refs.declKey(sym), g_key);
+    }
+    return refs.sameTarget(sym, target);
+}
+
+private void emitUse(Loc recv, Dsymbol sym, Dsymbol target, ref RefLoc[] out_)
+{
+    if (!sym)
+        return;
+    if (g_collect)
+    {
+        auto p = usePos(recv, sym);
+        g_hits ~= Hit(p.line, p.col, sym);
+        return;
+    }
+    if (!isTarget(sym, target))
+        return;
+    auto p = usePos(recv, sym);
+    recordPos(p.line, p.col, sym.ident, out_);
+}
+
+private void emitDecl(Loc loc, Dsymbol d, Dsymbol target, bool includeDecl,
+    ref RefLoc[] out_)
+{
+    if (!d.ident)
+        return;
+    if (g_collect)
+    {
+        g_hits ~= Hit(loc.linnum(), loc.charnum(), d);
+        return;
+    }
+    if (!includeDecl || !isTarget(d, target))
+        return;
+    recordPos(loc.linnum(), loc.charnum(), d.ident, out_);
 }
 
 private void walkDecl(Dsymbol d, Dsymbol target, bool includeDecl, ref RefLoc[] out_)
@@ -186,8 +520,7 @@ private void walkDecl(Dsymbol d, Dsymbol target, bool includeDecl, ref RefLoc[] 
             walkDecl(s, target, includeDecl, out_);
         return;
     }
-    if (includeDecl && d.ident && sameTarget(d, target))
-        record(d.loc, d.ident, out_);
+    emitDecl(d.loc, d, target, includeDecl, out_);
 
     if (auto ad = d.isAggregateDeclaration())
     {
@@ -217,8 +550,7 @@ private void walkDecl(Dsymbol d, Dsymbol target, bool includeDecl, ref RefLoc[] 
             {
                 if (!p)
                     continue;
-                if (includeDecl && p.ident && sameTarget(p, target))
-                    record(p.loc, p.ident, out_);
+                emitDecl(p.loc, p, target, includeDecl, out_);
                 if (p.type) // parameter default values
                     walkInit(p._init, target, out_);
             }
@@ -383,29 +715,19 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
 {
     if (!e)
         return;
-    Identifier name = target.ident;
     if (auto ve = e.isVarExp())
-    {
-        if (sameTarget(ve.var, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, ve.var, target, out_);
     else if (auto dv = e.isDotVarExp())
-    {
-        if (sameTarget(dv.var, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, dv.var, target, out_);
     else if (auto so = e.isSymOffExp())
-    {
-        if (sameTarget(so.var, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, so.var, target, out_);
     else if (auto ca = e.isCallExp())
     {
         // The callee is `e1` (walked below); some calls carry the resolved
         // function only in `ca.f` (templates/qualified), so record at the
         // callee identifier too. Dedupe folds the two paths.
-        if (ca.f && ca.e1 && sameTarget(ca.f, target))
-            record(ca.e1.loc, name, out_);
+        if (ca.f && ca.e1)
+            emitUse(ca.e1.loc, ca.f, target, out_);
         walkExpr(ca.e1, target, out_);
         if (ca.arguments)
             foreach (a; *ca.arguments)
@@ -422,52 +744,34 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
     }
     else if (auto ne = e.isNewExp())
     {
-        if (sameType(ne.newtype, target))
-            record(e.loc, name, out_);
+        emitUse(e.loc, typeSymbol(ne.newtype), target, out_);
         if (ne.arguments)
             foreach (a; *ne.arguments)
                 walkExpr(a, target, out_);
         return;
     }
     else if (auto te = e.isTypeExp())
-    {
-        if (sameType(te.type, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, typeSymbol(te.type), target, out_);
     else if (auto se = e.isScopeExp())
-    {
-        if (sameTarget(se.sds, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, se.sds, target, out_);
     else if (auto fe = e.isFuncExp())
-    {
-        if (sameTarget(fe.fd, target) || sameTarget(fe.td, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, fe.fd ? cast(Dsymbol) fe.fd : cast(Dsymbol) fe.td, target, out_);
     else if (auto te = e.isTemplateExp())
-    {
-        if (sameTarget(te.td, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, te.td, target, out_);
     else if (auto dte = e.isDotTemplateExp())
     {
-        if (sameTarget(dte.td, target))
-            record(e.loc, name, out_);
+        emitUse(e.loc, dte.td, target, out_);
         walkExpr(dte.e1, target, out_);
         return;
     }
     else if (auto dti = e.isDotTemplateInstanceExp())
     {
-        if (dti.ti && sameTarget(dti.ti.tempdecl, target))
-            record(e.loc, name, out_);
+        emitUse(e.loc, dti.ti ? dti.ti.tempdecl : null, target, out_);
         walkExpr(dti.e1, target, out_);
         return;
     }
     else if (auto th = e.isThisExp())
-    {
-        if (sameTarget(th.var, target))
-            record(e.loc, name, out_);
-    }
+        emitUse(e.loc, th.var, target, out_);
 
     if (auto c = e.isCondExp())
     {
@@ -498,66 +802,35 @@ private void walkExpr(Expression e, Dsymbol target, ref RefLoc[] out_)
     }
 }
 
-private bool sameTarget(Dsymbol a, Dsymbol b)
-{
-    if (!a || !b)
-        return false;
-    if (a is b)
-        return true;
-    if (auto ti = a.isTemplateInstance())
-        if (ti.tempdecl)
-            return sameTarget(ti.tempdecl, b);
-    if (auto ti = b.isTemplateInstance())
-        if (ti.tempdecl)
-            return sameTarget(ti.tempdecl, a);
-    // A template function instance resolves back to its template.
-    if (auto ti = a.isInstantiated())
-        if (ti.tempdecl)
-            return sameTarget(ti.tempdecl, b);
-    if (auto ti = b.isInstantiated())
-        if (ti.tempdecl)
-            return sameTarget(ti.tempdecl, a);
-    // A function that is a template's single member stands in for the template.
-    if (a.parent is b && b.isTemplateDeclaration() && a.isFuncDeclaration())
-        return true;
-    if (b.parent is a && a.isTemplateDeclaration() && b.isFuncDeclaration())
-        return true;
-    // Overload group: same name in the same scope (a call picks one overload,
-    // but references/rename operate on the name).
-    if (a.ident && b.ident && a.ident is b.ident && a.parent && a.parent is b.parent)
-        if ((a.isFuncDeclaration() || a.isTemplateDeclaration()) &&
-            (b.isFuncDeclaration() || b.isTemplateDeclaration()))
-            return true;
-    return false;
-}
-
-private bool sameType(Type t, Dsymbol target)
+// The Dsymbol a type expression denotes (struct/class/enum/instance).
+private Dsymbol typeSymbol(Type t)
 {
     if (!t)
-        return false;
+        return null;
     Type b = t.toBasetype();
     if (!b)
-        return false;
+        return null;
     if (auto ts = b.isTypeStruct())
-        return ts.sym is target;
+        return ts.sym;
     if (auto tc = b.isTypeClass())
-        return tc.sym is target;
+        return tc.sym;
     if (auto te = b.isTypeEnum())
-        return te.sym is target;
+        return te.sym;
     if (auto ti = b.isTypeInstance())
         if (ti.tempinst)
-            return sameTarget(ti.tempinst.tempdecl, target);
-    return false;
+            return ti.tempinst.tempdecl;
+    return null;
 }
 
-private void record(Loc loc, Identifier ident, ref RefLoc[] out_)
+private void recordPos(uint line, uint col, Identifier ident, ref RefLoc[] out_)
 {
-    if (loc.linnum() < 1)
+    if (line < 1 || col < 1)
         return;
-    const(char)* f = loc.filename();
-    if (!f)
+    const(char)[] f = g_refFile;
+    if (!f.length)
         return;
-    import core.stdc.string : strlen;
+    if (!spanVerified(line, col, ident))
+        return; // synthetic/generated location: no real source span
     uint len = ident ? cast(uint) ident.toString().length : 0;
-    out_ ~= RefLoc(f[0 .. strlen(f)].idup, loc.linnum(), loc.charnum(), len);
+    out_ ~= RefLoc(f.idup, line, col, len);
 }

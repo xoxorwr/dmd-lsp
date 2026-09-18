@@ -349,7 +349,7 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
 // Run a references request against the worker, respawning once if needed.
 private bool workerReferencesRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    bool includeDecl, ref worker.WRef[] refs)
+    bool includeDecl, ref worker.WRefs refs)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -1719,13 +1719,13 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             string atext = analysisText(text, line, col);
             ensureIndex(app); // enables workspace-wide references
-            worker.WRef[] refs;
+            worker.WRefs refs;
             if (workerReferencesRetry(app, path, atext, text, line, col,
                 includeDecl, refs))
             {
                 auto js = jmake();
                 auto arr = js.create_array();
-                foreach (r; refs)
+                foreach (r; refs.refs)
                 {
                     auto loc = js.create_object();
                     js.add_string_to_object(loc, "uri", zstr(pathToUri(r.file)));

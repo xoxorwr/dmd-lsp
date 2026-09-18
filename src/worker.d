@@ -23,10 +23,14 @@ import session;
 import server;
 import complete;
 import symbols : DocSymbol, documentSymbols;
-import references : RefLoc, findReferences, isLocalDsymbol;
+import references : RefLoc, findReferences, isLocalDsymbol, referencesForKey,
+    mergeRefs, resolvedSymbolAt;
+import refs : DeclKey, declKey;
+import lexutil : ScanOut, scanIdents;
 import lint;
 import semantic : SemTok, semanticTokens;
-import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly, dmdSemantic3Closure;
+import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
+    dmdHasUnloadedImport;
 
 import dmd.dmodule : Module;
 
@@ -339,7 +343,8 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
-    private void sendReferences(const(RefLoc)[] refs)
+    private void sendReferences(const(RefLoc)[] refs, bool complete = true,
+        const(char)[] reason = null)
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -354,7 +359,18 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "refs", arr);
+        js.add_bool_to_object(root, "complete", complete);
+        if (reason.length)
+            js.add_string_to_object(root, "reason", zstr(reason));
         js.add_bool_to_object(root, "needRespawn", false);
+        import core.stdc.stdlib : getenv;
+        import core.stdc.stdio : fprintf, stderr;
+        if (getenv("DMD_LSP_TRACE_REFS"))
+        {
+            const(char)[] rs = reason.length ? reason : "";
+            fprintf(stderr, "dmd-lsp: refs n=%zu complete=%d reason=%.*s\n",
+                refs.length, complete ? 1 : 0, cast(int) rs.length, rs.ptr);
+        }
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -494,7 +510,9 @@ private void flattenIndex(const(DocSymbol)[] syms, const(char)[] file,
 private void buildIndexNow(ref ServerState s, string[] files)
 {
     import core.stdc.string : strlen;
+    import timing : nowMs, traceMs;
 
+    ulong t0 = nowMs();
     g_index = null;
     g_files = null;
     dmdResetRequest(s.dmd, &s.sink);
@@ -532,6 +550,7 @@ private void buildIndexNow(ref ServerState s, string[] files)
         g_files ~= fi;
     }
     g_indexBuilt = true;
+    traceMs("index.build", nowMs() - t0);
 }
 
 // File of a recorded module name, or null.
@@ -676,51 +695,23 @@ private void sendWorkspaceSymbols(const(WIndexSym)[] syms)
 }
 
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
-    const(char)[] orig, uint line, uint col, bool includeDecl)
+    const(char)[] path, const(char)[] orig, uint line, uint col,
+    bool includeDecl)
 {
-    CompleteCtx ctx;
-    ctx.line = line;
-    ctx.character = col;
-    auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
+    auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
     RefLoc[] refs;
     if (target)
-        refs = findReferences(cast(Module)a.module_, target, includeDecl);
+        refs = findReferences(cast(Module)a.module_, target, includeDecl,
+            path, orig);
     sendReferences(refs);
 }
 
 // ---- workspace-wide references ----
-// When the index is warm, extend the search to importer modules outside the
-// request universe: build a synthetic root importing the request module, the
-// declaring module and every (word-prefiltered) importer, re-analyze it, then
-// match by declaration identity inside that combined universe. Must run in a
-// fork (serverAnalyze resets the state).
-private Module findModuleByFile(Module root, const(char)[] file)
-{
-    if (!root)
-        return null;
-    Module[] stack = [root];
-    bool[Module] seen;
-    seen[root] = true;
-    while (stack.length)
-    {
-        auto m = stack[$ - 1];
-        stack.length--;
-        if (m.srcfile.toString() == file || m.arg == file)
-            return m;
-        if (!m.members)
-            continue;
-        foreach (i; 0 .. (*m.members).length)
-        {
-            auto imp = (*m.members)[i].isImport();
-            if (imp && imp.mod && !(imp.mod in seen))
-            {
-                seen[imp.mod] = true;
-                stack ~= imp.mod;
-            }
-        }
-    }
-    return null;
-}
+// The index gives the candidate importer modules; each candidate is then
+// analysed as its own root (isolating failures) and uses are matched by
+// declaration key, so no synthetic combined universe is needed. Completeness
+// is tracked per candidate and reported alongside the locations (it gates
+// rename). Must run in a fork: every `serverAnalyze` resets dmd state.
 
 private bool isIdChar(char c) pure nothrow @nogc @safe
 {
@@ -745,41 +736,66 @@ private bool containsWord(const(char)[] text, const(char)[] word)
     return false;
 }
 
+// True when `text` contains constructs that can synthesise references dmd's
+// resolved AST cannot see (string mixins, reflective __traits). Such a module
+// makes a reference set incomplete.
+private bool hasRiskyConst(const(char)[] text, Arena* a)
+{
+    ScanOut so;
+    scanIdents(a, text, 1, so);
+    return !so.ok || so.riskyMixin || so.riskyTraits;
+}
+
 private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
     const(char)[] path, const(char)[] orig, uint line, uint col,
     bool includeDecl)
 {
     import core.stdc.string : strlen;
+    import timing : nowMs, traceMs;
 
-    CompleteCtx ctx;
-    ctx.line = line;
-    ctx.character = col;
-    auto target = symbolAt(cast(Module)a.module_, &ctx, orig, a.syn);
+    ulong tStart = nowMs();
+
+    auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
     if (!target || isLocalDsymbol(target))
     {
         RefLoc[] r0;
         if (target)
-            r0 = findReferences(cast(Module)a.module_, target, includeDecl);
+            r0 = findReferences(cast(Module)a.module_, target, includeDecl,
+                path, orig);
         sendReferences(r0);
         return;
     }
-    // Universe-scoped result is computed before the synthetic re-analysis
-    // below invalidates `a`; it is the fallback for every failure path.
-    RefLoc[] base = findReferences(cast(Module)a.module_, target, includeDecl);
+
+    // The target identity must be copied before any reset invalidates the
+    // request universe; matching below is by key only.
+    auto key = declKey(target);
+    // In-universe result: covers the request closure and is the fallback for
+    // every failure path (also for local symbols, handled above).
+    ulong tBase0 = nowMs();
+    RefLoc[] base = findReferences(cast(Module)a.module_, target, includeDecl,
+        path, orig);
+    traceMs("refs.wide.base", nowMs() - tBase0);
+
     const(char)* df = target.loc.filename();
     string declFile = df ? df[0 .. strlen(df)].idup : null;
     string declName = declFile.length ? indexModuleOfFile(declFile) : null;
     if (!declName.length)
     {
-        sendReferences(base);
+        sendReferences(base, false, "declaring module not indexed");
         return;
     }
-    const(char)[] ident = target.ident ? target.ident.toString() : null;
-    string reqName = indexModuleOfFile(path);
+    const(char)[] ident = target.ident ? target.ident.toString().idup : null;
+
+    // Candidate set: declaring module + request module + every transitive
+    // importer, word-prefiltered (cannot contain a use otherwise).
     bool[string] want;
     want[declName] = true;
+    string reqName = indexModuleOfFile(path);
     if (reqName.length)
         want[reqName] = true;
+    bool complete = reqName.length != 0;
+    string reason = complete ? null : "request module not indexed";
+    ulong tGather0 = nowMs();
     auto imp = importerModules(declName);
     foreach (mn; imp)
     {
@@ -787,35 +803,69 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
             continue;
         auto f = indexFileOf(mn);
         if (!f.length)
+        {
+            complete = false;
+            if (!reason.length)
+                reason = "unlocatable importer " ~ mn;
             continue;
+        }
         auto t = sessionReadDisk(f);
         if (ident.length && t && !containsWord(t, ident))
             continue;
         want[mn] = true;
     }
-    string synth = "module __dmd_lsp_ws;\n";
+    traceMs("refs.wide.gather", nowMs() - tGather0);
+
+    // Analyse each candidate as its own root and match by declaration key.
+    // A module that fails to load marks the result incomplete but cannot hide
+    // its siblings. Runs in a fork: each `serverAnalyze` resets dmd state.
+    RefLoc[] out_;
+    ulong tAnalyze0 = nowMs();
     foreach (mn, _; want)
-        synth ~= "import " ~ mn ~ ";\n";
-    auto a2 = serverAnalyze(s, "/tmp/dmd-lsp-ws/__dmd_lsp_ws.d", synth);
-    dmdSemantic3Closure(a2.module_); // resolve importer bodies
-    auto reqMod = findModuleByFile(cast(Module)a2.module_, path);
-    auto reqText = sessionReadDisk(path);
-    if (!reqMod || !reqText)
     {
-        sendReferences(base);
-        return;
+        auto f = indexFileOf(mn);
+        if (!f.length)
+            continue;
+        const(char)[] text;
+        if (f == path && orig.length)
+            text = orig; // request buffer may be ahead of disk
+        else
+            text = sessionReadDisk(f);
+        if (!text.length)
+        {
+            complete = false;
+            if (!reason.length)
+                reason = "unreadable " ~ mn;
+            continue;
+        }
+        if (ident.length && !containsWord(text, ident))
+            continue;
+        auto ca = serverAnalyze(s, f, text);
+        if (!ca.ok || !ca.module_)
+        {
+            complete = false;
+            if (!reason.length)
+                reason = "parse failed " ~ mn;
+            continue;
+        }
+        if (dmdHasUnloadedImport(ca.module_))
+        {
+            complete = false;
+            if (!reason.length)
+                reason = "unloaded import in " ~ mn;
+        }
+        if (hasRiskyConst(text, &s.scratch))
+        {
+            complete = false;
+            if (!reason.length)
+                reason = "mixin/__traits in " ~ mn;
+        }
+        out_ ~= referencesForKey([cast(Module) ca.module_], key, includeDecl,
+            f, text);
     }
-    SynMod empty;
-    CompleteCtx rctx;
-    rctx.line = line;
-    rctx.character = col;
-    auto t2 = symbolAt(reqMod, &rctx, reqText, empty);
-    if (!t2)
-    {
-        sendReferences(base);
-        return;
-    }
-    sendReferences(findReferences(cast(Module)a2.module_, t2, includeDecl));
+    traceMs("refs.wide.analyze", nowMs() - tAnalyze0, "modules");
+    traceMs("refs.wide.total", nowMs() - tStart);
+    sendReferences(mergeRefs(base, out_), complete, reason);
 }
 
     void workerMain()
@@ -1069,8 +1119,9 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
                 if (g_indexBuilt)
                 {
                     // Workspace-wide: ensure the request universe, then fork
-                    // (the wide walk re-analyzes a synthetic importer root and
-                    // would otherwise clobber the warm universe).
+                    // (the per-candidate re-analysis clobbers the warm
+                    // universe). Without a fork, fall back to the
+                    // in-universe result rather than risk clobbering.
                     auto st0 = built ? serverUniState(s, path, orig, null) : UniState.miss;
                     Analysis a0;
                     if (built && st0 == UniState.reuse)
@@ -1084,13 +1135,13 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
                         wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
                     }))
                         continue;
-                    wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
+                    referencesAndSend(s, a0, path, orig, line, col, includeDecl);
                     continue;
                 }
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    referencesAndSend(s, a, orig, line, col, includeDecl);
+                    referencesAndSend(s, a, path, orig, line, col, includeDecl);
                 }))
                     continue;
                 if (built && st != UniState.reuse)
@@ -1101,7 +1152,7 @@ private void wideReferencesAndSend(ref ServerState s, const ref Analysis a,
                 auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                referencesAndSend(s, a, orig, line, col, includeDecl);
+                referencesAndSend(s, a, path, orig, line, col, includeDecl);
                 built = true;
                 continue;
             }
@@ -1473,6 +1524,15 @@ struct WRef
     uint len = 0;
 }
 
+// References result plus whether the search is believed exhaustive. `complete`
+// gates rename (all-or-nothing); references themselves are best-effort.
+struct WRefs
+{
+    WRef[] refs;
+    bool complete = true;
+    string reason;
+}
+
 struct WHover
 {
     bool found = false;
@@ -1754,7 +1814,7 @@ ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
 
 ExchangeResult workerReferences(ref Worker w, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    bool includeDecl, ref WRef[] out_)
+    bool includeDecl, ref WRefs out_)
 {
     auto js = jmake();
     auto root = js.create_object();
@@ -1773,6 +1833,10 @@ ExchangeResult workerReferences(ref Worker w, const(char)[] path,
         return ExchangeResult.failed;
     if (jbool(jget(r, "needRespawn"), false))
         return ExchangeResult.respawn;
+    // A fresh result each request.
+    out_.refs = null;
+    out_.complete = jbool(jget(r, "complete"), true);
+    out_.reason = dupOrEmpty(jstr(jget(r, "reason")));
     if (auto arr = jget(r, "refs"))
     {
         for (auto c = arr.child; c; c = c.next)
@@ -1782,7 +1846,7 @@ ExchangeResult workerReferences(ref Worker w, const(char)[] path,
             ref_.line = cast(uint)jint(jget(c, "line"));
             ref_.col = cast(uint)jint(jget(c, "col"));
             ref_.len = cast(uint)jint(jget(c, "len"));
-            out_ ~= ref_;
+            out_.refs ~= ref_;
         }
     }
     return ExchangeResult.ok;
