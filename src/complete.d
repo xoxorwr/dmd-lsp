@@ -28,7 +28,8 @@ import dmd.typesem : nextOf, toBasetype;
 import dmd.dsymbolsem : toAlias;
 import dmd.init : Initializer;
 import dmd.expression : Expression, CallExp, NewExp, IdentifierExp, TypeExp,
-    DotIdExp, DotTemplateInstanceExp, ScopeExp, TemplateExp;
+    DotIdExp, DotTemplateInstanceExp, ScopeExp, TemplateExp, FuncExp, CastExp,
+    CommaExp;
 import dmd.rootobject : DYNCAST;
 
 struct CompleteCtx
@@ -1249,6 +1250,58 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
     pushItem(a, o, nm, 6, typeTextWithStorage(vd), docOf(vd), "0", seen, vd);
 }
 
+// `foreach` over a user type (opApply) is lowered to a call passing a delegate
+// (`cast(void) (aggr.opApply(delegate { ... }))`), so the loop variable is a
+// parameter of that delegate, not a `ForeachStatement` parameter. Walk the
+// statement expression looking for such a delegate whose body contains the
+// cursor.
+private void walkDelegateExpr(Expression e, FuncDeclaration cur,
+    const ref SynMod syn, uint cursorLine, const(char)[] prefix, Arena* a,
+    ref CompleteOut o, ref bool[const(char)[]] seen, int depth)
+{
+    if (!e || depth > 8)
+        return;
+    if (auto fe = e.isFuncExp())
+    {
+        auto dfd = fe.fd;
+        if (dfd && dfd.fbody)
+        {
+            uint el = dfd.endloc.linnum();
+            if (dfd.loc.linnum() <= cursorLine && (el == 0 || cursorLine <= el))
+            {
+                if (dfd.parameters)
+                    foreach (i; 0 .. dfd.parameters.length)
+                    {
+                        VarDeclaration v = (*dfd.parameters)[i];
+                        addLocal(a, o, seen, v, cursorLine, prefix);
+                    }
+                walkStmt(dfd.fbody, dfd, syn, cursorLine, prefix, a, o, seen);
+            }
+        }
+        return;
+    }
+    if (auto ce = e.isCallExp())
+    {
+        if (ce.e1)
+            walkDelegateExpr(ce.e1, cur, syn, cursorLine, prefix, a, o, seen, depth + 1);
+        if (ce.arguments)
+            foreach (arg; *ce.arguments)
+                walkDelegateExpr(arg, cur, syn, cursorLine, prefix, a, o, seen, depth + 1);
+        return;
+    }
+    if (auto ce = e.isCastExp())
+    {
+        walkDelegateExpr(ce.e1, cur, syn, cursorLine, prefix, a, o, seen, depth + 1);
+        return;
+    }
+    if (auto me = e.isCommaExp())
+    {
+        walkDelegateExpr(me.e1, cur, syn, cursorLine, prefix, a, o, seen, depth + 1);
+        walkDelegateExpr(me.e2, cur, syn, cursorLine, prefix, a, o, seen, depth + 1);
+        return;
+    }
+}
+
 // Members made available by `with (obj) { ... }`: unqualified names resolve
 // against the object. The frontend resolves the object into `w.wthis` (a
 // synthetic VarDeclaration whose type is the object's type); for pre-semantic
@@ -1312,6 +1365,8 @@ private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, ui
                     }
                 }
             }
+            else
+                walkDelegateExpr(es.exp, cur, syn, cursorLine, prefix, a, o, seen, 0);
         }
         return;
     }
@@ -2028,6 +2083,56 @@ private Dsymbol findImportScope(Module root, const(char)[] name)
 // Semantic-tree slot collection: surviving VarDeclarations plus
 // condition variables (`if (auto x = ...)`, `while`, `switch`, `with`,
 // `foreach`), which live in statement/parameter nodes rather than bodies.
+// The loop variables of a lowered `foreach` over `opApply` live in the delegate
+// passed to `opApply`, so collect its parameters (and anything declared in its
+// body) when the cursor is inside it. Also covers ordinary delegate literals.
+private void collectDelegateSlots(Expression e, uint cursorLine, ref NameType[] r,
+    int depth)
+{
+    if (!e || depth > 8)
+        return;
+    if (auto fe = e.isFuncExp())
+    {
+        auto dfd = fe.fd;
+        if (dfd && dfd.fbody)
+        {
+            uint el = dfd.endloc.linnum();
+            if (dfd.loc.linnum() <= cursorLine && (el == 0 || cursorLine <= el))
+            {
+                if (dfd.parameters)
+                    foreach (i; 0 .. dfd.parameters.length)
+                    {
+                        VarDeclaration v = (*dfd.parameters)[i];
+                        if (v && v.ident)
+                            r ~= NameType(v.ident.toString(), v.type, null, v);
+                    }
+                collectSemSlots(dfd.fbody, cursorLine, r);
+            }
+        }
+        return;
+    }
+    if (auto ce = e.isCallExp())
+    {
+        if (ce.e1)
+            collectDelegateSlots(ce.e1, cursorLine, r, depth + 1);
+        if (ce.arguments)
+            foreach (arg; *ce.arguments)
+                collectDelegateSlots(arg, cursorLine, r, depth + 1);
+        return;
+    }
+    if (auto ce = e.isCastExp())
+    {
+        collectDelegateSlots(ce.e1, cursorLine, r, depth + 1);
+        return;
+    }
+    if (auto me = e.isCommaExp())
+    {
+        collectDelegateSlots(me.e1, cursorLine, r, depth + 1);
+        collectDelegateSlots(me.e2, cursorLine, r, depth + 1);
+        return;
+    }
+}
+
 private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
 {
     if (!s || s.loc.linnum() > cursorLine)
@@ -2044,6 +2149,8 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
                         r ~= NameType(vd.ident.toString(), vd.type, null, vd);
                 }
             }
+            else
+                collectDelegateSlots(es.exp, cursorLine, r, 0);
         }
         return;
     }

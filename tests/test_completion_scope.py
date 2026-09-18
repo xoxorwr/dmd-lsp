@@ -17,6 +17,12 @@ struct Vec2 { int width; int height; }
 struct Inner { int promoted; }
 struct Wrapper { Inner inner; alias inner this; }
 
+struct EventRange { Event front; void popFront() {} bool empty() { return true; } }
+struct OpApplyRange
+{
+    int opApply(scope int delegate(Event) dg) { return 0; }
+}
+
 class Base { int baseField; }
 class Derived : Base { int derivedField; }
 interface Speaker { void speak(); }
@@ -59,6 +65,24 @@ void on_alias_this()
 {
     Wrapper w;
     auto x = w.promoted;
+}
+
+void on_foreach_range()
+{
+    EventRange r;
+    foreach (e; r)
+    {
+        auto x = e.consumed;
+    }
+}
+
+void on_foreach_opapply()
+{
+    OpApplyRange r;
+    foreach (e; r)
+    {
+        auto x = e.consumed;
+    }
 }
 
 void on_ref(ref Event arg)
@@ -368,6 +392,19 @@ il = line_of('void on_impl') + 3  # the `    i.` line
 labels = complete(il, len(lines[il]))
 check('interface-members', 'own' in labels and 'speak' in labels,
       str(sorted(set(labels))[:12]))
+
+# 17) `foreach` over a user range (`front`) and over `opApply`: the loop
+# variable's type is the element type, so its members complete.
+fl = line_of('void on_foreach_range') + 5
+labels = complete(fl, lines[fl].index('e.consumed') + 2)
+check('foreach-range-loop-var',
+      'consumed' in labels and 'resize' in labels and 'type' in labels,
+      str(sorted(set(labels))[:10]))
+ol = line_of('void on_foreach_opapply') + 5
+labels = complete(ol, lines[ol].index('e.consumed') + 2)
+check('foreach-opapply-loop-var',
+      'consumed' in labels and 'resize' in labels and 'type' in labels,
+      str(sorted(set(labels))[:10]))
 
 proc.stdin.close()
 proc.wait(timeout=5)
