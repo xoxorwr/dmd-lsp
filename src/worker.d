@@ -833,6 +833,18 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     // its siblings. Runs in a fork: each `serverAnalyze` resets dmd state.
     RefLoc[] out_;
     ulong tAnalyze0 = nowMs();
+    // Resolving a reference to a manifest constant requires the *unfolded* AST:
+    // the frontend substitutes `Test.A` with its value, losing the member. Turn
+    // that substitution off for the candidate analyses only (diagnostics and
+    // completion keep it), and drop the cached universe so the request module is
+    // re-analysed unfolded too. `lspNoManifestExpand` is imported from the
+    // vendored frontend on purpose: a `make vendor` that drops the patch fails
+    // to compile here instead of silently regressing.
+    import dmd.optimize : lspNoManifestExpand;
+    lspNoManifestExpand = true;
+    s.uni.valid = false;
+    scope (exit)
+        lspNoManifestExpand = false;
     foreach (mn, _; want)
     {
         auto f = indexFileOf(mn);

@@ -536,6 +536,51 @@ check('enum-member-prepare',
       str(r.get('result')))
 d.close()
 
+# Enum members inside a constant expression (`Test.A + Test.B`) are folded by
+# the frontend unless manifest-constant expansion is disabled for the analysis
+# (see `lspNoManifestExpand`). Both simple and compound uses -- function body
+# and module-level initializer -- must be found.
+enc = ('module enc;\n'
+       'enum Test { A, B, C }\n'
+       'int f() { return Test.A + Test.B; }\n'
+       'Test t = Test.A + Test.B;\n')
+encp = os.path.join(root, 'enc.d')
+open(encp, 'w').write(enc)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(encp, enc)
+d.drain(1.0)
+crefs = fmt(d.references(encp, 1, 12, True))  # `A` in the enum declaration
+check('enum-compound-member-refs',
+      crefs == [('enc.d', 1, 12, 13), ('enc.d', 2, 22, 23), ('enc.d', 3, 14, 15)],
+      str(crefs))
+crefs = fmt(d.references(encp, 1, 5, True))  # `Test` in the enum declaration
+check('enum-compound-type-refs',
+      crefs == [('enc.d', 1, 5, 9), ('enc.d', 2, 17, 21), ('enc.d', 2, 26, 30),
+                ('enc.d', 3, 0, 4), ('enc.d', 3, 9, 13), ('enc.d', 3, 18, 22)],
+      str(crefs))
+d.close()
+
+# The same substitution affects `const`/`immutable` manifest constants, so the
+# declaration and every folded use must be found too.
+cst = ('module cst;\n'
+       'const int K = 5;\n'
+       'int f() { return K + K; }\n'
+       'int x = K;\n')
+cstp = os.path.join(root, 'cst.d')
+open(cstp, 'w').write(cst)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(cstp, cst)
+d.drain(1.0)
+krefs = fmt(d.references(cstp, 1, 10, True))  # `K` in the const declaration
+check('const-manifest-refs',
+      krefs == [('cst.d', 1, 10, 11), ('cst.d', 2, 17, 18), ('cst.d', 2, 21, 22),
+                ('cst.d', 3, 8, 9)], str(krefs))
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

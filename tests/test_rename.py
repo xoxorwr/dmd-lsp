@@ -397,6 +397,31 @@ else:
     check('rename-enum-type', False, str(r)[:200])
 d.close()
 
+# Enum member inside a constant expression: rename must rewrite the compound
+# uses too (function body and module-level initializer).
+ENC2 = ('module enc2;\n'
+        'enum Test { A, B, C }\n'
+        'int f() { return Test.A + Test.B; }\n'
+        'Test t = Test.A + Test.B;\n')
+enc2p = os.path.join(root, 'enc2.d')
+open(enc2p, 'w').write(ENC2)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(enc2p, ENC2)
+d.drain(1.0)
+r = d.rename(enc2p, 1, 15, 'X')  # `B` in the enum declaration
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {enc2p: ENC2})
+    check('rename-enum-compound-member',
+          new[enc2p] == ('module enc2;\n'
+                         'enum Test { A, X, C }\n'
+                         'int f() { return Test.A + Test.X; }\n'
+                         'Test t = Test.A + Test.X;\n'), repr(new[enc2p]))
+else:
+    check('rename-enum-compound-member', False, str(r)[:200])
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

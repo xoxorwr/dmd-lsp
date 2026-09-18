@@ -355,6 +355,8 @@ Initializer initializerSemantic(Initializer init, Scope* sc, ref Type tx, NeedIn
     Initializer visitExp(ExpInitializer i)
     {
         //printf("ExpInitializer::semantic(%s), type = %s\n", i.exp.toChars(), t.toChars());
+        if (needInterpret && lspNoManifestExpand)
+            needInterpret = NeedInterpret.INITnointerpret; // keep manifest constants for tooling
         if (needInterpret)
             sc = sc.startCTFE();
         i.exp = i.exp.expressionSemantic(sc);

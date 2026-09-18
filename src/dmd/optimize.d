@@ -36,6 +36,14 @@ import dmd.tokens;
 import dmd.typesem;
 import dmd.visitor;
 
+// Tooling-only switch, set by dmd-lsp (see src/worker.d): when set, manifest
+// constants (enum members included) are not substituted by their initializer,
+// so a post-semantic walk still sees the `VarExp`. Off for normal compilation
+// and for diagnostics/completion; on only while resolving references/rename,
+// where the substitution would destroy the member identity. dmd-lsp imports
+// this symbol, so dropping the patch during `make vendor` is a compile error.
+__gshared bool lspNoManifestExpand;
+
 /*************************************
  * If variable has a const initializer,
  * return that initializer.
@@ -184,6 +192,8 @@ private Expression fromConstInitializer(int result, Expression e1)
 {
     //printf("fromConstInitializer(result = %x, %s)\n", result, e1.toChars());
     //static int xx; if (xx++ == 10) assert(0);
+    if (lspNoManifestExpand)
+        return e1;
     auto ve = e1.isVarExp();
     if (!ve)
         return e1;
