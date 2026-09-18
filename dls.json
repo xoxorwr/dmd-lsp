@@ -1,0 +1,18 @@
+{
+    "importPaths": [
+        "src/"
+    ],
+    "stringImportPaths": [
+        "src/dmd/res",
+        "src/dmd",
+        "stringimp"
+    ],
+    "flags": [
+        "-version=MARS",
+        "-version=NoBackend",
+        "-version=GC",
+        "-version=CallbackAPI",
+        "-version=DMDLIB",
+        "-preview=dip1000"
+    ]
+}
