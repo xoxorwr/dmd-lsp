@@ -10,6 +10,12 @@
 
 # Toolchain: pinned to 2.113.0 (never system dmd).
 DC ?= dmd
+# dmd-lsp derives default stdlib import paths from the dmd executable. Prefer
+# the sibling dev build (its druntime matches the vendored frontend), else the
+# compiler the build uses.
+DEV_DMD = ../dmd/generated/linux/release/64/dmd
+DMD ?= $(shell test -x $(DEV_DMD) && echo $(DEV_DMD) || echo $(DC))
+export DMD
 # Vendored dmd frontend root: `import dmd.x` resolves under src/dmd/.
 DMD_SRC = src
 # Modules imported only under non-Linux version blocks, so `dmd -i` on this

@@ -1,8 +1,8 @@
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 BIN = './dmd-lsp'
 FILE = 'tests/cc.d'
-URI = 'file:///home/ryuukk/dev/dmd-lsp/tests/cc.d'
+URI = 'file://' + os.path.abspath(FILE)
 
 proc = subprocess.Popen([BIN, '--import=tests', '--debounce-ms=0'], stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -102,16 +102,16 @@ send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
 # attr.d lines (0-based): 19:'    auto q = w.sh;', 20:'    w.'
 atext = open('tests/attr.d').read()
 send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
-      "params": {"textDocument": {"uri": "file:///home/ryuukk/dev/dmd-lsp/tests/attr.d",
+      "params": {"textDocument": {"uri": 'file://' + os.path.abspath('tests/attr.d'),
                                  "languageId": "d", "version": 1, "text": atext}}})
 read_msg()  # diagnostics (parse errors expected from trailing dot)
 send({"jsonrpc": "2.0", "id": 103, "method": "textDocument/completion",
-      "params": {"textDocument": {"uri": "file:///home/ryuukk/dev/dmd-lsp/tests/attr.d"},
+      "params": {"textDocument": {"uri": 'file://' + os.path.abspath('tests/attr.d')},
                  "position": {"line": 19, "character": 17}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
 check('attr-selective-shown', labels == ['shown'], str(labels))
 send({"jsonrpc": "2.0", "id": 104, "method": "textDocument/completion",
-      "params": {"textDocument": {"uri": "file:///home/ryuukk/dev/dmd-lsp/tests/attr.d"},
+      "params": {"textDocument": {"uri": 'file://' + os.path.abspath('tests/attr.d')},
                  "position": {"line": 20, "character": 6}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
 check('attr-dot-nocrash', 'shown' in labels and 'greet' in labels and

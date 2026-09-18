@@ -2370,21 +2370,98 @@ private void refreshImports(App* app)
     }
 }
 
+// The dmd executable: $DMD when set, else the first `dmd` on PATH.
+private string dmdExecutable()
+{
+    import core.stdc.string : strlen;
+
+    if (auto env = getenv("DMD"))
+    {
+        auto s = env[0 .. strlen(env)];
+        if (fileExists(s))
+            return absolutePath(s);
+    }
+    version (Windows)
+        immutable name = "dmd.exe";
+    else
+        immutable name = "dmd";
+    auto envPath = getenv("PATH");
+    if (!envPath)
+        return null;
+    auto p = envPath[0 .. strlen(envPath)];
+    version (Windows)
+        immutable sep = ';';
+    else
+        immutable sep = ':';
+    size_t start = 0;
+    while (start < p.length)
+    {
+        size_t end = start;
+        while (end < p.length && p[end] != sep)
+            end++;
+        auto dir = p[start .. end];
+        if (dir.length)
+        {
+            char[] cand = dir.dup;
+            if (cand[$ - 1] != '/' && cand[$ - 1] != '\\')
+                cand ~= '/';
+            cand ~= name;
+            if (fileExists(cand))
+                return absolutePath(cand);
+        }
+        start = end + 1;
+    }
+    return null;
+}
+
+// Parent directory of `p`, without a trailing separator.
+private string parentOf(const(char)[] p)
+{
+    size_t i = p.length;
+    while (i > 0 && (p[i - 1] == '/' || p[i - 1] == '\\'))
+        i--;
+    while (i > 0 && p[i - 1] != '/' && p[i - 1] != '\\')
+        i--;
+    while (i > 1 && (p[i - 1] == '/' || p[i - 1] == '\\') &&
+        (p[i - 2] == '/' || p[i - 2] == '\\'))
+        i--;
+    if (i <= 1)
+        return "/";
+    return p[0 .. i].idup;
+}
+
+// Default (stdlib) import paths, derived from the dmd executable so nothing
+// machine-specific is baked in. Walk up from the executable looking for a
+// source tree: the release layout has <root>/src/{druntime/import,phobos}; the
+// dev build has <root>/druntime/src (and no bundled phobos).
 private string[] defaultImports()
 {
     string[] found;
-    static immutable string[] candidates = [
-        // repo druntime first: matches the frontend under development
-        "/home/ryuukk/dev/dmd/druntime/src",
-        "/home/ryuukk/dlang/dmd-2.113.0/src/phobos",
-        "/home/ryuukk/dlang/dmd-2.113.0/src/druntime/import",
-    ];
-    foreach (c; candidates)
+    auto exe = dmdExecutable();
+    if (!exe.length)
+        return found;
+    auto dir = parentOf(exe);
+    foreach (_; 0 .. 8)
     {
-        if (fileExists(c))
-            found ~= c.idup;
+        if (!dir.length || dir == "/" || dir == ".")
+            break;
+        addImportDir(found, dir ~ "/src/druntime/import");
+        addImportDir(found, dir ~ "/src/phobos");
+        addImportDir(found, dir ~ "/druntime/src");
+        addImportDir(found, dir ~ "/phobos"); // dev tree: phobos is a sibling
+        dir = parentOf(dir);
     }
     return found;
+}
+
+private void addImportDir(ref string[] found, const(char)[] dir)
+{
+    if (!fileExists(dir))
+        return;
+    foreach (d; found)
+        if (d == dir)
+            return;
+    found ~= dir.idup;
 }
 
 enum dmdLspVersion = "0.3.0";
