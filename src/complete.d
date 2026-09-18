@@ -619,8 +619,13 @@ private Dsymbol[] aggregateMembers(AggregateDeclaration ad)
         return r;
     r ~= scopeMembers(ad);
     if (auto cd = ad.isClassDeclaration())
+    {
         for (auto b = cd.baseClass; b; b = b.baseClass)
             r ~= scopeMembers(b);
+        foreach (bc; cd.interfaces)
+            if (bc.sym)
+                r ~= scopeMembers(bc.sym);
+    }
     return r;
 }
 
@@ -1607,13 +1612,22 @@ private Dsymbol[] followTypeDepth(Type t, Module root, Dsymbol[] rootMembers, in
     return null;
 }
 
-// An aggregate's own members plus those promoted by `alias this` (`w.field`
-// for a field of `w`'s subobject). `aliasthis.sym` is the resolved target
-// member; `depth` keeps a cyclic `alias this` finite.
+// An aggregate's own members, its inherited members (class base chain and
+// interfaces; `cd.baseclasses` lists the base class first, then interfaces),
+// and those promoted by `alias this` (`w.field` for a field of `w`'s
+// subobject). Own members come first, so a derived override shadows the base.
+// `depth` keeps a cyclic inheritance/`alias this` finite.
 private Dsymbol[] aggregateMembers(AggregateDeclaration ad, int depth,
     Module root, Dsymbol[] rootMembers)
 {
     auto mem = scopeMembers(ad);
+    if (depth > 8)
+        return mem;
+    if (auto cd = ad.isClassDeclaration())
+        if (cd.baseclasses)
+            foreach (ref bc; *cd.baseclasses)
+                if (bc.sym && bc.sym !is ad)
+                    mem ~= aggregateMembers(bc.sym, depth + 1, root, rootMembers);
     if (ad.aliasthis && ad.aliasthis.sym)
     {
         auto more = stepInto(ad.aliasthis.sym, depth + 1, root, rootMembers);
@@ -1868,7 +1882,7 @@ private Dsymbol[] stepInto(Dsymbol s, int depth, Module root, Dsymbol[] rootMemb
     if (!s || depth > 8)
         return null;
     if (auto ad = s.isAggregateDeclaration())
-        return scopeMembers(ad);
+        return aggregateMembers(ad, depth, root, rootMembers);
     if (auto ed = s.isEnumDeclaration())
         return scopeMembers(ed);
     if (auto m = s.isModule())

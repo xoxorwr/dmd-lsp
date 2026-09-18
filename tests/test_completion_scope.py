@@ -17,6 +17,11 @@ struct Vec2 { int width; int height; }
 struct Inner { int promoted; }
 struct Wrapper { Inner inner; alias inner this; }
 
+class Base { int baseField; }
+class Derived : Base { int derivedField; }
+interface Speaker { void speak(); }
+class Impl : Speaker { int own; }
+
 T fourBytes(T)(T x) if (T.sizeof == 4) { return x; }
 
 Event make_event() { return Event.init; }
@@ -138,6 +143,18 @@ void on_array_index()
 void on_template()
 {
     four
+}
+
+void on_derived()
+{
+    Derived d;
+    d.
+}
+
+void on_impl()
+{
+    Impl i;
+    i.
 }
 '''
 
@@ -339,6 +356,18 @@ check('template-constraint-shown',
       titem is not None
       and 'if (' in ((titem.get('labelDetails') or {}).get('detail') or ''),
       str(titem))
+
+# 16) Inheritance: a derived instance offers the base class's members too.
+dl = line_of('void on_derived') + 3  # the `    d.` line
+labels = complete(dl, len(lines[dl]))
+check('derived-class-members',
+      'derivedField' in labels and 'baseField' in labels,
+      str(sorted(set(labels))[:12]))
+# Interfaces contribute their methods as well.
+il = line_of('void on_impl') + 3  # the `    i.` line
+labels = complete(il, len(lines[il]))
+check('interface-members', 'own' in labels and 'speak' in labels,
+      str(sorted(set(labels))[:12]))
 
 proc.stdin.close()
 proc.wait(timeout=5)
