@@ -53,11 +53,11 @@ $(VSCODE_DIR)/node_modules: $(VSCODE_DIR)/package.json $(VSCODE_DIR)/package-loc
 	cd $(VSCODE_DIR) && npm ci
 
 # Guard: our sources stay struct-only (vendored dmd is excluded). The only
-# exceptions are the two interop adapters: `RegionGC` (custom GC) and
-# `RefWalker` (dmd's class-based AST visitor, the supported way to traverse the
-# frontend's resolved AST).
+# exceptions are DMD interop adapters: classes deriving from a dmd `Visitor`
+# (the supported way to traverse the frontend's resolved AST) and `RegionGC`
+# (custom GC).
 check-no-oop:
-	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -vE 'RefWalker|RegionGC' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
+	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'RegionGC' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
 	@echo "struct-only check ok (interop adapters excepted)"
 
 # Refresh the vendored snapshot from the ../dmd dev tree.

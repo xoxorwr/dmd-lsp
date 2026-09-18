@@ -1,16 +1,23 @@
 module symbols;
 
 // textDocument/documentSymbol: walk the semantic module's declaration tree
-// into an LSP-shaped hierarchy. Pure dmd reads (public `members`/`loc`), no
-// frontend changes.
+// into an LSP-shaped hierarchy. Traversal uses dmd's own semantic transitive
+// visitor (a class, like the compiler's other visitors) rather than a
+// hand-rolled declaration walk.
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
-import dmd.declaration : VarDeclaration;
-import dmd.denum : EnumDeclaration;
+import dmd.arraytypes : Dsymbols;
+import dmd.declaration : VarDeclaration, AliasDeclaration;
+import dmd.denum : EnumDeclaration, EnumMember;
 import dmd.dtemplate : TemplateDeclaration;
+import dmd.func : FuncDeclaration, CtorDeclaration, DtorDeclaration,
+    PostBlitDeclaration, StaticCtorDeclaration, StaticDtorDeclaration,
+    InvariantDeclaration, UnitTestDeclaration;
+import dmd.dstruct : StructDeclaration, UnionDeclaration;
+import dmd.dclass : ClassDeclaration, InterfaceDeclaration;
+import dmd.visitor : SemanticTimeTransitiveVisitor;
 import dmd.dsymbolsem : toAlias;
-import complete : appendScopeSubs;
 
 // LSP SymbolKind subset (see the LSP spec).
 enum : ubyte
@@ -45,49 +52,50 @@ struct DocSymbol
 // aggregate `loc` is the declaration keyword, not the name).
 DocSymbol[] documentSymbols(Module mod, const(char)[] text)
 {
-    DocSymbol[] out_;
     if (!mod || !mod.members)
-        return out_;
-    Dsymbol[] members;
+        return null;
+    scope DocWalker w = new DocWalker();
+    w.text = text;
+    w.inAggregate = false;
     foreach (i; 0 .. (*mod.members).length)
-        members ~= (*mod.members)[i];
-    collect(members, false, text, out_);
-    return out_;
+        (*mod.members)[i].accept(w);
+    return w.out_;
 }
 
-private void collect(Dsymbol[] members, bool inAggregate, const(char)[] text,
-    ref DocSymbol[] out_)
+// Emits an outline node for each declaration. Aggregate/template/enum members
+// are visited with a fresh child walker; function bodies are not descended
+// (locals are not outline material).
+extern (C++) final class DocWalker : SemanticTimeTransitiveVisitor
 {
-    foreach (s; members)
+    alias visit = SemanticTimeTransitiveVisitor.visit;
+
+    const(char)[] text;
+    bool inAggregate;
+    DocSymbol[] out_;
+
+    private void emit(Dsymbol s, Dsymbols* members, bool childIsMember)
     {
-        if (!s)
-            continue;
-        if (s.isImport() || s.isModule())
-            continue; // not outline material
-        if (s.isAttribDeclaration())
-        {
-            // version/static if/private:... blocks: descend with the same
-            // aggregate context so their members still nest correctly.
-            Dsymbol[] subs;
-            appendScopeSubs(s, subs);
-            collect(subs, inAggregate, text, out_);
-            continue;
-        }
         if (!s.ident)
         {
-            // Anonymous aggregate/enum: descend, emit no node.
-            Dsymbol[] subs = childMembers(s);
-            if (subs.length)
-                collect(subs, true, text, out_);
-            continue;
+            // Anonymous aggregate/enum: descend in place, emit no node.
+            if (members)
+            {
+                bool saved = inAggregate;
+                inAggregate = true;
+                foreach (m; *members)
+                    if (m)
+                        m.accept(this);
+                inAggregate = saved;
+            }
+            return;
         }
         const(char)[] nm = s.ident.toString();
         if (nm == "__dmd_lsp_ph")
-            continue; // our own completion placeholder
+            return; // our own completion placeholder
         if (s.isCtorDeclaration())
             nm = "this"; // dmd names constructors `__ctor`
         if (s.loc.linnum() < 1)
-            continue; // synthetic symbol with no source span
+            return; // synthetic symbol with no source span
 
         DocSymbol d;
         d.name = nm;
@@ -98,15 +106,20 @@ private void collect(Dsymbol[] members, bool inAggregate, const(char)[] text,
         d.selLine = d.line;
         d.selCol = identCol(text, d.line, d.col, nm);
         d.selEndLine = d.line;
-        d.selEndCol = d.selCol + cast(uint)nm.length;
+        d.selEndCol = d.selCol + cast(uint) nm.length;
         d.endLine = d.selEndLine;
         d.endCol = d.selEndCol;
 
-        bool childIsMember = s.isAggregateDeclaration() || s.isEnumDeclaration();
-        DocSymbol[] kids;
-        Dsymbol[] subs = childMembers(s);
-        if (subs.length)
-            collect(subs, childIsMember, text, kids);
+        if (members)
+        {
+            scope DocWalker sub = new DocWalker();
+            sub.text = text;
+            sub.inAggregate = childIsMember;
+            foreach (m; *members)
+                if (m)
+                    m.accept(sub);
+            d.children = sub.out_;
+        }
 
         // A function's `endloc` is the closing brace: the best range end.
         if (auto fd = s.isFuncDeclaration())
@@ -115,9 +128,9 @@ private void collect(Dsymbol[] members, bool inAggregate, const(char)[] text,
                 d.endLine = fd.endloc.linnum() - 1;
                 d.endCol = fd.endloc.charnum() - 1;
             }
-        if (kids.length)
+        if (d.children.length)
         {
-            auto last = kids[$ - 1];
+            auto last = d.children[$ - 1];
             if (last.endLine > d.endLine ||
                 (last.endLine == d.endLine && last.endCol > d.endCol))
             {
@@ -125,9 +138,29 @@ private void collect(Dsymbol[] members, bool inAggregate, const(char)[] text,
                 d.endCol = last.endCol;
             }
         }
-        d.children = kids;
         out_ ~= d;
     }
+
+    override void visit(StructDeclaration s) { emit(s, s.members, true); }
+    override void visit(UnionDeclaration s) { emit(s, s.members, true); }
+    override void visit(ClassDeclaration s) { emit(s, s.members, true); }
+    override void visit(InterfaceDeclaration s) { emit(s, s.members, true); }
+    override void visit(EnumDeclaration s) { emit(s, s.members, true); }
+    override void visit(TemplateDeclaration s) { emit(s, s.members, false); }
+    override void visit(VarDeclaration s) { emit(s, null, false); }
+    override void visit(AliasDeclaration s) { emit(s, null, false); }
+
+    // The transitive visitor dispatches these more-specific function kinds to
+    // its own walkers, so each must be handled here to appear in the outline.
+    override void visit(FuncDeclaration s) { emit(s, null, false); }
+    override void visit(CtorDeclaration s) { emit(s, null, false); }
+    override void visit(DtorDeclaration s) { emit(s, null, false); }
+    override void visit(PostBlitDeclaration s) { emit(s, null, false); }
+    override void visit(StaticCtorDeclaration s) { emit(s, null, false); }
+    override void visit(StaticDtorDeclaration s) { emit(s, null, false); }
+    override void visit(InvariantDeclaration s) { emit(s, null, false); }
+    override void visit(UnitTestDeclaration s) { emit(s, null, false); }
+    override void visit(EnumMember s) { emit(s, null, false); }
 }
 
 // Column (0-based) of `name` as a whole word on `line0`, search starting at
@@ -162,7 +195,7 @@ private uint identCol(const(char)[] text, uint line0, uint col0,
                 continue;
             if (k + name.length < lt.length && isIdentChar(lt[k + name.length]))
                 continue;
-            return cast(uint)k;
+            return cast(uint) k;
         }
     return col0;
 }
@@ -171,22 +204,6 @@ private bool isIdentChar(char c) pure nothrow @nogc @safe
 {
     return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
         (c >= '0' && c <= '9');
-}
-
-// Children worth nesting under `s`: aggregate/template/namespace members via
-// the shared attrib-expanding walker, plus enum members (which it does not know).
-private Dsymbol[] childMembers(Dsymbol s)
-{
-    Dsymbol[] r;
-    if (auto ed = s.isEnumDeclaration())
-    {
-        if (ed.members)
-            foreach (i; 0 .. (*ed.members).length)
-                r ~= (*ed.members)[i];
-        return r;
-    }
-    appendScopeSubs(s, r);
-    return r;
 }
 
 private ubyte lspSymbolKind(Dsymbol s, bool inAggregate)
