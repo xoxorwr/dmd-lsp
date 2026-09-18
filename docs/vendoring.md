@@ -8,7 +8,9 @@ listed in [upstream.md](upstream.md), so the build needs no `../dmd` at all —
 only the D compiler's druntime/phobos are external.
 
 This is packaging, **not a fork**: do not edit files under `src/dmd/`. Fix
-in `../dmd` (with permission), then re-copy.
+in `../dmd` (with permission), then re-copy. The one exception is the
+tooling-only hacks listed in [hacks.md](hacks.md); those are edited in place
+and are lost (loudly) on the next `make vendor`.
 
 The set is exactly what the frontend imports (nothing extra to strip).
 
