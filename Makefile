@@ -66,24 +66,47 @@ check-no-oop:
 	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'RegionGC' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
 	@echo "struct-only check ok (interop adapters excepted)"
 
-# Refresh the vendored snapshot from the ../dmd dev tree.
+# Source of the vendored frontend. Defaults to the sibling dev checkout; a
+# different tree or ref can be selected:
+#   make vendor                  # current working tree of $(DMD_DIR)
+#   make vendor DMD_DIR=~/dmd    # vendor from another checkout (absolute path)
+#   make vendor BRANCH=fork      # vendor a branch/ref of $(DMD_DIR)
+# A branch is materialised in a temporary git worktree (detached), so the
+# current checkout of $(DMD_DIR) is left untouched and removed afterwards.
+DMD_DIR ?= ../dmd
+BRANCH ?=
+
+# Refresh the vendored snapshot from the dmd dev tree.
 vendor:
-	@$(DC) -I../dmd/compiler/src -i \
+	@set -e; \
+	src="$(DMD_DIR)"; wt=""; deps="$$(mktemp)"; \
+	if [ -n "$(BRANCH)" ]; then \
+	  wt="$$(mktemp -d)"; \
+	  git -C "$(DMD_DIR)" worktree add --detach "$$wt" "$(BRANCH)" >/dev/null; \
+	  src="$$wt"; \
+	fi; \
+	trap 'rm -f "$$deps"; test -n "$$wt" && git -C "$(DMD_DIR)" worktree remove --force "$$wt" >/dev/null 2>&1; true' EXIT; \
+	$(DC) -I"$$src/compiler/src" -i \
 	  -version=MARS -version=NoMain -version=GC -version=NoBackend \
 	  -version=CallbackAPI -version=DMDLIB -preview=dip1000 \
-	  -J../dmd/compiler/src/dmd/res -J../dmd -Jstringimp \
-	  $(SRC) -of/dev/null -deps 2>/dev/null \
-	  | grep -oE '\.\./dmd/[^ )]+' | sort -u \
+	  -J"$$src/compiler/src/dmd/res" -J"$$src" -Jstringimp \
+	  $(SRC) -o- -deps >"$$deps" 2>/dev/null || true; \
+	if ! grep -q "$$src/" "$$deps"; then \
+	  echo "vendor: no dmd modules resolved from $$src (incompatible branch/ref?)" >&2; \
+	  exit 1; \
+	fi; \
+	grep -oE "$$src/[^ )]+" "$$deps" | sort -u \
 	  | while read -r p; do \
-	      if [ "$$p" = "../dmd/VERSION" ]; then d="src/dmd/VERSION"; \
-	      else d="src/dmd/$${p#../dmd/compiler/src/dmd/}"; fi; \
+	      rel="$${p#"$$src/"}"; \
+	      if [ "$$rel" = "VERSION" ]; then d="src/dmd/VERSION"; \
+	      else d="src/dmd/$${rel#compiler/src/dmd/}"; fi; \
 	      mkdir -p "$$(dirname "$$d")"; cp "$$p" "$$d"; \
-	    done
-	@for f in $(PLATFORM_EXTRA); do \
+	    done; \
+	for f in $(PLATFORM_EXTRA); do \
 	  mkdir -p "src/dmd/$$(dirname $$f)"; \
-	  cp "../dmd/compiler/src/dmd/$$f" "src/dmd/$$f"; \
-	done
-	@echo "vendored $$(find src/dmd -type f | wc -l) files from ../dmd"
+	  cp "$$src/compiler/src/dmd/$$f" "src/dmd/$$f"; \
+	done; \
+	echo "vendored $$(find src/dmd -type f | wc -l) files from $$src"
 
 # Audit exactly which dmd modules got pulled in.
 deps:
