@@ -2430,38 +2430,170 @@ private string parentOf(const(char)[] p)
     return p[0 .. i].idup;
 }
 
-// Default (stdlib) import paths, derived from the dmd executable so nothing
-// machine-specific is baked in. Walk up from the executable looking for a
-// source tree: the release layout has <root>/src/{druntime/import,phobos}; the
-// dev build has <root>/druntime/src (and no bundled phobos).
+// Default (stdlib) import paths, auto-detected (inspired by serve-d):
+//   1. the `-I` paths from the dmd.conf/sc.ini next to the dmd executable
+//      (`%@P%` expands to the executable's directory);
+//   2. otherwise, walk up from the executable for a source tree (release:
+//      <root>/src/{druntime/import,phobos}; dev: <root>/druntime/import);
+//   3. otherwise, common system install locations.
 private string[] defaultImports()
 {
     string[] found;
     auto exe = dmdExecutable();
-    if (!exe.length)
-        return found;
-    auto dir = parentOf(exe);
-    foreach (_; 0 .. 8)
+    if (exe.length)
     {
-        if (!dir.length || dir == "/" || dir == ".")
-            break;
-        addImportDir(found, dir ~ "/src/druntime/import");
-        addImportDir(found, dir ~ "/src/phobos");
-        addImportDir(found, dir ~ "/druntime/src");
-        addImportDir(found, dir ~ "/phobos"); // dev tree: phobos is a sibling
-        dir = parentOf(dir);
+        auto dir = dirOf(exe);
+        version (Windows)
+            immutable confName = "sc.ini";
+        else
+            immutable confName = "dmd.conf";
+        if (dir.length)
+        {
+            foreach (c; dmdConfImports(dir ~ confName, dir))
+                addImportDir(found, c);
+        }
+        if (!found.length)
+        {
+            auto d = parentOf(exe);
+            foreach (_; 0 .. 8)
+            {
+                if (!d.length || d == "/" || d == ".")
+                    break;
+                addImportDir(found, d ~ "/src/druntime/import");
+                addImportDir(found, d ~ "/src/phobos");
+                addImportDir(found, d ~ "/druntime/import");
+                addImportDir(found, d ~ "/druntime/src");
+                addImportDir(found, d ~ "/phobos"); // dev tree: sibling
+                d = parentOf(d);
+            }
+        }
+    }
+    if (!found.length)
+    {
+        version (Windows)
+            immutable string[] sys = [
+                `C:\D\dmd2\src\druntime\import`, `C:\D\dmd2\src\phobos`,
+            ];
+        else version (OSX)
+            immutable string[] sys = [
+                "/Library/D/dmd/src/druntime/import",
+                "/Library/D/dmd/src/phobos",
+                "/usr/local/include/dmd/druntime/import",
+                "/usr/local/include/dmd/phobos",
+            ];
+        else
+            immutable string[] sys = [
+                "/usr/include/dlang/dmd",
+                "/usr/include/dmd/druntime/import",
+                "/usr/include/dmd/phobos",
+                "/usr/local/include/dmd/druntime/import",
+                "/usr/local/include/dmd/phobos",
+            ];
+        foreach (c; sys)
+            addImportDir(found, c);
     }
     return found;
 }
 
 private void addImportDir(ref string[] found, const(char)[] dir)
 {
-    if (!fileExists(dir))
+    if (!dir.length || !fileExists(dir))
         return;
     foreach (d; found)
         if (d == dir)
             return;
     found ~= dir.idup;
+}
+
+// The `-I` import paths from a dmd.conf/sc.ini, preferring [Environment64].
+private string[] dmdConfImports(const(char)[] confPath, const(char)[] dmdDir)
+{
+    auto text = sessionReadDisk(confPath);
+    if (!text.length)
+        return null;
+    string any, d64;
+    bool in64 = false;
+    size_t i = 0;
+    while (i < text.length)
+    {
+        size_t e = i;
+        while (e < text.length && text[e] != '\n')
+            e++;
+        auto line = trimAscii(text[i .. e]);
+        i = e + 1;
+        if (line == "[Environment64]")
+        {
+            in64 = true;
+            continue;
+        }
+        if (line.length && line[0] == '[')
+        {
+            in64 = false;
+            continue;
+        }
+        if (line.length > 7 && line[0 .. 7] == "DFLAGS=")
+        {
+            if (!any.length)
+                any = line[7 .. $].idup;
+            if (in64)
+                d64 = line[7 .. $].idup;
+        }
+    }
+    auto flags = d64.length ? d64 : any;
+    if (!flags.length)
+        return null;
+    string[] out_;
+    i = 0;
+    while (i < flags.length)
+    {
+        while (i < flags.length && (flags[i] == ' ' || flags[i] == '\t'))
+            i++;
+        size_t s = i;
+        while (i < flags.length && flags[i] != ' ' && flags[i] != '\t')
+            i++;
+        auto tok = flags[s .. i];
+        if (tok.length <= 2 || tok[0] != '-' || tok[1] != 'I')
+            continue;
+        string p = tok[2 .. $];
+        if (p.length >= 2 && (p[0] == '"' || p[0] == '\'') && p[$ - 1] == p[0])
+            p = p[1 .. $ - 1];
+        p = expandDmdPath(p, dmdDir);
+        if (p.length)
+            out_ ~= p.idup;
+    }
+    return out_;
+}
+
+// `%@P%` -> the dmd executable's directory.
+private string expandDmdPath(const(char)[] p, const(char)[] dmdDir)
+{
+    static immutable tok = "%@P%";
+    char[] o;
+    size_t i = 0;
+    while (i < p.length)
+    {
+        if (i + tok.length <= p.length && p[i .. i + tok.length] == tok)
+        {
+            o ~= dmdDir;
+            i += tok.length;
+        }
+        else
+        {
+            o ~= p[i];
+            i++;
+        }
+    }
+    return o.idup;
+}
+
+private string trimAscii(const(char)[] s)
+{
+    size_t a = 0, b = s.length;
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r'))
+        a++;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r'))
+        b--;
+    return s[a .. b].idup;
 }
 
 enum dmdLspVersion = "0.3.0";
