@@ -18,7 +18,7 @@ import dmd.declaration : VarDeclaration;
 import dmd.aggregate : AggregateDeclaration;
 import dmd.dclass : ClassDeclaration;
 import dmd.dtemplate : TemplateDeclaration, TemplateInstance;
-import dmd.statement : Statement;
+import dmd.statement : Statement, WithStatement;
 import dmd.arraytypes : Dsymbols;
 import dmd.attrib : ConditionalDeclaration;
 import dmd.dsymbol : DSYM;
@@ -1206,6 +1206,39 @@ private void addLocal(Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen,
     pushItem(a, o, nm, 6, typeTextWithStorage(vd), docOf(vd), "0", seen, vd);
 }
 
+// Members made available by `with (obj) { ... }`: unqualified names resolve
+// against the object. The frontend resolves the object into `w.wthis` (a
+// synthetic VarDeclaration whose type is the object's type); for pre-semantic
+// buffers `w.exp.type` is the best available.
+private void addWithMembers(Arena* a, ref CompleteOut o,
+    ref bool[const(char)[]] seen, const(char)[] prefix, WithStatement w)
+{
+    Type t = w.wthis ? w.wthis.type : (w.exp ? w.exp.type : null);
+    if (!t)
+        return;
+    if (isBuiltinArrayType(t))
+    {
+        pushArrayProperties(a, o, seen, prefix, t);
+        return;
+    }
+    auto members = followTypeDepth(t, null, null, 0);
+    if (!members.length)
+        return;
+    foreach (m; members)
+    {
+        if (!m.ident)
+            continue;
+        if (m.visible().kind == Visibility.Kind.private_)
+            continue;
+        auto nm = m.ident.toString();
+        if (nm in seen || !hasPrefix(nm, prefix))
+            continue;
+        pushItem(a, o, nm, kindOf(m), typeDetail(symType(m)), docOf(m), "0", seen, m);
+        if (o.nitems >= 500)
+            return;
+    }
+}
+
 private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, uint cursorLine,
     const(char)[] prefix, Arena* a, ref CompleteOut o, ref bool[const(char)[]] seen)
 {
@@ -1387,13 +1420,16 @@ private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, ui
         uint end = w.endloc.linnum();
         if (end != 0 && cursorLine > end)
             return;
+        // Body locals shadow the with object's members, so walk the body first
+        // and add the object's members afterwards (first add wins via `seen`).
+        walkStmt(w._body, cur, syn, cursorLine, prefix, a, o, seen);
         if (w.prm && w.prm.ident)
         {
             const(char)[] wnm = w.prm.ident.toString();
             if (hasPrefix(wnm, prefix))
                 pushItem(a, o, wnm, 6, typeDetail(w.prm.type), null, "0", seen, null, typeDetail(w.prm.type));
         }
-        walkStmt(w._body, cur, syn, cursorLine, prefix, a, o, seen);
+        addWithMembers(a, o, seen, prefix, w);
         return;
     }
     if (auto sy = s.isSynchronizedStatement())

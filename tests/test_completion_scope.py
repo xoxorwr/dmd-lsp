@@ -25,6 +25,26 @@ import evmod = mod;
 void helper(Event e) { }
 void helperInt(int n) { }
 
+void on_with()
+{
+    Event e;
+    with (e)
+    {
+        consumed;
+    }
+}
+
+void on_with_nested()
+{
+    Event e;
+    Vec2 v;
+    with (e)
+    with (v)
+    {
+        width;
+    }
+}
+
 void on_ref(ref Event arg)
 {
     ar
@@ -258,6 +278,22 @@ labels = complete(el, len(lines[el]))
 check('ufcs-completion',
       'helper' in labels and 'helperInt' not in labels,
       str(sorted(set(labels))[:10]))
+
+# 12) `with (e) { ... }`: Event's fields are in scope unqualified (complete at
+# the line start, empty prefix, so every field is offered).
+wl = line_of('        consumed;')
+labels = complete(wl, 8)
+check('with-scope',
+      'consumed' in labels and 'resize' in labels and 'type' in labels,
+      str(sorted(set(labels))[:10]))
+
+# 13) Nested `with`: both the inner (Vec2) and outer (Event) members are in
+# scope.
+nl = line_of('        width;')
+labels = complete(nl, 8)
+check('with-nested-scope',
+      'width' in labels and 'height' in labels and 'consumed' in labels,
+      str(sorted(set(labels))[:12]))
 
 proc.stdin.close()
 proc.wait(timeout=5)
