@@ -76,6 +76,13 @@ class Daemon:
                               "context": {"includeDeclaration": include}}})
         return self.read_msg()['result']
 
+    def prepare(self, path, line, ch):
+        self.send({"jsonrpc": "2.0", "id": 101,
+                   "method": "textDocument/prepareRename",
+                   "params": {"textDocument": {"uri": 'file://' + path},
+                              "position": {"line": line, "character": ch}}})
+        return self.read_msg()
+
     def close(self):
         try:
             self.proc.kill()
@@ -335,6 +342,35 @@ d.drain(1.0)
 crefs2 = fmt(d.references(cmp_, 4, 4, True))
 check('callee-not-located-in-comment',
       sorted(l for (_, l, _, _) in crefs2) == [1, 4], str(crefs2))
+d.close()
+
+# Aggregate declarations store the *keyword* in `loc` (not the name), and dmd
+# does not keep the type-name span on a resolved `Type`, so struct/class type
+# references need explicit handling: the declaration, explicit type
+# annotations, and invocation from a type annotation.
+st = ('module st;\n'
+      'struct S { int f; }\n'
+      'S gvar;\n'
+      'void f(S p)\n{\n'
+      '    S s;\n'
+      '}\n')
+stp = os.path.join(root, 'st.d')
+open(stp, 'w').write(st)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(stp, st)
+d.drain(1.0)
+srefs = fmt(d.references(stp, 1, 7, True))  # `S` in the struct declaration
+check('struct-type-refs',
+      ('st.d', 1, 7, 8) in srefs and ('st.d', 2, 0, 1) in srefs
+      and ('st.d', 3, 7, 8) in srefs and ('st.d', 5, 4, 5) in srefs,
+      str(srefs))
+r = d.prepare(stp, 2, 0)  # cursor on the type annotation `S gvar;`
+check('struct-type-prepare',
+      r.get('result') and r['result']['placeholder'] == 'S'
+      and r['result']['range']['start'] == {'line': 2, 'character': 0},
+      str(r.get('result')))
 d.close()
 
 # Uses inside expression kinds that a hand-rolled walk tends to miss:

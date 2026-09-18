@@ -667,6 +667,81 @@ private RefPos usePos(Loc recv, Dsymbol sym, bool member)
     return r;
 }
 
+// The name position of a declaration. Most symbols store the identifier in
+// `loc`, but aggregate declarations (struct/class/union/interface/enum) store
+// the *keyword* (`loc` points at `struct`); scan forward for the identifier as
+// a whole word in that case.
+private RefPos declPos(Loc loc, Identifier ident)
+{
+    RefPos r = RefPos(loc.linnum(), loc.charnum());
+    if (!ident)
+        return r;
+    ensureRefText();
+    if (!g_refText.length)
+        return r;
+    auto name = ident.toString();
+    if (!name.length || textSpells(g_refText, loc.linnum(), loc.charnum(), name))
+        return r;
+    size_t start = refOffset(g_refText, loc.linnum(), loc.charnum());
+    size_t i = start;
+    while (i < g_refText.length)
+    {
+        size_t j = indexOfFrom(g_refText, name, i);
+        if (j == size_t.max)
+            break;
+        bool okL = j == 0 || !isIdentChar(g_refText[j - 1]);
+        bool okR = j + name.length >= g_refText.length ||
+            !isIdentChar(g_refText[j + name.length]);
+        if (okL && okR)
+        {
+            offsetLineCol(g_refText, j, r.line, r.col);
+            return r;
+        }
+        i = j + name.length;
+    }
+    return r;
+}
+
+// First whole-word occurrence of `ident` on the declaration's line *before*
+// `anchor` (the declared name). This locates an explicit type annotation
+// (`S s;`, `S[] a;`) whose name dmd does not store on the resolved `Type`.
+// Returns line 0 when absent (e.g. an inferred `auto` type), which the caller
+// treats as "no source occurrence here".
+private RefPos typeBackPos(Loc anchor, Identifier ident)
+{
+    RefPos none = RefPos(0, 0);
+    if (!ident)
+        return none;
+    ensureRefText();
+    if (!g_refText.length)
+        return none;
+    auto name = ident.toString();
+    if (!name.length)
+        return none;
+    size_t off = refOffset(g_refText, anchor.linnum(), anchor.charnum());
+    size_t ls = off;
+    while (ls > 0 && g_refText[ls - 1] != '\n')
+        ls--;
+    size_t i = ls;
+    while (i + name.length <= off)
+    {
+        size_t j = indexOfFrom(g_refText, name, i);
+        if (j == size_t.max || j + name.length > off)
+            break;
+        bool okL = j == 0 || !isIdentChar(g_refText[j - 1]);
+        bool okR = j + name.length >= g_refText.length ||
+            !isIdentChar(g_refText[j + name.length]);
+        if (okL && okR)
+        {
+            RefPos r;
+            offsetLineCol(g_refText, j, r.line, r.col);
+            return r;
+        }
+        i = j + 1;
+    }
+    return none;
+}
+
 // ---------- semantic walk ----------
 
 private struct Hit
@@ -717,14 +792,15 @@ private void emitDecl(Loc loc, Dsymbol d, Dsymbol target, bool includeDecl,
 {
     if (!d.ident)
         return;
+    auto p = declPos(loc, d.ident);
     if (g_collect)
     {
-        g_hits ~= Hit(loc.linnum(), loc.charnum(), d);
+        g_hits ~= Hit(p.line, p.col, d);
         return;
     }
     if (!includeDecl || !isTarget(d, target))
         return;
-    recordPos(loc.linnum(), loc.charnum(), d.ident, out_);
+    recordPos(p.line, p.col, d.ident, out_);
 }
 
 // DMD's own semantic-time transitive visitor provides the AST traversal, so we
@@ -749,6 +825,30 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     {
         if (d)
             emitDecl(d.loc, d, target, includeDecl, out_);
+    }
+
+    // A reference to `t` in a declaration's explicit type annotation. dmd drops
+    // the type-name location when it resolves the type, so locate it by scanning
+    // back from the declared name; inferred (`auto`/`typeof`) types have no
+    // written type name and are skipped.
+    private void typeUse(Loc anchor, Type t)
+    {
+        auto sym = typeSymbol(t);
+        if (!sym || !sym.ident)
+            return;
+        if (g_collect)
+        {
+            // Also allow references/rename to be invoked on a type annotation.
+            auto p = typeBackPos(anchor, sym.ident);
+            if (p.line >= 1)
+                g_hits ~= Hit(p.line, p.col, sym);
+            return;
+        }
+        if (!isTarget(sym, target))
+            return;
+        auto p = typeBackPos(anchor, sym.ident);
+        if (p.line >= 1)
+            recordPos(p.line, p.col, sym.ident, out_);
     }
 
     // Uses: every expression node that carries a resolved symbol. `super.visit`
@@ -792,15 +892,21 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     override void visit(FuncDeclaration d)
     {
         decl(d);
+        if (d.type)
+            if (auto tf = d.type.isTypeFunction())
+                if (tf.next)
+                    typeUse(d.loc, tf.next); // return type annotation
         // `d.parameters` is a `VarDeclarations*` (the parameter symbols); the
         // base visitor only walks the function type + body, so emit the
-        // parameters (and their default arguments) explicitly.
+        // parameters (their types and default arguments) explicitly.
         if (d.parameters)
             foreach (p; *d.parameters)
             {
                 if (!p)
                     continue;
                 decl(p);
+                if (p.type)
+                    typeUse(p.loc, p.type);
                 if (p._init)
                     p._init.accept(this);
             }
@@ -810,6 +916,8 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     override void visit(VarDeclaration d)
     {
         decl(d);
+        if (d.type)
+            typeUse(d.loc, d.type);
         super.visit(d);
     }
 
@@ -822,6 +930,9 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
             return;
         auto old = e.stageflags;
         e.stageflags |= StructLiteralExp.StageFlags.apply;
+        // `S(...)` is a struct literal; its type name is at the literal's loc.
+        if (e.sd)
+            use(e.loc, e.sd, false);
         if (e.elements)
             foreach (el; *e.elements)
                 if (el)
