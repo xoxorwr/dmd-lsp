@@ -293,6 +293,31 @@ else:
     check('rename-twice-second-ok', False, 'first rename failed')
 d.close()
 
+# Renaming a type must rewrite the declaration and every explicit type
+# annotation (not just expression uses).
+ST2 = ('module st2;\n'
+       'struct S { int f; }\n'
+       'S gvar;\n'
+       'void fn(S p) { S s; }\n')
+st2 = os.path.join(root, 'st2.d')
+open(st2, 'w').write(ST2)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(st2, ST2)
+d.drain(1.0)
+r = d.rename(st2, 1, 7, 'T')  # `S` in the struct declaration
+if 'result' in r:
+    new = apply_changes(r['result']['changes'], {st2: ST2})
+    check('rename-type-annotations',
+          new[st2] == ('module st2;\n'
+                       'struct T { int f; }\n'
+                       'T gvar;\n'
+                       'void fn(T p) { T s; }\n'), repr(new[st2]))
+else:
+    check('rename-type-annotations', False, str(r)[:200])
+d.close()
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

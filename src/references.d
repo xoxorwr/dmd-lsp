@@ -722,6 +722,9 @@ private RefPos typeBackPos(Loc anchor, Identifier ident)
     size_t ls = off;
     while (ls > 0 && g_refText[ls - 1] != '\n')
         ls--;
+    // The *nearest* preceding occurrence is the declaration's own type
+    // (`S a; S b;` must map each name to its own type).
+    size_t best = size_t.max;
     size_t i = ls;
     while (i + name.length <= off)
     {
@@ -732,14 +735,14 @@ private RefPos typeBackPos(Loc anchor, Identifier ident)
         bool okR = j + name.length >= g_refText.length ||
             !isIdentChar(g_refText[j + name.length]);
         if (okL && okR)
-        {
-            RefPos r;
-            offsetLineCol(g_refText, j, r.line, r.col);
-            return r;
-        }
+            best = j;
         i = j + 1;
     }
-    return none;
+    if (best == size_t.max)
+        return none;
+    RefPos r;
+    offsetLineCol(g_refText, best, r.line, r.col);
+    return r;
 }
 
 // ---------- semantic walk ----------
