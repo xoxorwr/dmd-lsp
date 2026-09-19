@@ -770,6 +770,46 @@ check('typehierarchy-subtypes',
 d.close()
 os.remove(tbp)
 
+# Type hierarchy across a templated interface: `Read!(Data!int)` is shown as
+# the supertype, and subtypes of `interface Read(T)` find the deriving class.
+tt = ('module tth;\n'
+      '\n'
+      'struct Data(T) {}\n'
+      '\n'
+      'interface Read(T)\n'
+      '{\n'
+      '    void read(T stuff);\n'
+      '}\n'
+      '\n'
+      'class BinaryReader : Read!(Data!int)\n'
+      '{\n'
+      '}\n')
+ttp = os.path.join(root, 'tth.d')
+open(ttp, 'w').write(tt)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(ttp, tt)
+d.drain(1.5)
+br = th_rpc(220, 'textDocument/prepareTypeHierarchy',
+            {"textDocument": {"uri": 'file://' + ttp},
+             "position": {"line": 9, "character": 6}})  # `BinaryReader`
+check('typehierarchy-template-prepare',
+      bool(br) and br[0]['name'] == 'BinaryReader', str(br))
+sup = th_rpc(221, 'typeHierarchy/supertypes', {"item": br[0]}) if br else None
+check('typehierarchy-template-super',
+      bool(sup) and any(s['name'].startswith('Read!') for s in sup), str(sup))
+rd = th_rpc(222, 'textDocument/prepareTypeHierarchy',
+            {"textDocument": {"uri": 'file://' + ttp},
+             "position": {"line": 4, "character": 10}})  # `Read` decl
+check('typehierarchy-template-decl',
+      bool(rd) and rd[0]['name'] == 'Read' and rd[0]['kind'] == 11, str(rd))
+sub = th_rpc(223, 'typeHierarchy/subtypes', {"item": rd[0]}) if rd else None
+check('typehierarchy-template-sub',
+      bool(sub) and any(s['name'] == 'BinaryReader' for s in sub), str(sub))
+d.close()
+os.remove(ttp)
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

@@ -1219,20 +1219,51 @@ private void sendImplementStubs(const(WStub)[] stubs)
 }
 
 // The class the cursor is on (its name) or inside (a member's parent chain).
+// Handles template instantiations (`Read!(Data!int)`) and the template
+// declaration itself (`interface Read(T)`).
 private ClassDeclaration classAt(Module mod, uint line, uint col,
     const(char)[] text)
 {
-    import dmd.dclass : ClassDeclaration;
-
     auto sym = resolvedSymbolAt(mod, line, col, text);
     if (!sym)
         return null;
     if (auto cd = sym.isClassDeclaration())
         return cd;
+    if (auto ti = sym.isTemplateInstance())
+        if (ti.inst)
+            if (auto cd = ti.inst.isClassDeclaration())
+                return cd;
+    if (auto td = sym.isTemplateDeclaration())
+    {
+        if (td.onemember)
+            if (auto cd = td.onemember.isClassDeclaration())
+                return cd;
+        if (td.members)
+            foreach (i; 0 .. (*td.members).length)
+                if (auto cd = (*td.members)[i].isClassDeclaration())
+                    return cd;
+    }
     for (auto p = sym.parent; p; p = p.parent)
         if (auto cd = p.isClassDeclaration())
             return cd;
     return null;
+}
+
+// Declaration key with template instantiations reduced to their template, so a
+// `class C : Read!int` matches the `interface Read(T)` declaration.
+private DeclKey originDeclKey(Dsymbol sym)
+{
+    if (sym.parent)
+    {
+        if (auto ti = sym.parent.isTemplateInstance())
+            if (ti.tempdecl)
+                return declKey(ti.tempdecl);
+        // The aggregate declared by a template (`interface Read(T)`): key on
+        // the template declaration so it matches every instantiation.
+        if (sym.parent.isTemplateDeclaration())
+            return declKey(sym.parent);
+    }
+    return declKey(sym);
 }
 
 private void implementStubsAndSend(ref ServerState s, const ref Analysis a,
@@ -1319,12 +1350,28 @@ private void nameSpan(const(char)[] text, uint line, uint fromCol,
         }
 }
 
+// Display name: the instantiated name for a template instance
+// (`Read!(Data!(int))`), else the plain identifier.
+private string typeName(ClassDeclaration cd)
+{
+    import core.stdc.string : strlen;
+
+    if (cd.parent)
+        if (auto ti = cd.parent.isTemplateInstance())
+        {
+            const(char)* s = ti.toChars();
+            if (s)
+                return s[0 .. strlen(s)].idup;
+        }
+    return cd.ident ? cd.ident.toString().idup : null;
+}
+
 private WTypeItem typeItem(ClassDeclaration cd)
 {
     import core.stdc.string : strlen;
 
     WTypeItem it;
-    it.name = cd.ident ? cd.ident.toString().idup : null;
+    it.name = typeName(cd);
     it.kind = cd.isInterfaceDeclaration() ? 11 : 5;
     const(char)* f = cd.loc.filename();
     it.file = f ? f[0 .. strlen(f)].idup : null;
@@ -1375,10 +1422,11 @@ private void collectSubtypesIn(Module mod, ref const DeclKey baseKey,
     collectClassDecls(top, classes);
     foreach (cd; classes)
     {
-        bool direct = cd.baseClass && keyMatches(declKey(cd.baseClass), baseKey);
+        bool direct = cd.baseClass &&
+            keyMatches(originDeclKey(cd.baseClass), baseKey);
         if (!direct)
             foreach (bc; cd.interfaces)
-                if (bc.sym && keyMatches(declKey(bc.sym), baseKey))
+                if (bc.sym && keyMatches(originDeclKey(bc.sym), baseKey))
                 {
                     direct = true;
                     break;
@@ -1420,7 +1468,7 @@ private void typeHierarchyAndSend(ref ServerState s, const ref Analysis a,
         return;
     }
     // subtypes: workspace-wide, mirroring the `implementation` op.
-    auto baseKey = declKey(cd);
+    auto baseKey = originDeclKey(cd);
     const(char)* df = cd.loc.filename();
     string declFile = df ? df[0 .. strlen(df)].idup : null;
     string declName = declFile.length ? indexModuleOfFile(declFile) : null;
