@@ -769,6 +769,74 @@ private bool ensureIndex(App* app)
     return true;
 }
 
+// Modules exporting `name` that the document does not already import.
+private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
+    ref worker.WIndexSym[] out_)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!respawnWorker(app))
+                return false;
+        }
+        auto r = workerImportCandidates(app.wk, name, path, out_);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// The name in dmd's "undefined identifier `X`" message, or null.
+private string undefinedName(const(char)[] msg)
+{
+    immutable pre = "undefined identifier `";
+    if (msg.length < pre.length || msg[0 .. pre.length] != pre)
+        return null;
+    size_t e = pre.length;
+    while (e < msg.length && msg[e] != '`')
+        e++;
+    if (e >= msg.length)
+        return null;
+    return msg[pre.length .. e].idup;
+}
+
+// Line/char just after the `module` declaration (or the file start), where a
+// new `import` line can be inserted.
+private void importInsertPos(const(char)[] text, out uint line, out uint ch)
+{
+    line = 0;
+    ch = 0;
+    size_t start = 0;
+    uint ln = 0;
+    while (start < text.length)
+    {
+        size_t end = start;
+        while (end < text.length && text[end] != '\n')
+            end++;
+        auto lt = text[start .. end];
+        size_t a = 0;
+        while (a < lt.length && (lt[a] == ' ' || lt[a] == '\t' || lt[a] == '\r'))
+            a++;
+        if (a + 6 <= lt.length && lt[a .. a + 6] == "module")
+        {
+            line = ln + 1;
+            return;
+        }
+        if (a < lt.length && lt[a] != '/' && lt[a] != '#')
+            return; // first real line is not `module`: insert on top
+        start = end + 1;
+        ln++;
+    }
+    line = ln;
+}
+
 // Files to index: the project's declared import paths (CLI/editor + dls.json),
 // not the builtin stdlib defaults. This follows the project's module graph
 // instead of scanning the whole checkout (whose test fixtures / vendored trees
@@ -2738,22 +2806,19 @@ private void handleMessage(App* app, ref RawMsg m)
             auto actions = js.create_array();
             if (path !is null)
             {
-                if (hasPending(app, path))
+                // Actions carry edit ranges: refresh so they match the
+                // current text.
+                const(char)[] text;
+                auto d = sessionFind(app.session, path);
+                if (d)
+                    text = d.text;
+                else
+                    text = sessionReadDisk(path);
+                if (hasPending(app, path) && text)
                 {
-                    // Actions carry edit ranges: refresh so they match the
-                    // current text.
-                    const(char)[] text;
-                    auto d = sessionFind(app.session, path);
-                    if (d)
-                        text = d.text;
-                    else
-                        text = sessionReadDisk(path);
-                    if (text)
-                    {
-                        worker.WAnalysis a;
-                        if (workerAnalyzeRetry(app, path, text, a))
-                            app.cache[path.idup] = HitCache(a);
-                    }
+                    worker.WAnalysis a;
+                    if (workerAnalyzeRetry(app, path, text, a))
+                        app.cache[path.idup] = HitCache(a);
                 }
                 if (auto hc = path.idup in app.cache)
                 {
@@ -2799,6 +2864,63 @@ private void handleMessage(App* app, ref RawMsg m)
                         js.add_item_to_object(w, "changes", changes);
                         js.add_item_to_object(a, "edit", w);
                         js.add_item_to_array(actions, a);
+                    }
+                    // Add-import: an unresolved identifier in the requested
+                    // range gets a quickfix per indexed module exporting it.
+                    if (auto rng = jget(p, "range"))
+                    {
+                        auto rs = jget(rng, "start");
+                        auto re = jget(rng, "end");
+                        uint sl = cast(uint) jint(jget(rs, "line"));
+                        uint el = cast(uint) jint(jget(re, "line"));
+                        bool[string] offered;
+                        uint il = 0, ic = 0;
+                        bool haveInsert = false;
+                        foreach (ref dg; (*hc).analysis.diags)
+                        {
+                            if (dg.kind != 'E')
+                                continue;
+                            string nm = undefinedName(dg.text);
+                            if (!nm.length || nm in offered)
+                                continue;
+                            uint dl = dg.line > 0 ? dg.line - 1 : 0;
+                            if (dl < sl || dl > el)
+                                continue;
+                            offered[nm] = true;
+                            if (!haveInsert)
+                            {
+                                if (!text)
+                                    break;
+                                ensureIndex(app);
+                                importInsertPos(text, il, ic);
+                                haveInsert = true;
+                            }
+                            worker.WIndexSym[] cands;
+                            if (!workerImportRetry(app, nm, path, cands))
+                                continue;
+                            foreach (cand; cands)
+                            {
+                                if (!cand.moduleName.length)
+                                    continue;
+                                auto edits = js.create_array();
+                                auto ed = js.create_object();
+                                js.add_item_to_object(ed, "range",
+                                    jrange(js, il, ic, il, ic));
+                                js.add_string_to_object(ed, "newText",
+                                    zstr("import " ~ cand.moduleName ~ ";\n"));
+                                js.add_item_to_array(edits, ed);
+                                auto changes = js.create_object();
+                                js.add_item_to_object(changes, zstr(uri), edits);
+                                auto act = js.create_object();
+                                js.add_string_to_object(act, "title",
+                                    zstr("Import `" ~ nm ~ "` from " ~ cand.moduleName));
+                                js.add_string_to_object(act, "kind", "quickfix");
+                                auto w = js.create_object();
+                                js.add_item_to_object(w, "changes", changes);
+                                js.add_item_to_object(act, "edit", w);
+                                js.add_item_to_array(actions, act);
+                            }
+                        }
                     }
                 }
             }

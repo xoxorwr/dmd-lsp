@@ -84,6 +84,7 @@ struct WIndexSym
     uint line; // 0-based
     uint col;
     string container;
+    string moduleName; // declaring module, for add-import
 }
 private WIndexSym[] g_index;
 private bool g_indexBuilt = false;
@@ -873,12 +874,16 @@ private void buildIndexNow(ref ServerState s, string[] files)
         if (!pr.ok || !pr.module_)
             continue;
         auto mod = cast(Module)pr.module_;
+        string moduleName = null;
+        if (const(char)* mn = mod.toPrettyChars())
+            moduleName = mn[0 .. strlen(mn)].idup;
+        size_t before = g_index.length;
         flattenIndex(documentSymbols(mod, text), f, null, g_index);
+        foreach (i; before .. g_index.length)
+            g_index[i].moduleName = moduleName;
         WFileInfo fi;
         fi.file = f.idup;
-        const(char)* mn = mod.toPrettyChars();
-        if (mn)
-            fi.moduleName = mn[0 .. strlen(mn)].idup;
+        fi.moduleName = moduleName;
         if (mod.members)
             foreach (i; 0 .. (*mod.members).length)
             {
@@ -1038,6 +1043,53 @@ private void sendWorkspaceSymbols(const(WIndexSym)[] syms)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "syms", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+// Symbols named `name` in indexed modules that `path` neither declares nor
+// already imports, for an add-import quickfix. One per module.
+private WIndexSym[] importCandidates(const(char)[] name, const(char)[] path)
+{
+    WIndexSym[] out_;
+    if (!g_indexBuilt || !name.length)
+        return out_;
+    bool[string] imported;
+    foreach (fi; g_files)
+        if (fi.file == path)
+            foreach (im; fi.imports)
+                imported[im] = true;
+    bool[string] seenModule;
+    foreach (s; g_index)
+    {
+        if (s.name != name || s.file == path)
+            continue;
+        if (s.moduleName in imported || s.moduleName in seenModule)
+            continue;
+        seenModule[s.moduleName] = true;
+        out_ ~= s;
+        if (out_.length >= 20)
+            break;
+    }
+    return out_;
+}
+
+private void sendImportCandidates(const(WIndexSym)[] cands)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    foreach (s; cands)
+    {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "module", zstr(s.moduleName));
+        js.add_string_to_object(o, "file", zstr(s.file));
+        js.add_number_to_object(o, "kind", s.kind);
+        if (s.container.length)
+            js.add_string_to_object(o, "container", zstr(s.container));
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "cands", arr);
     js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
@@ -1941,6 +1993,13 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 if (q is null)
                     q = "";
                 sendWorkspaceSymbols(queryIndex(q));
+                continue;
+            }
+            if (ops == "importCandidates")
+            {
+                auto nm = dupOrEmpty(jstr(jget(p, "name")));
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                sendImportCandidates(importCandidates(nm, path));
                 continue;
             }
             if (ops == "invalidateIndex")
@@ -2982,6 +3041,36 @@ ExchangeResult workerWorkspaceSymbol(ref Worker w, const(char)[] query,
             out_ ~= s;
         }
     }
+    return ExchangeResult.ok;
+}
+
+// Modules exporting `name` that `path` does not already import.
+ExchangeResult workerImportCandidates(ref Worker w, const(char)[] name,
+    const(char)[] path, ref WIndexSym[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("importCandidates"));
+    js.add_string_to_object(root, "name", zstr(name));
+    js.add_string_to_object(root, "path", zstr(path));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "cands"))
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WIndexSym s;
+            s.moduleName = dupOrEmpty(jstr(jget(c, "module")));
+            s.file = dupOrEmpty(jstr(jget(c, "file")));
+            s.kind = cast(ubyte)jint(jget(c, "kind"));
+            s.container = dupOrEmpty(jstr(jget(c, "container")));
+            out_ ~= s;
+        }
     return ExchangeResult.ok;
 }
 

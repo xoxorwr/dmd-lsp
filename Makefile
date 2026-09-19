@@ -126,6 +126,7 @@ check: $(BIN) check-no-oop unittest
 	./$(BIN) --check --import=tests tests/u2.d
 	./$(BIN) --check tests/ok.d || true
 	python3 tests/test_lsp.py
+	python3 tests/test_code_actions.py
 	python3 tests/test_semantic.py
 	python3 tests/test_semantic_hints.py
 	python3 tests/test_lint.py
