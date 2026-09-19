@@ -91,6 +91,10 @@ struct WFileInfo
 }
 private WFileInfo[] g_files;
 
+// Set when a child could not write a response. The worker loop checks it and
+// exits, so a lost reply can't leave the parent blocked in readFrame forever.
+__gshared bool g_writeFailed = false;
+
 private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
 {
     size_t off = 0;
@@ -100,14 +104,25 @@ private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
         {
             auto n = write(c.fd, data.ptr + off, data.length - off);
             if (n <= 0)
+            {
+                g_writeFailed = true;
                 return false;
+            }
             off += cast(size_t)n;
         }
         version (Windows)
         {
+            // The standard handles are not stable across calls (the runtime
+            // can move them), so resolve them here instead of caching.
+            auto h = c.h;
+            if (h is null)
+                h = GetStdHandle(STD_OUTPUT_HANDLE);
             DWORD n = 0;
-            if (!WriteFile(c.h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
+            if (!WriteFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
+            {
+                g_writeFailed = true;
                 return false;
+            }
             off += n;
         }
     }
@@ -128,8 +143,11 @@ private bool chanRead(ref Chan c, ubyte[] data) nothrow
         }
         version (Windows)
         {
+            auto h = c.h;
+            if (h is null)
+                h = GetStdHandle(STD_INPUT_HANDLE);
             DWORD n = 0;
-            if (!ReadFile(c.h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
+            if (!ReadFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
                 return false;
             off += n;
         }
@@ -1357,13 +1375,19 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
         version (Posix) { inChan.fd = 0; outChan.fd = 1; }
         version (Windows)
         {
-            inChan.h = GetStdHandle(STD_INPUT_HANDLE);
-            outChan.h = GetStdHandle(STD_OUTPUT_HANDLE);
+            // Resolve the std handles per call (see chanRead/chanWrite): they
+            // are not stable enough to cache for the worker's lifetime.
+            inChan.h = null;
+            outChan.h = null;
         }
         ServerState s;
         bool built = false;
         for (;;)
         {
+            // A response we could not deliver already wedged the parent; exit
+            // so it sees EOF and respawns instead of waiting forever.
+            if (g_writeFailed)
+                break;
             char[] req;
             if (!readFrame(inChan, req))
                 break;
