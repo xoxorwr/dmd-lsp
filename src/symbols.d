@@ -18,6 +18,9 @@ import dmd.dstruct : StructDeclaration, UnionDeclaration;
 import dmd.dclass : ClassDeclaration, InterfaceDeclaration;
 import dmd.visitor : SemanticTimeTransitiveVisitor;
 import dmd.dsymbolsem : toAlias;
+import dmd.expression : Expression, CallExp;
+import dmd.identifier : Identifier;
+import dmd.astenums : STC, TY;
 
 // LSP SymbolKind subset (see the LSP spec).
 enum : ubyte
@@ -45,6 +48,152 @@ struct DocSymbol
     uint endLine, endCol; // range end
     uint selLine, selCol, selEndLine, selEndCol; // selectionRange
     DocSymbol[] children;
+}
+
+// ---------- inlay hints ----------
+
+// One hint at a 0-based position. `auto` type hints are `paddingLeft`; call
+// parameter-name hints are `paddingRight`.
+struct InlayHint
+{
+    uint line;
+    uint col;
+    const(char)[] label;
+    bool paddingLeft;
+    bool paddingRight;
+}
+
+// True when showing a parameter name for `arg` would be noise: the argument is
+// a literal, or an identifier that already spells the parameter name.
+private bool obviousArg(Expression arg, Identifier pname)
+{
+    if (!arg)
+        return true;
+    if (arg.isIdentifierExp())
+        return pname && arg.isIdentifierExp().ident is pname;
+    if (arg.isVarExp())
+    {
+        auto v = arg.isVarExp().var;
+        return v && v.ident && pname && v.ident is pname;
+    }
+    if (arg.isIntegerExp() || arg.isRealExp() || arg.isStringExp() ||
+        arg.isNullExp())
+        return true;
+    return false;
+}
+
+private bool wordAt(const(char)[] hay, const(char)[] word, size_t i)
+{
+    if (i + word.length > hay.length)
+        return false;
+    foreach (k; 0 .. word.length)
+        if (hay[i + k] != word[k])
+            return false;
+    if (i > 0 && identChar(hay[i - 1]))
+        return false;
+    if (i + word.length < hay.length && identChar(hay[i + word.length]))
+        return false;
+    return true;
+}
+
+private bool containsWord(const(char)[] hay, const(char)[] word)
+{
+    if (!word.length || hay.length < word.length)
+        return false;
+    foreach (i; 0 .. hay.length - word.length + 1)
+        if (wordAt(hay, word, i))
+            return true;
+    return false;
+}
+
+extern (C++) final class HintWalker : SemanticTimeTransitiveVisitor
+{
+    alias visit = SemanticTimeTransitiveVisitor.visit;
+
+    const(char)[] text;
+    size_t[] lineStarts;
+    InlayHint[] out_;
+
+    // `auto` is cleared from `storage_class` during semantic, so detect it from
+    // the source text before the declared name.
+    private bool isAutoDecl(VarDeclaration d)
+    {
+        if (!d.ident)
+            return false;
+        uint line = d.loc.linnum();
+        uint col = d.loc.charnum();
+        if (line == 0 || line > lineStarts.length || col == 0)
+            return false;
+        size_t s = lineStarts[line - 1];
+        size_t e = line < lineStarts.length ? lineStarts[line] : text.length;
+        size_t nameOff = s + col - 1;
+        if (nameOff > e)
+            return false;
+        return containsWord(text[s .. nameOff], "auto");
+    }
+
+    // `auto` declaration: show the resolved type after the name.
+    override void visit(VarDeclaration d)
+    {
+        if (isAutoDecl(d))
+            if (d.type && d.type.ty != TY.Terror)
+            {
+                import core.stdc.string : strlen;
+                const(char)* tp = d.type.toChars();
+                if (tp)
+                {
+                    auto name = d.ident.toString();
+                    out_ ~= InlayHint(d.loc.linnum() - 1,
+                        cast(uint) d.loc.charnum() + cast(uint) name.length - 1,
+                        cast(const(char)[]) (": " ~ tp[0 .. strlen(tp)]),
+                        true, false);
+                }
+            }
+        super.visit(d);
+    }
+
+    // Call argument names, when not obvious.
+    override void visit(CallExp e)
+    {
+        auto fd = e.f ? e.f.isFuncDeclaration() : null;
+        auto tf = fd && fd.type ? fd.type.isTypeFunction() : null;
+        if (tf && tf.parameterList.parameters && e.arguments)
+        {
+            size_t nparam = (*tf.parameterList.parameters).length;
+            size_t startArg = e.isUfcsRewrite ? 1 : 0; // skip the receiver
+            foreach (i, arg; *e.arguments)
+            {
+                if (i < startArg || !arg)
+                    continue;
+                if (i >= nparam)
+                    break;
+                auto p = (*tf.parameterList.parameters)[i];
+                if (!p || !p.ident || obviousArg(arg, p.ident))
+                    continue;
+                out_ ~= InlayHint(arg.loc.linnum() - 1,
+                    cast(uint) arg.loc.charnum() - 1,
+                    cast(const(char)[]) (p.ident.toString() ~ ":"),
+                    false, true);
+            }
+        }
+        super.visit(e);
+    }
+}
+
+InlayHint[] inlayHints(Module mod, const(char)[] text)
+{
+    if (!mod || !mod.members)
+        return null;
+    size_t[] starts = [0];
+    foreach (i, c; text)
+        if (c == '\n')
+            starts ~= i + 1;
+    scope HintWalker w = new HintWalker();
+    w.text = text;
+    w.lineStarts = starts;
+    foreach (i; 0 .. (*mod.members).length)
+        (*mod.members)[i].accept(w);
+    return w.out_;
 }
 
 // ---------- folding ----------

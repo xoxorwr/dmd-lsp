@@ -22,7 +22,8 @@ import lsp;
 import session;
 import server;
 import complete;
-import symbols : DocSymbol, documentSymbols, FoldRange, foldingRanges;
+import symbols : DocSymbol, documentSymbols, FoldRange, foldingRanges,
+    InlayHint, inlayHints;
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
@@ -313,6 +314,26 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         writeFrame(outChan, printJsonStr(root));
     }
 
+    private void sendHints(InlayHint[] hints)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        auto arr = js.create_array();
+        foreach (h; hints)
+        {
+            auto o = js.create_object();
+            js.add_number_to_object(o, "line", h.line);
+            js.add_number_to_object(o, "col", h.col);
+            addStrOpt(js, o, "label", h.label);
+            js.add_bool_to_object(o, "padL", h.paddingLeft);
+            js.add_bool_to_object(o, "padR", h.paddingRight);
+            js.add_item_to_array(arr, o);
+        }
+        js.add_item_to_object(root, "hints", arr);
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
     private void sendFolds(FoldRange[] folds)
     {
         auto js = jmake();
@@ -533,6 +554,12 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         if (target)
             locs = findReferences(cast(Module)a.module_, target, true, path, orig);
         sendLocs(locs);
+    }
+
+    private void inlayHintsAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] text)
+    {
+        sendHints(inlayHints(cast(Module)a.module_, text));
     }
 
     // Best-effort `textDocument/implementation`: derived classes for a class/
@@ -1383,6 +1410,33 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 built = true;
                 continue;
             }
+            if (ops == "inlayHint")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    inlayHintsAndSend(s, a, orig);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                inlayHintsAndSend(s, a, orig);
+                built = true;
+                continue;
+            }
             if (ops == "foldingRange")
             {
                 auto text = jstr(jget(p, "text"));
@@ -1941,6 +1995,15 @@ struct WFold
     string kind;
 }
 
+struct WHint
+{
+    uint line = 0; // 0-based
+    uint col = 0;  // 0-based
+    string label;
+    bool padL = false;
+    bool padR = false;
+}
+
 // References result plus whether the search is believed exhaustive. `complete`
 // gates rename (all-or-nothing); references themselves are best-effort.
 struct WRefs
@@ -2228,6 +2291,38 @@ ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
                 l.col = cast(uint)jint(jget(c, "col"));
                 l.len = cast(uint)jint(jget(c, "len"));
                 out_ ~= l;
+            }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerInlayHints(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, ref WHint[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("inlayHint"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto ha = jget(r, "hints"))
+        if ((ha.type & 0xFF) == JsonArray)
+            for (auto c = ha.child; c; c = c.next)
+            {
+                WHint h;
+                h.line = cast(uint)jint(jget(c, "line"));
+                h.col = cast(uint)jint(jget(c, "col"));
+                h.label = dupOrEmpty(jstr(jget(c, "label")));
+                h.padL = jbool(jget(c, "padL"), false);
+                h.padR = jbool(jget(c, "padR"), false);
+                out_ ~= h;
             }
     return ExchangeResult.ok;
 }

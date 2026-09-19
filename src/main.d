@@ -64,6 +64,8 @@ struct App
     string root; // workspace root from initialize (scopes the config watcher)
     bool indexBuilt = false; // workspace symbol index is warm in the worker
     ulong nextReqId = 0; // ids for our own server->client requests
+    bool inlayHints = false; // opt-in (dls.json / editor); off by default
+    bool inlayHintsSet = false; // editor/CLI explicitly set it
 }
 
 // Project config file (`dls.json` at the workspace root): checked-in
@@ -79,6 +81,8 @@ struct FileConfig
     string[] flags; // raw dmd flags from the project file
     ulong debounceMs;
     bool hasDebounce = false;
+    bool inlayHints = false;
+    bool hasInlayHints = false;
 }
 
 // Monotonic milliseconds (debounce clock; no phobos).
@@ -333,6 +337,32 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
                 return false;
         }
         auto r = workerImplementation(app.wk, path, atext, origText, line, col, locs);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// Same, for `textDocument/inlayHint`.
+private bool workerInlayHintsRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, ref worker.WHint[] hints)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerInlayHints(app.wk, path, atext, origText, hints);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
@@ -928,6 +958,11 @@ private void applyConfig(App* app, JsonNode* node)
             refreshImports(app);
         }
     }
+    if (auto ih = jget(obj, "inlayHints"))
+    {
+        app.inlayHints = jbool(ih, false);
+        app.inlayHintsSet = true;
+    }
 }
 
 // Workspace root from initialize params: first workspace folder, else
@@ -1053,11 +1088,18 @@ private Notice loadFileConfig(App* app, const(char)[] root)
             fc.debounceMs = v < 0 ? 0 : cast(ulong)v;
         }
     }
+    if (auto ih = jget(doc, "inlayHints"))
+    {
+        fc.hasInlayHints = true;
+        fc.inlayHints = jbool(ih, false);
+    }
     // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
     fc.flags = jstrArray(jget(doc, "flags"));
     app.fileCfg = fc;
     if (!app.debounceSet && fc.hasDebounce)
         app.debounceMs = fc.debounceMs;
+    if (!app.inlayHintsSet && fc.hasInlayHints)
+        app.inlayHints = fc.inlayHints;
     refreshImports(app);
     n.have = true;
     n.type = 4;
@@ -1684,6 +1726,8 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "implementationProvider", true);
         js.add_bool_to_object(caps, "documentHighlightProvider", true);
         js.add_bool_to_object(caps, "foldingRangeProvider", true);
+        if (app.inlayHints) // opt-in (dls.json / editor); off by default
+            js.add_bool_to_object(caps, "inlayHintProvider", true);
         js.add_bool_to_object(caps, "referencesProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
         js.add_bool_to_object(caps, "documentSymbolProvider", true);
@@ -1843,6 +1887,51 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             else
                 lspRespond(m.idJson, `{"signatures":[]}`);
+            return;
+        }
+        if (m.method == "textDocument/inlayHint")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null || !app.inlayHints)
+            {
+                lspRespond(m.idJson, "[]");
+                return;
+            }
+            string path = uriToPath(uri);
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "[]");
+                return;
+            }
+            worker.WHint[] hints;
+            if (workerInlayHintsRetry(app, path, text, text, hints))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (h; hints)
+                {
+                    auto o = js.create_object();
+                    auto pos = js.create_object();
+                    js.add_number_to_object(pos, "line", h.line);
+                    js.add_number_to_object(pos, "character", h.col);
+                    js.add_item_to_object(o, "position", pos);
+                    js.add_string_to_object(o, "label", zstr(h.label));
+                    if (h.padL)
+                        js.add_bool_to_object(o, "paddingLeft", true);
+                    if (h.padR)
+                        js.add_bool_to_object(o, "paddingRight", true);
+                    js.add_item_to_array(arr, o);
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "[]");
             return;
         }
         if (m.method == "textDocument/foldingRange")
