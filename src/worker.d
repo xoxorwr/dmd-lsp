@@ -41,7 +41,7 @@ import dmd.dsymbol : Dsymbol;
 
 version (Posix)
 {
-    import core.sys.posix.unistd : read, write, close, fork, dup2, pipe, getpid, pid_t, _exit;
+    import core.sys.posix.unistd : read, write, close, fork, dup2, pipe, pid_t, _exit;
     import core.stdc.errno : errno, EINTR;
     import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
         WEXITSTATUS;
@@ -1381,10 +1381,6 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
 
     void workerMain()
     {
-        version (Posix)
-            log("worker: ready pid %d", getpid());
-        version (Windows)
-            log("worker: ready pid %u", GetCurrentProcessId());
         version (Posix) { inChan.fd = 0; outChan.fd = 1; }
         version (Windows)
         {
@@ -2085,7 +2081,6 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
         w.resp.fd = fromChild[0];
         w.pid = pid;
         w.alive = true;
-        log("worker: started pid %d", pid);
     }
     version (Windows)
     {
@@ -2150,7 +2145,6 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
         w.resp.h = fromChildR;
         w.proc = pi.hProcess;
         w.alive = true;
-        log("worker: started pid %u", pi.dwProcessId);
     }
 
     auto js = jmake();
@@ -2176,7 +2170,6 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
         workerKill(w);
         return false;
     }
-    log("worker: init ok");
     return true;
 }
 

@@ -2962,7 +2962,6 @@ private void refreshImports(App* app)
         // differently under the new paths, so drop the cache too.
         app.tokCache = null;
         app.tokHash = null;
-        log("worker: config changed; restarting");
         dropWorker(app);
     }
 }
