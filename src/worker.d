@@ -2386,10 +2386,16 @@ ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] tex
 {
     auto js = jmake();
     auto root = js.create_object();
-    // open/save (realOnly) get full semantic diagnostics; the debounced
-    // keypress uses the parse-only lint path, which is independent of the
-    // (possibly neutralized, possibly stale) warm universe.
-    js.add_string_to_object(root, "op", zstr(realOnly ? "analyze" : "lint"));
+    // open/save (realOnly) get full semantic diagnostics. The debounced
+    // keypress normally uses the parse-only lint path, which is cheap because
+    // POSIX forks a child for it. Windows has no fork, so the lint would
+    // clobber the warm universe and force a worker respawn on the next
+    // semantic request; use the in-place analyze path there instead.
+    version (Windows)
+        immutable bool useLint = false;
+    else
+        immutable bool useLint = !realOnly;
+    js.add_string_to_object(root, "op", zstr(useLint ? "lint" : "analyze"));
     js.add_string_to_object(root, "path", zstr(path));
     js.add_string_to_object(root, "text", zstr(text));
     char[] resp;
