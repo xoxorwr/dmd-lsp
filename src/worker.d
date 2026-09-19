@@ -42,6 +42,7 @@ import dmd.dsymbol : Dsymbol;
 version (Posix)
 {
     import core.sys.posix.unistd : read, write, close, fork, dup2, pipe, getpid, pid_t, _exit;
+    import core.stdc.errno : errno, EINTR;
     import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
         WEXITSTATUS;
 }
@@ -60,7 +61,13 @@ struct Chan
     version (Posix)
         int fd = -1;
     version (Windows)
+    {
         void* h = null;
+        // An inherited standard handle: resolve it via GetStdHandle on every
+        // call instead of caching (see chanRead/chanWrite). Only the worker's
+        // inChan/outChan set this; pipe handles keep a stable `h`.
+        bool stdHandle = false;
+    }
 }
 
 private __gshared Chan inChan;   // child: requests
@@ -93,6 +100,8 @@ private WFileInfo[] g_files;
 
 // Set when a child could not write a response. The worker loop checks it and
 // exits, so a lost reply can't leave the parent blocked in readFrame forever.
+// Single-threaded: only the worker's main loop writes, and it never resets the
+// flag because the process exits (the parent always respawns, never reuses).
 __gshared bool g_writeFailed = false;
 
 private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
@@ -103,6 +112,8 @@ private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
         version (Posix)
         {
             auto n = write(c.fd, data.ptr + off, data.length - off);
+            if (n < 0 && errno == EINTR)
+                continue; // interrupted before writing anything: retry
             if (n <= 0)
             {
                 g_writeFailed = true;
@@ -112,10 +123,10 @@ private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
         }
         version (Windows)
         {
-            // The standard handles are not stable across calls (the runtime
-            // can move them), so resolve them here instead of caching.
+            // A std handle must be re-resolved here instead of caching: it is
+            // not stable for the process lifetime.
             auto h = c.h;
-            if (h is null)
+            if (c.stdHandle)
                 h = GetStdHandle(STD_OUTPUT_HANDLE);
             DWORD n = 0;
             if (!WriteFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
@@ -137,6 +148,8 @@ private bool chanRead(ref Chan c, ubyte[] data) nothrow
         version (Posix)
         {
             auto n = read(c.fd, data.ptr + off, data.length - off);
+            if (n < 0 && errno == EINTR)
+                continue; // interrupted before reading anything: retry
             if (n <= 0)
                 return false;
             off += cast(size_t)n;
@@ -144,7 +157,7 @@ private bool chanRead(ref Chan c, ubyte[] data) nothrow
         version (Windows)
         {
             auto h = c.h;
-            if (h is null)
+            if (c.stdHandle)
                 h = GetStdHandle(STD_INPUT_HANDLE);
             DWORD n = 0;
             if (!ReadFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
@@ -1375,10 +1388,9 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
         version (Posix) { inChan.fd = 0; outChan.fd = 1; }
         version (Windows)
         {
-            // Resolve the std handles per call (see chanRead/chanWrite): they
-            // are not stable enough to cache for the worker's lifetime.
-            inChan.h = null;
-            outChan.h = null;
+            // Resolve the inherited std handles on each call (chanRead/chanWrite).
+            inChan.stdHandle = true;
+            outChan.stdHandle = true;
         }
         ServerState s;
         bool built = false;
