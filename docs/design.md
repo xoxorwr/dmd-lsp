@@ -176,7 +176,7 @@ build precomputes the new set before its `workspace/semanticTokens/refresh`.
 
 ## Status
 
-Verified by `make check` (377 assertions across the LSP, semantic-token,
+Verified by `make check` (384 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):
@@ -196,7 +196,10 @@ debounce, config and memory suites) plus stress runs against real dmd sources
 - `textDocument/signatureHelp` (trigger `(`, `,`) for calls and struct
   literals (`Entry(target, hate)`), active parameter by comma nesting.
 - `textDocument/definition` for locals/params, module members, imported
-  symbols and members of dotted chains. Cross-file locations are turned into
+  symbols and members of dotted chains. Resolved from dmd's own symbol at the
+  cursor when the semantic walk has one (so an identifier inside an index
+  expression is not confused with the array), falling back to a text chain for
+  declaration sites. Cross-file locations are turned into
   absolute `file://` URIs (`absolutePath`/`pathToUri`), Windows-aware (drive
   letters, backslash normalisation).
 - `textDocument/hover`: functions/types/templates/aliases are rendered by
