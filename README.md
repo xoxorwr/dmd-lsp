@@ -104,8 +104,7 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
   "inlayHints": false,               // default: false
   "autoImports": false,              // default: false
 
-  "sharedRegistry": true,            // default: true
-  "maxWorkers": 4                    // only when sharedRegistry is false
+  "sharedRegistry": true             // default: true
 }
 ```
 
