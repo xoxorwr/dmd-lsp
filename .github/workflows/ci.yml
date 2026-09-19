@@ -1,0 +1,32 @@
+name: ci
+
+# `make check` on every push/PR: the struct-only guard, the D unittests
+# (pathutil + json), and the full Python LSP suite. The nightly workflow builds
+# and publishes binaries; this one is the correctness gate.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: make check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: dmd
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The server derives its stdlib import paths from the dmd executable,
+          # so point DMD at the installed compiler (an absolute path).
+          export DMD="$(command -v dmd)"
+          dmd --version
+          make check
