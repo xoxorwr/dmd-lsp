@@ -497,19 +497,44 @@ void appendScopeSubs(Dsymbol s, ref Dsymbol[] out_)
     }
     else if (auto at = s.isAttribDeclaration())
     {
-        if (at.decl)
-            foreach (i; 0 .. (*at.decl).length)
-                out_ ~= (*at.decl)[i];
         // NOTE: never D-cast dmd AST nodes (extern(C++) classes have no
         // runtime type check; a bogus cast reads wrong field offsets).
         // Tag-check first, then the cast is safe.
-        if (at.dsym == DSYM.conditionalDeclaration)
+        if (at.dsym == DSYM.conditionalDeclaration ||
+            at.dsym == DSYM.staticIfDeclaration)
         {
             auto cd = cast(ConditionalDeclaration)at;
-            if (cd.elsedecl)
-                foreach (i; 0 .. (*cd.elsedecl).length)
-                    out_ ~= (*cd.elsedecl)[i];
+            // Only the branch dmd actually selected is live. Including both
+            // (or always the `then` branch) lets a versioned-out declaration
+            // shadow the real one: e.g. on Linux `core.stdc.stdio`'s
+            // `version (MinGW)` `printf` and its
+            // `static if (PPCUseIEEE128)` alias both precede the glibc
+            // declaration, so resolution/completion answered with the wrong
+            // symbol. `inc` is computed by semantic; on a parse-only module it
+            // is still `notComputed`, so include both branches there.
+            import dmd.cond : Include;
+            Dsymbols* branch = null;
+            if (cd.condition && cd.condition.inc != Include.notComputed)
+                branch = cd.condition.inc == Include.yes ? cd.decl : cd.elsedecl;
+            if (branch)
+            {
+                foreach (i; 0 .. (*branch).length)
+                    out_ ~= (*branch)[i];
+            }
+            else if (cd.condition)
+            {
+                if (cd.decl)
+                    foreach (i; 0 .. (*cd.decl).length)
+                        out_ ~= (*cd.decl)[i];
+                if (cd.elsedecl)
+                    foreach (i; 0 .. (*cd.elsedecl).length)
+                        out_ ~= (*cd.elsedecl)[i];
+            }
+            return;
         }
+        if (at.decl)
+            foreach (i; 0 .. (*at.decl).length)
+                out_ ~= (*at.decl)[i];
     }
 }
 

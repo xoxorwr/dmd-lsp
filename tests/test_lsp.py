@@ -335,6 +335,20 @@ check('def-local',
       def_at(duri, 6, 8)[0]['range']['start'] == {'line': 6, 'character': 8},
       '')
 
+# Conditional declarations: definition must follow the branch dmd selected,
+# not the first branch in the AST. A versioned-out / static-if-false
+# declaration must not shadow the live one (core.stdc.stdio's `printf` picks
+# up the MinGW/ieee128 alias otherwise).
+cond = ('module conddefs;\n'
+        'enum useAlt = false;\n'
+        'static if (useAlt) { int pick() { return 1; } }\n'
+        'else { int pick() { return 2; } }\n'
+        'void main() { pick(); }\n')
+curi = open_doctype('conddefs.d', cond)
+check('def-staticif-active-branch',
+      def_at(curi, 4, 14)[0]['range']['start']['line'] == 3,
+      str(def_at(curi, 4, 14)))
+
 def _req_at(method, uri, line, ch):
     _sid[0] += 1
     send({"jsonrpc": "2.0", "id": _sid[0], "method": method,
