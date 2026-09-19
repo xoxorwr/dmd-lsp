@@ -95,6 +95,8 @@ private bool sharedMode()
     return cached == 1;
 }
 
+
+
 struct WIndexSym
 {
     string name;
@@ -2331,6 +2333,13 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
             jtmp.reset();
             auto p = jparse(req);
             auto ops = p ? jstr(jget(p, "op")) : null;
+            // Registry cap hit on a previous op: force a respawn so the OS
+            // reclaims the accumulated universe before doing more work.
+            if (serverRegistryOverCap() && ops != "shutdown" && ops != "init")
+            {
+                sendNeedRespawn();
+                continue;
+            }
             if (ops == "shutdown")
                 break;
             if (ops == "init")

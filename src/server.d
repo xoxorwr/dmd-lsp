@@ -293,6 +293,32 @@ Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
     return a;
 }
 
+// Static bound on the shared registry (PLAN2 Task 2). Once it holds more than
+// this many modules the worker asks to be respawned so the OS reclaims the
+// universe — there is no arbitrary-module eviction (docs/reclamation.md). One
+// number, no adaptivity; override with DMD_LSP_SHARED_MAX_MODULES.
+private size_t sharedMaxModules()
+{
+    __gshared long cached = -1;
+    if (cached < 0)
+    {
+        import core.stdc.stdlib : getenv, atol;
+        auto e = getenv("DMD_LSP_SHARED_MAX_MODULES");
+        cached = e !is null ? atol(e) : 512;
+        if (cached <= 0)
+            cached = 512;
+    }
+    return cast(size_t) cached;
+}
+
+// Set when the registry crossed the cap; the worker loop forces a respawn.
+private __gshared bool g_sharedOverCap;
+
+bool serverRegistryOverCap()
+{
+    return g_sharedOverCap;
+}
+
 // EXPERIMENTAL (PLAN2 Task 2, `DMD_LSP_SHARED`): analyze `path` on the existing
 // module registry, without a full reset, so a second root whose closure is
 // already loaded reuses those modules (`importAll` skips modules already at
@@ -373,6 +399,8 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
     s.uni.valid = true;
+    if (Module.amodules.length > sharedMaxModules())
+        g_sharedOverCap = true;
     return a;
 }
 

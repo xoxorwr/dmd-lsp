@@ -847,6 +847,11 @@ private PoolEntry* poolAcquire(App* app, const(char)[] path)
 // universe and workspace index die with it.
 private void poolDrop(App* app, const(char)[] path)
 {
+    // Shared-registry mode has one worker serving every root, so a
+    // `needRespawn` (root switch, cap hit, config) is not bound to `path`:
+    // drop the MRU worker.
+    if (sharedMode())
+        path = null;
     size_t idx = size_t.max;
     if (path is null)
     {
