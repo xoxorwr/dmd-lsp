@@ -299,21 +299,25 @@ d.close()
 # must not hide a sibling importer's use, and it must mark the result
 # incomplete (rename will refuse on that). The worker reports completeness on
 # stderr under DMD_LSP_TRACE_REFS.
-os.makedirs(os.path.join(root, 'parts'))
+# A dedicated root: `root` already contains `cyc/a.d` etc., and `--import=root`
+# recurses into it, so two files declaring `module a` would make importer
+# resolution depend on directory order.
+proot = tempfile.mkdtemp(prefix='dmd-lsp-refs-isolated-')
+os.makedirs(os.path.join(proot, 'parts'))
 pa = 'module a;\nvoid thing() {}\n'
 pb = ('module b;\nimport a;\nimport definitely_missing_module;\n'
       'void fb() { thing(); }\n')
 pc = 'module c;\nimport a;\nvoid fc() { thing(); }\n'
 for nm, txt in (('a.d', pa), ('b.d', pb), ('c.d', pc)):
-    open(os.path.join(root, 'parts', nm), 'w').write(txt)
+    open(os.path.join(proot, 'parts', nm), 'w').write(txt)
 os.environ['DMD_LSP_TRACE_REFS'] = '1'
-d = Daemon(['--debounce-ms=0', '--import=' + root,
-            '--import=' + root + '/parts'], stderr=subprocess.PIPE)
-d.init(root)
+d = Daemon(['--debounce-ms=0', '--import=' + proot + '/parts'],
+           stderr=subprocess.PIPE)
+d.init(proot)
 d.drain(0.5)
-d.open_doc(os.path.join(root, 'parts', 'a.d'), pa)
+d.open_doc(os.path.join(proot, 'parts', 'a.d'), pa)
 d.drain(1.0)
-prefs = fmt(d.references(os.path.join(root, 'parts', 'a.d'), 1, 5, True))
+prefs = fmt(d.references(os.path.join(proot, 'parts', 'a.d'), 1, 5, True))
 check('importer-failure-isolated',
       ('a.d', 1, 5, 10) in prefs and ('c.d', 2, 12, 17) in prefs
       and not any(nm == 'b.d' for (nm, _, _, _) in prefs), str(prefs))
