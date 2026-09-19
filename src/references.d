@@ -1056,6 +1056,25 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
             recordPos(p.line, p.col, sym.ident, out_);
     }
 
+    // Base-class list (`class C : Base`, `interface I : J`). dmd overwrites
+    // `BaseClass.type` with the resolved (loc-less) type; the vendored H2 patch
+    // preserves the usage `Loc` in `BaseClass.loc`. Reading it here makes a
+    // `make vendor` that drops the patch a compile error.
+    private void baseUses(ClassDeclaration d)
+    {
+        if (!d.baseclasses || !d.baseclasses.length)
+            return;
+        foreach (bc; *d.baseclasses)
+        {
+            if (!bc.sym || !bc.sym.ident)
+                continue;
+            auto la = bc.loc;
+            if (la.linnum() < 1)
+                continue;
+            emitAt(la.linnum(), la.charnum(), bc.sym, target, out_);
+        }
+    }
+
     // Uses: every expression node that carries a resolved symbol. `super.visit`
     // continues dmd's traversal into children.
     override void visit(VarExp e) { use(e.loc, e.var, false); super.visit(e); }
@@ -1117,8 +1136,8 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
     // and not every declaration kind is reached; emit here.
     override void visit(StructDeclaration d) { decl(d); super.visit(d); }
     override void visit(UnionDeclaration d) { decl(d); super.visit(d); }
-    override void visit(ClassDeclaration d) { decl(d); super.visit(d); }
-    override void visit(InterfaceDeclaration d) { decl(d); super.visit(d); }
+    override void visit(ClassDeclaration d) { decl(d); baseUses(d); super.visit(d); }
+    override void visit(InterfaceDeclaration d) { decl(d); baseUses(d); super.visit(d); }
     override void visit(EnumDeclaration d) { decl(d); super.visit(d); }
     override void visit(TemplateDeclaration d) { decl(d); super.visit(d); }
     override void visit(AliasDeclaration d) { decl(d); super.visit(d); }

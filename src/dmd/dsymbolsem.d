@@ -5574,6 +5574,10 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             for (size_t i = 0; i < cldec.baseclasses.length;)
             {
                 auto b = (*cldec.baseclasses)[i];
+                // dmd-lsp (H2): keep the base-clause location before `type` is
+                // resolved into a loc-less symbolic type.
+                if (auto tq = cast(TypeQualified) b.type)
+                    b.loc = tq.loc;
                 b.type = resolveBase(b.type.typeSemantic(cldec.loc, sc));
 
                 Type tb = b.type.toBasetype();
@@ -6222,6 +6226,9 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             for (size_t i = 0; i < idec.baseclasses.length;)
             {
                 auto b = (*idec.baseclasses)[i];
+                // dmd-lsp (H2): see the class case above.
+                if (auto tq = cast(TypeQualified) b.type)
+                    b.loc = tq.loc;
                 b.type = resolveBase(b.type.typeSemantic(idec.loc, sc));
 
                 Type tb = b.type.toBasetype();

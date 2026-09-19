@@ -807,6 +807,14 @@ check('typehierarchy-template-decl',
 sub = th_rpc(223, 'typeHierarchy/subtypes', {"item": rd[0]}) if rd else None
 check('typehierarchy-template-sub',
       bool(sub) and any(s['name'] == 'BinaryReader' for s in sub), str(sub))
+# Also resolvable straight from the base clause (`Read!(Data!int)`), via the
+# vendored H2 patch that preserves `BaseClass.loc`.
+bl = th_rpc(224, 'textDocument/prepareTypeHierarchy',
+            {"textDocument": {"uri": 'file://' + ttp},
+             "position": {"line": 9, "character": 21}})
+check('typehierarchy-base-list',
+      bool(bl) and bl[0]['name'] == 'Read!(Data!int)' and bl[0]['kind'] == 11,
+      str(bl))
 d.close()
 os.remove(ttp)
 

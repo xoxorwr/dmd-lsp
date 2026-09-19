@@ -113,6 +113,43 @@ half survives but stops doing its job, `enum-compound-*` and
 
 ---
 
+## H2. `BaseClass.loc` — keep base-clause locations
+
+**Files**: `src/dmd/dclass.d` (field), `src/dmd/dsymbolsem.d` (capture)
+**Consumer**: `src/references.d` (`RefWalker.baseUses`)
+**Tests**: `tests/test_references.py` (`typehierarchy-base-list`)
+**Status**: not upstreamable.
+
+### Problem
+
+`semanticBaseClasses` resolves each base-clause type in place:
+
+```d
+b.type = resolveBase(b.type.typeSemantic(cldec.loc, sc));
+```
+
+Before that line, `b.type` is the parsed `TypeIdentifier`/`TypeInstance`, whose
+`Loc` is the base-clause usage. After it, `b.type` is a symbolic `TypeClass`
+with no location, so the only record of *where* the base clause is written is
+gone. A language server then cannot resolve a cursor on `class C : Base` or
+`class C : Read!(T)` — which is exactly where "go to definition", "show type
+hierarchy" and rename are invoked.
+
+### What it does
+
+Adds `Loc loc` to `BaseClass` and fills it in `semanticBaseClasses` (class and
+interface paths) from `b.type` before the type is overwritten. `RefWalker`
+emits an occurrence at `bc.loc` for each base, so base clauses participate in
+references, rename, `typeDefinition`, `implementation` and type hierarchy.
+
+### Keeping it honest
+
+`src/references.d` reads `BaseClass.loc`, so a `make vendor` that drops the
+field is a **compile error**. `typehierarchy-base-list` fails if the field
+survives but stops being filled.
+
+---
+
 ## Adding a hack
 
 1. Keep it as small and self-contained as possible; put the toggle in the
