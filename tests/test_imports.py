@@ -115,6 +115,33 @@ check('version-predefined',
 check('version-user-declared',
       complete(vuri, 3, len('version(Cu')) == ['Custom'], '')
 
+# Function-scoped `import`: its symbols are in scope from the declaration to
+# the end of the enclosing function, and must not leak into sibling functions.
+li = ('module licomp;\n'
+      'void withImport()\n'
+      '{\n'
+      '    import lib;\n'
+      '    al\n'
+      '}\n'
+      'void plain()\n'
+      '{\n'
+      '    al\n'
+      '}\n')
+lpath = os.path.join(src, 'licomp.d')
+open(lpath, 'w').write(li)
+luri = 'file://' + lpath
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": luri, "languageId": "d",
+                                  "version": 1, "text": li}}})
+time.sleep(0.5)
+while read_msg(0.3):
+    pass
+inscope = complete(luri, 4, len('    al'))
+check('local-import-in-scope', 'alpha' in inscope, str(inscope))
+outscope = complete(luri, 8, len('    al'))
+check('local-import-sibling-out-of-scope', 'alpha' not in outscope,
+      str(outscope))
+
 proc.stdin.close()
 proc.wait(timeout=5)
 shutil.rmtree(root, ignore_errors=True)

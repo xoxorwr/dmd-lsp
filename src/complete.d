@@ -872,6 +872,15 @@ private string initTypeName(Initializer init)
     return null;
 }
 
+// A function-scoped `import` captured pre-semantic. `mod` is null at snapshot
+// time and filled in by `dmdSemantic` on the same Import object, so completion
+// (which runs post-semantic) can read it even if an error rewrote the body.
+struct SynImport
+{
+    Import imp;
+    uint line; // declaration line: visible only from here on
+}
+
 struct SynFunc
 {
     FuncDeclaration fd; // the parsed function; fbody is re-checked post-semantic
@@ -880,6 +889,7 @@ struct SynFunc
     uint endLine = 0; // 0 = unknown/open
     uint depth = 0;
     SynLocal[] vars;   // body vars (names + decl lines + type idents)
+    SynImport[] imports; // function-scoped imports
     string[] params;   // param names from the type (no locs)
     string[] paramTypes; // parallel unresolved type idents (may be null)
     string[] paramTypeTexts; // parallel full type spelling for display
@@ -897,6 +907,17 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
 {
     if (!s)
         return;
+    if (auto is_ = s.isImportStatement())
+    {
+        if (is_.imports)
+            foreach (i; 0 .. (*is_.imports).length)
+            {
+                auto imp = (*is_.imports)[i] ? (*is_.imports)[i].isImport() : null;
+                if (imp)
+                    fn.imports ~= SynImport(imp, imp.loc.linnum());
+            }
+        return;
+    }
     if (auto es = s.isExpStatement())
     {
         if (es.exp)
@@ -3871,6 +3892,36 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         addMembers(arena, ms, prefix, "1", out_, seen);
     }
     walkImports(mod, 0, arena, prefix, out_, seen);
+    addLocalImports(syn, ctx.line, arena, prefix, out_, seen);
+}
+
+// One import's completions: its local binding (the alias in
+// `import custom = rt.dbg;`, else the leftmost name) plus, for a non-static
+// import, the imported module's public interface.
+private void addOneImport(Import imp, int depth, Arena* a, const(char)[] prefix,
+    ref CompleteOut o, ref bool[const(char)[]] seen)
+{
+    if (imp.ident)
+    {
+        auto nm = imp.ident.toString();
+        if (hasPrefix(nm, prefix))
+        {
+            const(char)[] d;
+            if (imp.mod)
+            {
+                const(char)* mp = imp.mod.toPrettyChars();
+                if (mp)
+                {
+                    import core.stdc.string : strlen;
+                    d = mp[0 .. strlen(mp)];
+                }
+            }
+            pushItem(a, o, nm, 9, d, null, "1", seen);
+        }
+    }
+    if (!imp.mod || imp.isstatic)
+        return; // static import: qualified access only
+    addModuleInterface(imp.mod, depth, a, prefix, o, seen);
 }
 
 // Entry: offer the public interface of every module the root imports.
@@ -3885,36 +3936,24 @@ private void walkImports(Module root, int depth, Arena* a, const(char)[] prefix,
     Dsymbol[] flat;
     flattenMembers(root.members, flat);
     foreach (s; flat)
-    {
         if (auto imp = s.isImport())
-        {
-            // The import's local binding -- the alias in
-            // `import custom = rt.dbg;`, otherwise the leftmost package / module
-            // name -- is usable in this module regardless of the import
-            // symbol's visibility (imports default to private, which is why
-            // addMembers skips them). Offer it explicitly.
-            if (imp.ident)
-            {
-                auto nm = imp.ident.toString();
-                if (hasPrefix(nm, prefix))
-                {
-                    const(char)[] d;
-                    if (imp.mod)
-                    {
-                        const(char)* mp = imp.mod.toPrettyChars();
-                        if (mp)
-                        {
-                            import core.stdc.string : strlen;
-                            d = mp[0 .. strlen(mp)];
-                        }
-                    }
-                    pushItem(a, o, nm, 9, d, null, "1", seen);
-                }
-            }
-            if (!imp.mod || imp.isstatic)
-                continue; // static import: qualified access only
-            addModuleInterface(imp.mod, depth, a, prefix, o, seen);
-        }
+            addOneImport(imp, depth, a, prefix, o, seen);
+}
+
+// Function-scoped `import`s visible at the cursor: every snapshot function
+// whose body range contains the line, for imports declared at or before it.
+private void addLocalImports(const ref SynMod syn, uint line, Arena* a,
+    const(char)[] prefix, ref CompleteOut o, ref bool[const(char)[]] seen)
+{
+    foreach (ref fn; syn.funcs)
+    {
+        if (!fn.startLine || fn.startLine > line)
+            continue;
+        if (fn.endLine && line > fn.endLine)
+            continue;
+        foreach (ref li; fn.imports)
+            if (li.line <= line)
+                addOneImport(cast(Import) li.imp, 0, a, prefix, o, seen);
     }
 }
 
