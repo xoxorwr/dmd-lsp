@@ -37,6 +37,7 @@ struct App
     Session session; // open document texts (perm arena inside)
     HitCache[string] cache; // GC map, cold path only
     bool shutdownRequested = false;
+    bool workerNotified = false; // one-shot user notice when the worker won't start
     bool labelDetails = false; // client supports CompletionItem.labelDetails
     string[] pending; // paths with unanalyzed changes (debounced analysis)
     ulong lastMsgMs = 0; // last stdin activity, monotonic ms
@@ -202,7 +203,7 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerAnalyze(app.wk, path, text, out_, realOnly);
@@ -227,7 +228,7 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerComplete(app.wk, path, atext, origText, line, col, prefix, items);
@@ -254,7 +255,7 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerSignature(app.wk, path, atext, origText, line, col, sig);
@@ -281,7 +282,7 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerDefinition(app.wk, path, atext, origText, line, col, def);
@@ -309,7 +310,7 @@ private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerTypeDefinition(app.wk, path, atext, origText, line, col, def);
@@ -336,7 +337,7 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerImplementation(app.wk, path, atext, origText, line, col, locs);
@@ -363,7 +364,7 @@ private bool workerCallHierarchyRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerCallHierarchy(app.wk, path, atext, origText, line, col,
@@ -422,7 +423,7 @@ private bool workerInlayHintsRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerInlayHints(app.wk, path, atext, origText, hints);
@@ -447,7 +448,7 @@ private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[]
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerFolding(app.wk, text, folds);
@@ -474,7 +475,7 @@ private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerDocumentHighlight(app.wk, path, atext, origText, line, col, locs);
@@ -500,7 +501,7 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerHover(app.wk, path, atext, origText, line, col, hov);
@@ -527,7 +528,7 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerDocumentSymbol(app.wk, path, text, resultJson);
@@ -554,7 +555,7 @@ private bool workerReferencesRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerReferences(app.wk, path, atext, origText, line, col,
@@ -582,7 +583,7 @@ private bool workerPrepareRenameRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerPrepareRename(app.wk, path, atext, origText, line, col,
@@ -610,7 +611,7 @@ private bool workerRenameRetry(App* app, const(char)[] path,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerRename(app.wk, path, atext, origText, line, col, newName,
@@ -685,7 +686,7 @@ private bool workerBuildIndexRetry(App* app, string[] files)
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         if (workerBuildIndex(app.wk, files) == worker.ExchangeResult.ok)
@@ -702,7 +703,7 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerWorkspaceSymbol(app.wk, query, syms);
@@ -723,6 +724,28 @@ private void dropWorker(App* app)
     app.indexBuilt = false;
 }
 
+// Spawn the worker, notifying the user once if it cannot start. Wrapping
+// workerSpawn keeps a dead worker from silently yielding empty results.
+private bool respawnWorker(App* app)
+{
+    if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+    {
+        log("worker: start failed");
+        if (!app.workerNotified)
+        {
+            app.workerNotified = true;
+            Notice n;
+            n.have = true;
+            n.type = 1;
+            n.text = "dmd-lsp: could not start the analysis worker; see the dmd-lsp output channel";
+            notifyNotice(n);
+        }
+        return false;
+    }
+    app.workerNotified = false;
+    return true;
+}
+
 // Build the workspace index once per worker/config generation.
 private bool ensureIndex(App* app)
 {
@@ -737,7 +760,10 @@ private bool ensureIndex(App* app)
     auto files = indexFiles(app);
     traceMs("index.discovery", nowMs() - t0);
     if (!workerBuildIndexRetry(app, files))
+    {
+        log("worker: workspace index build failed");
         return false;
+    }
     traceMs("index.build", nowMs() - t0);
     app.indexBuilt = true;
     return true;
@@ -783,7 +809,7 @@ private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] tex
     {
         if (!app.wk.alive)
         {
-            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+            if (!respawnWorker(app))
                 return false;
         }
         auto r = workerSemantic(app.wk, path, text, toks);
@@ -2936,6 +2962,7 @@ private void refreshImports(App* app)
         // differently under the new paths, so drop the cache too.
         app.tokCache = null;
         app.tokHash = null;
+        log("worker: config changed; restarting");
         dropWorker(app);
     }
 }
