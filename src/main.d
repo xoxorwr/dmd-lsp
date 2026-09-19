@@ -2962,7 +2962,8 @@ private string parentOf(const(char)[] p)
 //   1. the `-I` paths from the dmd.conf/sc.ini next to the dmd executable
 //      (`%@P%` expands to the executable's directory);
 //   2. otherwise, walk up from the executable for a source tree (release:
-//      <root>/src/{druntime/import,phobos}; dev: <root>/druntime/import);
+//      <root>/src/{druntime/import,phobos}; dev: <root>/druntime/import; LDC:
+//      <root>/import);
 //   3. otherwise, common system install locations.
 private string[] defaultImports()
 {
@@ -2987,11 +2988,19 @@ private string[] defaultImports()
             {
                 if (!d.length || d == "/" || d == ".")
                     break;
+                size_t before = found.length;
+                // dmd layout first; if it resolves, this is the toolchain.
                 addImportDir(found, d ~ "/src/druntime/import");
                 addImportDir(found, d ~ "/src/phobos");
                 addImportDir(found, d ~ "/druntime/import");
                 addImportDir(found, d ~ "/druntime/src");
                 addImportDir(found, d ~ "/phobos"); // dev tree: sibling
+                if (found.length != before)
+                    break;
+                // ldc layout (druntime + phobos in one `import` dir).
+                addImportDir(found, d ~ "/import");
+                if (found.length != before)
+                    break;
                 d = parentOf(d);
             }
         }
