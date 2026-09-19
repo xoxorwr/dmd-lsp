@@ -3044,11 +3044,13 @@ private string parentOf(const(char)[] p)
 
 // Default (stdlib) import paths, auto-detected (inspired by serve-d):
 //   1. the `-I` paths from the dmd.conf/sc.ini next to the dmd executable
-//      (`%@P%` expands to the executable's directory);
+//      (`%@P%` expands to the executable's directory), or /etc/dmd.conf;
 //   2. otherwise, walk up from the executable for a source tree (release:
 //      <root>/src/{druntime/import,phobos}; dev: <root>/druntime/import; LDC:
 //      <root>/import);
 //   3. otherwise, common system install locations.
+// A candidate only counts if it really provides `object.d`: e.g. a file named
+// `import` (ImageMagick ships `/usr/bin/import`) must not shadow the stdlib.
 private string[] defaultImports()
 {
     string[] found;
@@ -3062,8 +3064,15 @@ private string[] defaultImports()
             immutable confName = "dmd.conf";
         if (dir.length)
         {
+            size_t before = found.length;
             foreach (c; dmdConfImports(dir ~ confName, dir))
                 addImportDir(found, c);
+            // Distro packages put it in /etc instead of next to the binary.
+            if (found.length == before)
+                foreach (c; dmdConfImports("/etc/dmd.conf", dir))
+                    addImportDir(found, c);
+            if (found.length != before && !hasObjectFile(found[before .. $]))
+                found.length = before;
         }
         if (!found.length)
         {
@@ -3079,12 +3088,14 @@ private string[] defaultImports()
                 addImportDir(found, d ~ "/druntime/import");
                 addImportDir(found, d ~ "/druntime/src");
                 addImportDir(found, d ~ "/phobos"); // dev tree: sibling
-                if (found.length != before)
+                if (found.length != before && hasObjectFile(found[before .. $]))
                     break;
                 // ldc layout (druntime + phobos in one `import` dir).
                 addImportDir(found, d ~ "/import");
-                if (found.length != before)
+                if (found.length != before && hasObjectFile(found[before .. $]))
                     break;
+                // Not a stdlib (e.g. a file named `import`): undo and keep up.
+                found.length = before;
                 d = parentOf(d);
             }
         }
@@ -3114,6 +3125,15 @@ private string[] defaultImports()
             addImportDir(found, c);
     }
     return found;
+}
+
+// Whether any candidate directory actually contains the core `object.d`.
+private bool hasObjectFile(const(string)[] dirs)
+{
+    foreach (d; dirs)
+        if (fileExists(d ~ "/object.d"))
+            return true;
+    return false;
 }
 
 private void addImportDir(ref string[] found, const(char)[] dir)
