@@ -360,13 +360,19 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     }
     if (id !is text)
         mapFixDiags(a.diags, id, text);
+    // Publish the result as the live universe so a repeated request for this
+    // same root+text is a `reuse` (no re-parse). Deps are recorded from the
+    // registry (a superset: it also holds other roots' modules), so a change
+    // anywhere in the resident union invalidates conservatively.
+    universeRecord(s.uni.deps, path);
     s.uni.analysis = a;
     s.uni.rootPath = path.idup;
     s.uni.rootHash = fnv1a64(cast(const(ubyte)[])id);
     s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
     s.uni.tokenHash = dmdTokenHash(text);
+    s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
-    s.uni.valid = false; // no reuse until per-root closure tracking lands
+    s.uni.valid = true;
     return a;
 }
 
