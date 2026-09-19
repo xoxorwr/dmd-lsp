@@ -279,6 +279,15 @@ string uriToPath(const(char)[] uri)
         else
             out_ ~= u[i];
     }
+    version (Windows)
+    {
+        // A `file:///C:/...` URI decodes to a leading slash before the drive;
+        // Windows expects `C:/...`.
+        if (out_.length >= 3 && out_[0] == '/' &&
+            ((out_[1] >= 'A' && out_[1] <= 'Z') ||
+             (out_[1] >= 'a' && out_[1] <= 'z')) && out_[2] == ':')
+            out_ = out_[1 .. $];
+    }
     return out_.idup;
 }
 

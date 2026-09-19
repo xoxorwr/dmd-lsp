@@ -183,7 +183,20 @@ bool fileExists(const(char)[] p)
         return access(buf.ptr, F_OK) == 0;
     }
     else
-        return true;
+    {
+        import core.sys.windows.winbase : GetFileAttributesA;
+        import core.sys.windows.winnt : DWORD, INVALID_FILE_ATTRIBUTES,
+            FILE_ATTRIBUTE_DIRECTORY;
+
+        if (p.length + 1 >= 4096)
+            return false;
+        char[4096] buf;
+        buf[0 .. p.length] = p[];
+        buf[p.length] = 0;
+        DWORD a = GetFileAttributesA(buf.ptr);
+        return a != INVALID_FILE_ATTRIBUTES &&
+            (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
 }
 
 ulong fnv1a64(const(ubyte)[] data, ulong h = 14695981039346656037UL) pure nothrow @nogc
