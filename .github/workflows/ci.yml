@@ -17,17 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The vendored frontend is 2.113.0-beta.1. A newer compiler's druntime
-      # (2.113.0 release or rc) does not analyse cleanly under it, while
-      # 2.112.1's does and is still new enough to build the frontend. The
-      # action sets `$DC` (build) and `$DMD` (stdlib for the tests) to it.
+      # LDC 1.42 is based on DMD 2.112.1, whose druntime the vendored
+      # 2.113.0-beta.1 frontend analyses cleanly (the 2.113.0 release's does
+      # not). Use its dmd-compatible driver, as the nightly build does; `$DMD`
+      # (stdlib for the tests) points at it.
       - uses: dlang-community/setup-dlang@v2
         with:
-          compiler: dmd-2.112.1
+          compiler: ldc-1.42.0
 
       - name: Test
         shell: bash
         run: |
           set -euo pipefail
-          dmd --version
-          make check
+          ldmd2 --version
+          make check DC=ldmd2
