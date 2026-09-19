@@ -25,6 +25,7 @@ import pathutil : dirOf, isDFilePath, isDlsJson, resolveCfgPath, sameDir;
 import fsutil : findDFiles;
 import complete : extractPrefix;
 import semantic : tokenTypes, tokenModifiers;
+import log : log;
 
 struct HitCache
 {
@@ -1102,28 +1103,59 @@ private void notifyNotice(Notice n)
     lspNotify(`"window/showMessage"`, printJsonStr(params));
 }
 
+// `line:col` of the last JSON parse error within `text`, or null.
+private string jsonErrorLineCol(const(char)[] text)
+{
+    import json : get_error_ptr;
+    auto p = get_error_ptr();
+    if (!p || p < text.ptr || p > text.ptr + text.length)
+        return null;
+    size_t off = cast(size_t)(p - text.ptr);
+    uint line = 1, col = 1;
+    foreach (i; 0 .. off)
+    {
+        if (text[i] == '\n') { line++; col = 1; }
+        else col++;
+    }
+    return ulongStr(line) ~ ":" ~ ulongStr(col);
+}
+
 // Load <root>/dls.json into app.fileCfg (flat schema: "importPaths",
 // "stringImportPaths", "flags"). Silent when absent; Log on success, Error
-// when present but broken.
+// when present but broken. Also logs the resolved path and counts.
 private Notice loadFileConfig(App* app, const(char)[] root)
 {
     Notice n;
     if (!root.length)
         return n;
     string r = root.idup;
-    while (r.length && r[$ - 1] == '/')
+    while (r.length && (r[$ - 1] == '/' || r[$ - 1] == '\\'))
         r = r[0 .. $ - 1];
     string cfg = r ~ "/dls.json";
     if (!fileExists(cfg))
-        return n; // no project file: stay quiet
+    {
+        log("dls.json: not found at %.*s", cast(int)cfg.length, cfg.ptr);
+        return n; // no project file: stay quiet (log only)
+    }
     string raw = sessionReadDisk(cfg);
-    string text = raw ? decodeJsonText(raw) : null; // UTF-16 -> UTF-8 (Windows)
-    auto doc = text ? jparse(text) : null;
-    if (!doc || (doc.type & 0xFF) != JsonObject)
+    if (!raw.length)
     {
         n.have = true;
         n.type = 1;
-        n.text = "dls.json: invalid JSON, ignored";
+        n.text = "dls.json: cannot read " ~ cfg;
+        log("%.*s", cast(int)n.text.length, n.text.ptr);
+        return n;
+    }
+    string text = decodeJsonText(raw); // UTF-16 -> UTF-8 (Windows)
+    auto doc = text ? jparse(text) : null;
+    if (!doc || (doc.type & 0xFF) != JsonObject)
+    {
+        auto at = jsonErrorLineCol(text);
+        n.have = true;
+        n.type = 1;
+        n.text = "dls.json: invalid JSON, ignored (" ~ cfg
+            ~ (at.length ? ", near " ~ at : "") ~ ")";
+        log("%.*s", cast(int)n.text.length, n.text.ptr);
         return n;
     }
     FileConfig fc;
@@ -1181,7 +1213,14 @@ private Notice loadFileConfig(App* app, const(char)[] root)
     refreshImports(app);
     n.have = true;
     n.type = 4;
-    n.text = "dls.json: " ~ ulongStr(fc.imports.length) ~ " import paths from " ~ r;
+    n.text = "dls.json: " ~ ulongStr(fc.imports.length) ~ " import paths, "
+        ~ ulongStr(fc.stringImports.length) ~ " string paths, "
+        ~ ulongStr(fc.flags.length) ~ " flags (inlayHints "
+        ~ (app.inlayHints ? "on" : "off") ~ ") from " ~ cfg;
+    log("%.*s", cast(int)n.text.length, n.text.ptr);
+    foreach (p; fc.imports)
+        if (!fileExists(p))
+            log("dls.json: import path does not exist: %.*s", cast(int)p.length, p.ptr);
     return n;
 }
 
@@ -2779,7 +2818,7 @@ private int runCheck(string[] files, string[] imports, string[] stringImports = 
         string text = sessionReadDisk(f);
         if (!text)
         {
-            fprintf(stderr, "%.*s: cannot read file\n", cast(int)f.length, f.ptr);
+            log("%.*s: cannot read file", cast(int)f.length, f.ptr);
             code = 2;
             continue;
         }
@@ -2792,7 +2831,7 @@ private int runCheck(string[] files, string[] imports, string[] stringImports = 
             auto before = st.usedSize;
             GC.minimize();
             auto after = GC.stats().usedSize;
-            fprintf(stderr, "gcstats: used=%zuMB afterMinimize=%zuMB allocatedTotal=%zuMB\n",
+            log("gcstats: used=%zuMB afterMinimize=%zuMB allocatedTotal=%zuMB",
                 before / 1024 / 1024, after / 1024 / 1024, st.allocatedInCurrentThread / 1024 / 1024);
         }
         foreach (ref d; a.diags)

@@ -8,6 +8,7 @@ module dmdwrap;
 import core.stdc.stdarg : va_list, va_copy, va_end;
 import core.stdc.stdio : vsnprintf;
 import core.stdc.string : strncmp;
+import log : log;
 
 import dmd.frontend : initDMD, deinitializeDMD, parseModule, addImport, addStringImport;
 import dmd.common.charactertables : IdentifierCharLookup, IdentifierTable;
@@ -366,9 +367,8 @@ void dmdEvictRoot(void* modp)
     auto removedTypes = Type.stringtable.removeWhere((const(StringValue!Type)* sv)
         => containsSlice(sv.toString(), tok));
     import core.stdc.stdlib : getenv;
-    import core.stdc.stdio : fprintf, stderr;
     if (getenv("DMD_LSP_TRACE_EVICT"))
-        fprintf(stderr, "dmd-lsp: evict token=%.*s typesRemoved=%zu\n",
+        log("evict token=%.*s typesRemoved=%zu",
             cast(int) tok.length, tok.ptr, removedTypes);
 }
 

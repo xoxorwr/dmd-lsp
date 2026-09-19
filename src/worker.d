@@ -17,6 +17,7 @@ module worker;
 // Struct-only, no phobos.
 
 import arena;
+import log : log;
 import json;
 import lsp;
 import session;
@@ -425,11 +426,10 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
             js.add_string_to_object(root, "reason", zstr(reason));
         js.add_bool_to_object(root, "needRespawn", false);
         import core.stdc.stdlib : getenv;
-        import core.stdc.stdio : fprintf, stderr;
         if (getenv("DMD_LSP_TRACE_REFS"))
         {
             const(char)[] rs = reason.length ? reason : "";
-            fprintf(stderr, "dmd-lsp: refs n=%zu complete=%d reason=%.*s\n",
+            log("refs n=%zu complete=%d reason=%.*s",
                 refs.length, complete ? 1 : 0, cast(int) rs.length, rs.ptr);
         }
         writeFrame(outChan, printJsonStr(root));
@@ -1974,8 +1974,7 @@ private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
         return false;
     if (writeFrame(w.req, req) && readFrame(w.resp, resp))
         return true;
-    import core.stdc.stdio : fprintf, stderr;
-    fprintf(stderr, "dmd-lsp: worker exchange failed; respawning\n");
+    log("worker exchange failed; respawning");
     return false;
 }
 
@@ -1991,8 +1990,7 @@ void workerKill(ref Worker w)
             waitpid(w.pid, &status, 0);
             if (WIFSIGNALED(status))
             {
-                import core.stdc.stdio : fprintf, stderr;
-                fprintf(stderr, "dmd-lsp: worker killed by signal %d\n", WTERMSIG(status));
+                log("worker killed by signal %d", WTERMSIG(status));
             }
             w.pid = -1;
         }
