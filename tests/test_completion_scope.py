@@ -180,6 +180,15 @@ void on_impl()
     Impl i;
     i.
 }
+
+interface Reader { void read(); }
+class BinReader : Reader { }
+
+void on_free_prefix()
+{
+    BinReader handle;
+    han
+}
 '''
 
 os.makedirs(SRC)
@@ -405,6 +414,15 @@ labels = complete(ol, lines[ol].index('e.consumed') + 2)
 check('foreach-opapply-loop-var',
       'consumed' in labels and 'resize' in labels and 'type' in labels,
       str(sorted(set(labels))[:10]))
+
+# 18) A bare prefix in a free function must not pick up an aggregate's members
+# as implicit `this` just because a later function body's brace contains the
+# line (the preceding interface/class must not be considered enclosing).
+npl = line_of('    han')
+labels = complete(npl, len(lines[npl]))
+check('free-function-no-implicit-this',
+      'handle' in labels and 'read' not in labels,
+      str(sorted(set(labels))[:12]))
 
 proc.stdin.close()
 proc.wait(timeout=5)

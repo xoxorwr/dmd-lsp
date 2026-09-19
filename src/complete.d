@@ -606,10 +606,23 @@ private AggregateDeclaration enclosingAggregate(Module mod, const ref SynMod syn
 // earliest such brace is the body and its presence is what we test).
 private bool aggregateBraceContains(const ref SynMod syn, uint declLine, uint line)
 {
+    // The aggregate's own body is the first brace opened at/after its
+    // declaration. Checking *any* later brace would also match a following
+    // function's body and wrongly treat the cursor as being inside the
+    // aggregate (surfacing its members as implicit `this`).
+    uint bestOpen = uint.max;
+    uint bestClose = 0;
     foreach (ref br; syn.braces)
-        if (br.openLine >= declLine && br.openLine <= line && line <= br.closeLine)
-            return true;
-    return false;
+    {
+        if (br.openLine < declLine)
+            continue;
+        if (br.openLine < bestOpen)
+        {
+            bestOpen = br.openLine;
+            bestClose = br.closeLine;
+        }
+    }
+    return bestOpen != uint.max && line >= bestOpen && line <= bestClose;
 }
 
 // Own + inherited (class base chain) members, for implicit-`this` completion.
