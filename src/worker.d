@@ -2084,8 +2084,19 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
             return false;
         }
         exe[n] = 0;
-        char* cmd = cast(char*) "--worker".ptr;
-        if (!CreateProcessA(exe.ptr, cmd, null, null, TRUE, 0, null, null, &si, &pi))
+        // argv[0] must be the exe: druntime rebuilds args from the command
+        // line, and main.d finds the worker via `--worker` in args[1..$].
+        char[4200] cmd;
+        size_t ci = 0;
+        cmd[ci++] = '"';
+        cmd[ci .. ci + n] = exe[0 .. n];
+        ci += n;
+        cmd[ci++] = '"';
+        cmd[ci++] = ' ';
+        foreach (c; "--worker")
+            cmd[ci++] = c;
+        cmd[ci] = 0;
+        if (!CreateProcessA(exe.ptr, cmd.ptr, null, null, TRUE, 0, null, null, &si, &pi))
         {
             CloseHandle(toChildR); CloseHandle(toChildW);
             CloseHandle(fromChildR); CloseHandle(fromChildW);
