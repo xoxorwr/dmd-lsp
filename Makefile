@@ -151,6 +151,7 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_memory.py
 	python3 tests/test_spawn.py
 	python3 tests/test_pool.py
+	python3 tests/test_index.py
 	python3 tests/test_sync.py
 
 # D unittests for the pure path helpers (no dmd, so the vendored frontend's

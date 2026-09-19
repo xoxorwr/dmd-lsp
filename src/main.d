@@ -707,8 +707,8 @@ private bool inProject(App* app, const(char)[] file)
     return false;
 }
 
-// Workspace symbol index: build (parse-only; resets the warm universe in the
-// worker), query, invalidate.
+// Workspace symbol index: build (parse-only, registration-free so it does
+// not disturb the warm universe), query, invalidate.
 private bool workerBuildIndexRetry(App* app, const(char)[] path, string[] files)
 {
     for (int attempt = 0; attempt < 2; attempt++)

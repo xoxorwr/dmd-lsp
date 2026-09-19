@@ -697,7 +697,7 @@ extern (C++) final class Module : Package
     }
 
     /// ditto
-    extern (D) Module parseModule(AST)()
+    extern (D) Module parseModule(AST)(bool registerModule = true)
     {
         const(char)* srcname = srcfile.toChars();
         //printf("Module::parse(srcname = '%s')\n", srcname);
@@ -770,7 +770,8 @@ extern (C++) final class Module : Package
             if (md)
             {
                 this.ident = md.id;
-                dst = Package.resolve(md.packages, &this.parent, &ppack);
+                if (registerModule)
+                    dst = Package.resolve(md.packages, &this.parent, &ppack);
             }
 
             numlines = p.linnum;
@@ -790,7 +791,8 @@ extern (C++) final class Module : Package
                 * the name of this module.
                 */
                 this.ident = md.id;
-                dst = Package.resolve(md.packages, &this.parent, &ppack);
+                if (registerModule)
+                    dst = Package.resolve(md.packages, &this.parent, &ppack);
             }
 
             // Done after parsing the module header because `module x.y.z` may override the file name
@@ -800,6 +802,8 @@ extern (C++) final class Module : Package
             numlines = p.linnum;
         }
 
+        if (registerModule)
+        {
         /* The symbol table into which the module is to be inserted.
          */
 
@@ -920,6 +924,7 @@ extern (C++) final class Module : Package
             amodules.push(this);
         }
         Compiler.onParseModule(this);
+        }
         return this;
     }
 

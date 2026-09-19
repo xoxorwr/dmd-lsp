@@ -35,6 +35,7 @@ import lint;
 import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
+    dmdParseNoRegister, dmdLocCheckpoint, dmdLocRollback,
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
 
 import dmd.dmodule : Module;
@@ -79,7 +80,7 @@ private __gshared Chan outChan;  // child: responses
 
 // Workspace symbol index (worker process). Parse-only declarations collected
 // from the parent's file discovery. Built lazily, invalidated on watched
-// changes; rebuilding resets the warm universe (see the `buildIndex` op).
+// changes; rebuilding is registration-free (H3) and keeps the universe.)
 struct WIndexSym
 {
     string name;
@@ -858,29 +859,49 @@ private void flattenIndex(const(DocSymbol)[] syms, const(char)[] file,
     }
 }
 
-// Parse-only index build. Resets the dmd request state, so the caller must
-// drop the warm universe (the op branch sets `built = false`).
+// Parse-only index build via the registration-free parse (H3), so the live
+// universe is not evicted by the parse.
+// Fully-qualified module name from a registration-free parse (H3): no package
+// parent exists, so rebuild it from the module declaration.
+private string indexModuleName(Module mod)
+{
+    string name;
+    if (mod.md)
+        foreach (p; mod.md.packages)
+        {
+            name ~= p.toString();
+            name ~= ".";
+        }
+    if (mod.ident)
+        name ~= mod.ident.toString();
+    return name.length ? name.idup : null;
+}
+
 private void buildIndexNow(ref ServerState s, string[] files)
 {
-    import core.stdc.string : strlen;
     import timing : nowMs, traceMs;
 
     ulong t0 = nowMs();
     g_index = null;
     g_files = null;
-    dmdResetRequest(s.dmd, &s.sink);
+    // H3: parse each file without registering it, so the live semantic
+    // universe survives (no `dmdResetRequest`). Roll back the Loc entries the
+    // parses append, like the in-place re-parse path.
+    size_t locTableLen;
+    uint locIndex;
+    dmdLocCheckpoint(locTableLen, locIndex);
+    scope (exit)
+        dmdLocRollback(locTableLen, locIndex);
     foreach (f; files)
     {
         auto text = sessionReadDisk(f);
         if (!text)
             continue;
-        auto pr = dmdParseOnly(f, text);
+        auto pr = dmdParseNoRegister(f, text);
         if (!pr.ok || !pr.module_)
             continue;
         auto mod = cast(Module)pr.module_;
-        string moduleName = null;
-        if (const(char)* mn = mod.toPrettyChars())
-            moduleName = mn[0 .. strlen(mn)].idup;
+        string moduleName = indexModuleName(mod);
         size_t before = g_index.length;
         flattenIndex(documentSymbols(mod, text), f, null, g_index);
         foreach (i; before .. g_index.length)
@@ -2913,8 +2934,8 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                                 files ~= v.idup;
                         }
                 buildIndexNow(s, files);
-                built = false; // reset above invalidated the warm universe
-                s.uni.valid = false;
+                // H3 keeps the parse registration-free, so the warm universe
+                // is untouched and stays valid for the next request.
                 sendIndexBuilt(g_index.length);
                 continue;
             }

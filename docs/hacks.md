@@ -150,6 +150,62 @@ survives but stops being filled.
 
 ---
 
+## H3. `parseModule(registerModule)` — parse without registering
+
+**Files**: `src/dmd/dmodule.d` (`Module.parseModule`)
+**Consumer**: `src/dmdwrap.d` (`dmdParseNoRegister`), `src/worker.d`
+(`buildIndexNow`)
+**Tests**: `tests/test_index.py` (`index-keeps-universe`, `index-module-fqn`)
+**Status**: not upstreamable as-is.
+
+### Problem
+
+`Module.parseModule` registers the module it parses: `Package.resolve` inserts
+`Package` objects into the global `Module.modules` table, `dst.insert` inserts
+the module itself (and on a duplicate name calls `eSink.error(... conflicts
+with another module ...)` and returns the *previously parsed* module), and
+`amodules.push(this)` appends to the global module list.
+
+The workspace index parses every project file. With registration, that collides
+with the live semantic universe: re-parsing a module the universe already holds
+would emit a spurious conflict and hand back the live `Module*`. That is why
+`buildIndexNow` called `dmdResetRequest` first — which **evicts the warm
+universe** (`s.uni.valid = false`), forcing a full re-analysis on the next
+request. The index needs the parse-level AST only (names, kinds, `Loc`), none of
+the registration.
+
+### Hack
+
+`parseModule(AST)(bool registerModule = true)`. When `false`, it skips the two
+`Package.resolve` calls and the entire symbol-table/`amodules`/`Compiler`
+registration tail. `dmdParseNoRegister` builds the `Module`, runs it with the
+flag off, gags the compiler sink (`global.gag = 1`) and restores the error
+counters; the caller (`buildIndexNow`) rolls the `Loc` table back with
+`dmdLocCheckpoint`/`dmdLocRollback`. Without a package parent, the FQN is
+rebuilt from `md.packages` + `ident` (`worker.indexModuleName`).
+
+```d
+// src/dmdwrap.d
+m = m.parseModule!ASTCodegen(false); // registration-free
+```
+
+### Why it is a hack
+
+A "parse but do not register" mode is a library-consumer escape hatch, not
+something the compiler wants; upstream should get a supported
+`Module.reparse`/library API instead. It is the enabling piece for the index
+(and the persistent-store plan) but changes no compiler behaviour by default.
+
+### Keeping it honest
+
+`src/dmdwrap.d` calls `m.parseModule!ASTCodegen(false)`: if a `make vendor`
+drops the flag, `parseModule` takes no arguments and the **build fails**.
+`tests/test_index.py` pins the semantics — `index-keeps-universe` fails if an
+index build evicts the warm universe (`analyze.full > 1`), and
+`index-module-fqn` fails if the FQN rebuild is wrong.
+
+---
+
 ## Adding a hack
 
 1. Keep it as small and self-contained as possible; put the toggle in the

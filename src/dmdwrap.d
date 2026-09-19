@@ -143,6 +143,51 @@ ParseOut dmdParseOnly(const(char)[] path, const(char)[] text)
     return r;
 }
 
+// Parse a module WITHOUT registering it: no `Package.resolve` (so `parent`
+// stays null), no `Module.modules`/`amodules` insertion, errors to a null sink
+// and the global counters restored. This is what lets an index build run
+// alongside a live semantic universe without evicting it — `dmdParseOnly`
+// would collide on an already-registered module name and return the live one.
+// The caller must roll back the `Loc` table it appended (`dmdLocCheckpoint`).
+// Hack H3: see docs/hacks.md. Rebuild the FQN from `md.packages` + `ident`.
+ParseOut dmdParseNoRegister(const(char)[] path, const(char)[] text)
+{
+    import dmd.root.filename : FileName;
+    import dmd.identifier : Identifier;
+
+    ParseOut r;
+    // Suppress index-file diagnostics: gag the compiler sink and restore the
+    // counters after, so a project with errors leaves the request untouched.
+    auto savedErrors = global.errors;
+    auto savedWarnings = global.warnings;
+    auto savedGagged = global.gaggedErrors;
+    auto savedGag = global.gag;
+    global.gag = 1;
+    scope (exit)
+    {
+        global.errors = savedErrors;
+        global.warnings = savedWarnings;
+        global.gaggedErrors = savedGagged;
+        global.gag = savedGag;
+    }
+    auto id = Identifier.idPool(FileName.removeExt(FileName.name(path)));
+    auto m = new Module(path, id, 1, 0);
+    auto fb = cast(ubyte[]) text.dup ~ '\0';
+    global.fileManager.add(FileName(path), fb);
+    m.src = fb;
+    m.importedFrom = m;
+    m = m.parseModule!ASTCodegen(false);
+    if (m is null)
+    {
+        r.errors = global.errors;
+        return r;
+    }
+    r.module_ = cast(void*)m;
+    r.errors = global.errors;
+    r.ok = true;
+    return r;
+}
+
 // True when any module in the import closure has a failed load (its `Import.mod`
 // is null). A scope search over a null import segfaults, so that — and only
 // that — must gate semantic. A parse error in a loaded import also bumps
