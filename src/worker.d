@@ -38,6 +38,8 @@ import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnl
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
+import dmd.func : FuncDeclaration;
+import dmd.dclass : ClassDeclaration;
 
 version (Posix)
 {
@@ -1125,6 +1127,154 @@ private WIndexSym[] importCompletions(const(char)[] prefix, const(char)[] path)
     return out_;
 }
 
+// ---------- implement / override stubs ----------
+
+struct WStub
+{
+    string name;
+    string sig; // `override <ret> <name>(<params>)`
+}
+
+// Parameter-type key: `name(t1,t2)`. Return type is ignored (D overloads by
+// parameters), so a covariant override still matches its base.
+private string paramKey(FuncDeclaration fd)
+{
+    import core.stdc.string : strlen;
+    import dmd.mtype : TypeFunction;
+
+    string k = fd.ident ? fd.ident.toString().idup : "";
+    k ~= "(";
+    auto tf = fd.type ? fd.type.isTypeFunction() : null;
+    if (tf && tf.parameterList.parameters)
+        foreach (i; 0 .. (*tf.parameterList.parameters).length)
+        {
+            if (i)
+                k ~= ",";
+            auto p = (*tf.parameterList.parameters)[i];
+            const(char)* ts = (p && p.type) ? p.type.toChars() : null;
+            k ~= ts ? ts[0 .. strlen(ts)] : "?";
+        }
+    k ~= ")";
+    return k;
+}
+
+// `override <ret> <name>(<params>)`, storage classes preserved so the stub
+// actually overrides.
+private string methodSig(FuncDeclaration fd)
+{
+    import core.stdc.string : strlen;
+    import dmd.astenums : STC, VarArg;
+
+    auto tf = fd.type ? fd.type.isTypeFunction() : null;
+    if (!tf || !fd.ident)
+        return null;
+    const(char)* rs = tf.next ? tf.next.toChars() : null;
+    string ret = rs ? rs[0 .. strlen(rs)].idup : "auto";
+    string ps;
+    if (tf.parameterList.parameters)
+        foreach (i; 0 .. (*tf.parameterList.parameters).length)
+        {
+            auto p = (*tf.parameterList.parameters)[i];
+            if (!p)
+                continue;
+            if (ps.length)
+                ps ~= ", ";
+            if (p.storageClass & STC.ref_) ps ~= "ref ";
+            else if (p.storageClass & STC.out_) ps ~= "out ";
+            else if (p.storageClass & STC.lazy_) ps ~= "lazy ";
+            else if (p.storageClass & STC.scope_) ps ~= "scope ";
+            else if (p.storageClass & STC.in_) ps ~= "in ";
+            const(char)* ts = p.type ? p.type.toChars() : null;
+            ps ~= ts ? ts[0 .. strlen(ts)] : "?";
+            if (p.ident)
+            {
+                ps ~= " ";
+                ps ~= p.ident.toString();
+            }
+        }
+    if (tf.parameterList.varargs != VarArg.none)
+    {
+        if (ps.length)
+            ps ~= ", ";
+        ps ~= "...";
+    }
+    return ("override " ~ ret ~ " " ~ fd.ident.toString() ~ "(" ~ ps ~ ")").idup;
+}
+
+private void sendImplementStubs(const(WStub)[] stubs)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    foreach (s; stubs)
+    {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "name", zstr(s.name));
+        js.add_string_to_object(o, "sig", zstr(s.sig));
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "stubs", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+// The class the cursor is on (its name) or inside (a member's parent chain).
+private ClassDeclaration classAt(Module mod, uint line, uint col,
+    const(char)[] text)
+{
+    import dmd.dclass : ClassDeclaration;
+
+    auto sym = resolvedSymbolAt(mod, line, col, text);
+    if (!sym)
+        return null;
+    if (auto cd = sym.isClassDeclaration())
+        return cd;
+    for (auto p = sym.parent; p; p = p.parent)
+        if (auto cd = p.isClassDeclaration())
+            return cd;
+    return null;
+}
+
+private void implementStubsAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] text, uint line, uint col)
+{
+    import dmd.func : FuncDeclaration;
+
+    WStub[] stubs;
+    if (auto cd = classAt(cast(Module)a.module_, line, col, text))
+    {
+        bool[string] have;
+        foreach (m; scopeMembers(cd))
+            if (auto fd = m.isFuncDeclaration())
+                have[paramKey(fd)] = true;
+        void add(FuncDeclaration fd, bool needAbstract)
+        {
+            if (!fd || !fd.ident)
+                return;
+            auto nm = fd.ident.toString();
+            if (nm == "this" || nm == "~this" || nm == "new" || nm == "delete")
+                return;
+            if (needAbstract && !fd.isAbstract())
+                return;
+            auto k = paramKey(fd);
+            if (k in have)
+                return;
+            have[k] = true;
+            auto sig = methodSig(fd);
+            if (sig.length)
+                stubs ~= WStub(nm.idup, sig);
+        }
+        foreach (bc; cd.interfaces)
+            if (bc.sym)
+                foreach (m; scopeMembers(bc.sym))
+                    add(m.isFuncDeclaration(), false);
+        for (auto b = cd.baseClass; b; b = b.baseClass)
+            foreach (m; scopeMembers(b))
+                add(m.isFuncDeclaration(), true);
+    }
+    sendImplementStubs(stubs);
+}
+
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
     const(char)[] path, const(char)[] orig, uint line, uint col,
     bool includeDecl)
@@ -1701,6 +1851,35 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 definitionAndSend(s, a, orig, line, col, typeDef);
+                built = true;
+                continue;
+            }
+            if (ops == "implementStubs")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    implementStubsAndSend(s, a, orig, line, col);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                implementStubsAndSend(s, a, orig, line, col);
                 built = true;
                 continue;
             }
@@ -3125,6 +3304,34 @@ ExchangeResult workerImportCompletions(ref Worker w, const(char)[] prefix,
     const(char)[] path, ref WIndexSym[] out_)
 {
     return workerImportCands(w, "importCompletions", prefix, "prefix", path, out_);
+}
+
+// Interface/abstract methods a class still needs to implement, near (line,col).
+ExchangeResult workerImplementStubs(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref WStub[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("implementStubs"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "stubs"))
+        for (auto c = arr.child; c; c = c.next)
+            out_ ~= WStub(dupOrEmpty(jstr(jget(c, "name"))),
+                dupOrEmpty(jstr(jget(c, "sig"))));
+    return ExchangeResult.ok;
 }
 
 ExchangeResult workerInvalidateIndex(ref Worker w)

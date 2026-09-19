@@ -108,6 +108,39 @@ check('auto-import-completion',
       auto[0]['additionalTextEdits'][0]['newText'] == 'import lib;\n',
       str(auto))
 
+# Implement/override: a class with unimplemented interface methods offers a
+# stub per method.
+shape = ('module shape;\n'
+         'interface Read { void read(); int size(); }\n'
+         'class Bin : Read\n'
+         '{\n'
+         '}\n')
+spath = os.path.join(src, 'shape.d')
+open(spath, 'w').write(shape)
+suri = 'file://' + spath
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": suri, "languageId": "d",
+                                  "version": 1, "text": shape}}})
+time.sleep(1)
+drain()
+send({"jsonrpc": "2.0", "id": 103, "method": "textDocument/codeAction",
+      "params": {"textDocument": {"uri": suri},
+                 "range": {"start": {"line": 2, "character": 6},
+                           "end": {"line": 2, "character": 9}},
+                 "context": {"diagnostics": []}}})
+acts = read_msg()['result']
+titles = [a['title'] for a in acts]
+check('implement-stubs-offered',
+      'Implement `read`' in titles and 'Implement `size`' in titles, str(titles))
+edits = []
+for a in acts:
+    for u, es in a.get('edit', {}).get('changes', {}).items():
+        if u == suri:
+            edits += es
+check('implement-stub-sig',
+      any(e['newText'] == '    override void read()\n    {\n    }\n' for e in edits),
+      str(edits))
+
 proc.stdin.close()
 proc.wait(timeout=5)
 shutil.rmtree(root, ignore_errors=True)

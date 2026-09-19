@@ -449,7 +449,7 @@ private const(char)[] templateParamList(Arena* a, TemplateDeclaration td)
     return arenaDupStr(a, buf);
 }
 
-private Dsymbol[] scopeMembers(Dsymbol scope_)
+Dsymbol[] scopeMembers(Dsymbol scope_)
 {
     Dsymbol[] r;
     if (auto ad = scope_.isAggregateDeclaration())

@@ -796,6 +796,63 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
     return false;
 }
 
+// Interface/abstract methods a class still needs to implement.
+private bool workerImplementRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    ref worker.WStub[] out_)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!respawnWorker(app))
+                return false;
+        }
+        auto r = workerImplementStubs(app.wk, path, atext, origText, line, col, out_);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// Line/char just after the class body's opening brace: scan forward from the
+// 0-based `fromLine` for the first `{`.
+private void classBodyInsert(const(char)[] text, uint fromLine, out uint line,
+    out uint ch)
+{
+    line = fromLine + 1;
+    ch = 0;
+    size_t i = 0;
+    uint l = 0;
+    while (i < text.length && l < fromLine)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    uint scanned = 0;
+    while (i < text.length && scanned < 8)
+    {
+        if (text[i] == '{')
+        {
+            line = l + 1;
+            return;
+        }
+        if (text[i] == '\n')
+        {
+            l++;
+            scanned++;
+        }
+        i++;
+    }
+}
+
 // True when the identifier prefix ending at 1-based (line,col) follows a `.`
 // (member access), where an add-import would be wrong.
 private bool prefixAfterDot(const(char)[] text, uint line, uint col, size_t plen)
@@ -2935,6 +2992,7 @@ private void handleMessage(App* app, ref RawMsg m)
                         auto rs = jget(rng, "start");
                         auto re = jget(rng, "end");
                         uint sl = cast(uint) jint(jget(rs, "line"));
+                        uint sc = cast(uint) jint(jget(rs, "character"));
                         uint el = cast(uint) jint(jget(re, "line"));
                         bool[string] offered;
                         uint il = 0, ic = 0;
@@ -2982,6 +3040,42 @@ private void handleMessage(App* app, ref RawMsg m)
                                 js.add_item_to_object(w, "changes", changes);
                                 js.add_item_to_object(act, "edit", w);
                                 js.add_item_to_array(actions, act);
+                            }
+                        }
+                        // Implement/override: when the cursor is on a class,
+                        // offer a stub per unimplemented interface/abstract
+                        // method.
+                        if (text)
+                        {
+                            string atext = analysisText(text.idup, sl + 1, sc + 1);
+                            worker.WStub[] stubs;
+                            if (workerImplementRetry(app, path, atext, text,
+                                    sl + 1, sc + 1, stubs))
+                            {
+                                uint bl = 0, bc = 0;
+                                classBodyInsert(text, sl, bl, bc);
+                                foreach (st; stubs)
+                                {
+                                    if (!st.sig.length)
+                                        continue;
+                                    auto edits = js.create_array();
+                                    auto ed = js.create_object();
+                                    js.add_item_to_object(ed, "range",
+                                        jrange(js, bl, bc, bl, bc));
+                                    js.add_string_to_object(ed, "newText",
+                                        zstr("    " ~ st.sig ~ "\n    {\n    }\n"));
+                                    js.add_item_to_array(edits, ed);
+                                    auto changes = js.create_object();
+                                    js.add_item_to_object(changes, zstr(uri), edits);
+                                    auto act = js.create_object();
+                                    js.add_string_to_object(act, "title",
+                                        zstr("Implement `" ~ st.name ~ "`"));
+                                    js.add_string_to_object(act, "kind", "quickfix");
+                                    auto w = js.create_object();
+                                    js.add_item_to_object(w, "changes", changes);
+                                    js.add_item_to_object(act, "edit", w);
+                                    js.add_item_to_array(actions, act);
+                                }
                             }
                         }
                     }
