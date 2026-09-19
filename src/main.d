@@ -3356,6 +3356,21 @@ private void handleMessage(App* app, ref RawMsg m)
                 }
                 if (auto hc = path.idup in app.cache)
                 {
+                    // The client asks for actions for a range (usually the
+                    // cursor line). Only offer an unused-import quickfix when
+                    // that import is inside it, or the lightbulb would show on
+                    // every line of the document.
+                    uint reqSl = 0;
+                    uint reqEl = uint.max;
+                    if (auto rng = jget(p, "range"))
+                    {
+                        reqSl = cast(uint) jint(jget(jget(rng, "start"), "line"));
+                        reqEl = cast(uint) jint(jget(jget(rng, "end"), "line"));
+                    }
+                    bool inRange(uint line1)
+                    {
+                        return line1 == 0 || (line1 - 1 >= reqSl && line1 - 1 <= reqEl);
+                    }
                     auto li = (*hc).analysis.lintImports;
                     JsonNode* mkEdit(uint sl, uint el)
                     {
@@ -3365,9 +3380,13 @@ private void handleMessage(App* app, ref RawMsg m)
                         return e;
                     }
                     // per-hit quickfixes
+                    size_t offeredHits = 0;
                     for (size_t i = 0; i < li.hits.length; i++)
                     {
                         auto h = li.hits[i];
+                        if (!inRange(h.line))
+                            continue;
+                        offeredHits++;
                         auto edits = js.create_array();
                         js.add_item_to_array(edits, mkEdit(h.line, h.endLine));
                         auto changes = js.create_object();
@@ -3381,7 +3400,7 @@ private void handleMessage(App* app, ref RawMsg m)
                         js.add_item_to_object(a, "edit", w);
                         js.add_item_to_array(actions, a);
                     }
-                    if (li.hits.length > 1)
+                    if (offeredHits > 1 || (offeredHits && li.hits.length > 1))
                     {
                         auto edits = js.create_array();
                         for (size_t i = 0; i < li.hits.length; i++)

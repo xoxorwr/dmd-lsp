@@ -63,11 +63,11 @@ def complete(line0, marker):
                      "position": {"line": line0, "character": idx}}})
     return [i['label'] for i in read_msg()['result']['items']]
 
-def code_actions():
+def code_actions(line=0):
     send({"jsonrpc": "2.0", "id": 101, "method": "textDocument/codeAction",
           "params": {"textDocument": {"uri": URI},
-                     "range": {"start": {"line": 0, "character": 0},
-                               "end": {"line": 0, "character": 0}},
+                     "range": {"start": {"line": line, "character": 0},
+                               "end": {"line": line, "character": 0}},
                      "context": {"diagnostics": []}}})
     return read_msg()['result']
 
@@ -85,10 +85,14 @@ first = complete(5, 'it.k')
 second = complete(5, 'it.k')
 check('cache-hit-consistent', first == second and 'keep' in first, str(first[:6]))
 
-# codeAction served from cached analysis (module_ nulled, lint pinned)
-acts = code_actions()
+# codeAction served from cached analysis (module_ nulled, lint pinned), and
+# only offered for the requested range (the unused `cextra` import on line 2).
+acts = code_actions(2)
 check('cache-codeaction', any('cextra' in a.get('title', '') for a in acts),
       str([a.get('title') for a in acts]))
+noacts = code_actions(0)
+check('cache-codeaction-range', not noacts,
+      str([a.get('title') for a in noacts]))
 
 # edit with a new (syntax) error: lint updates live. Semantic errors are a
 # save/open concern now (the debounced keypress path is parse-only).
