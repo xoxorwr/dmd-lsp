@@ -3194,8 +3194,9 @@ enum dmdLspVersion = "0.3.0";
 
 int main(string[] args)
 {
-    // Worker mode: this process is a spawned analysis child.
-    foreach (a; args[1 .. $])
+    // Worker mode: this process is a spawned analysis child. Scan every
+    // argument: a spawn that omits argv[0] makes `--worker` arrive as args[0].
+    foreach (a; args)
         if (a == "--worker")
         {
             workerMain();
