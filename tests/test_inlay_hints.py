@@ -68,7 +68,8 @@ def run(enable):
     if enable:
         opts["inlayHints"] = True
     d.send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"rootUri": None, "capabilities": {},
+            "params": {"rootUri": None,
+                       "capabilities": {"textDocument": {"inlayHint": {}}},
                        "initializationOptions": opts}})
     init = d.read()['result']
     caps = init.get('capabilities', {})
@@ -89,7 +90,7 @@ def run(enable):
 
 
 off_advertised, off_hints = run(False)
-check('inlay-hints-off-not-advertised', not off_advertised, str(off_advertised))
+check('inlay-hints-advertised', off_advertised, str(off_advertised))
 check('inlay-hints-off-empty', off_hints == [], str(off_hints))
 
 on_advertised, on_hints = run(True)

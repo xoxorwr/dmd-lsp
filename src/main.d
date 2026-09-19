@@ -66,6 +66,8 @@ struct App
     ulong nextReqId = 0; // ids for our own server->client requests
     bool inlayHints = false; // opt-in (dls.json / editor); off by default
     bool inlayHintsSet = false; // editor/CLI explicitly set it
+    bool clientInlayHint = false; // client supports textDocument/inlayHint
+    bool inlayHintRefresh = false; // client supports workspace/inlayHint/refresh
 }
 
 // Project config file (`dls.json` at the workspace root): checked-in
@@ -771,6 +773,18 @@ private void sendSemanticRefresh(App* app)
         `,"method":"workspace/semanticTokens/refresh","params":null}`);
 }
 
+// Ask the client to re-pull inlay hints after the `inlayHints` setting changed
+// (LSP workspace/inlayHint/refresh) — capabilities are static, so this is how
+// a live dls.json edit takes effect.
+private void sendInlayHintRefresh(App* app)
+{
+    if (!app.inlayHintRefresh)
+        return;
+    app.nextReqId++;
+    lspWrite(`{"jsonrpc":"2.0","id":` ~ ulongStr(app.nextReqId) ~
+        `,"method":"workspace/inlayHint/refresh","params":null}`);
+}
+
 // Ask the client to watch the project config file (LSP
 // workspace/didChangeWatchedFiles, dynamically registered). The watching is
 // done by the client, so this is portable and needs no native file watcher.
@@ -1052,6 +1066,7 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         return n;
     }
     FileConfig fc;
+    const bool prevHints = app.inlayHints;
     fc.loaded = true;
     fc.root = r;
     fc.configPath = cfg;
@@ -1100,6 +1115,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.debounceMs = fc.debounceMs;
     if (!app.inlayHintsSet && fc.hasInlayHints)
         app.inlayHints = fc.inlayHints;
+    if (app.inlayHints != prevHints)
+        sendInlayHintRefresh(app);
     refreshImports(app);
     n.have = true;
     n.type = 4;
@@ -1113,7 +1130,12 @@ private void clearFileConfig(App* app)
 {
     if (!app.fileCfg.loaded)
         return;
+    const bool prevHints = app.inlayHints;
     app.fileCfg = FileConfig.init;
+    if (!app.inlayHintsSet)
+        app.inlayHints = false;
+    if (app.inlayHints != prevHints)
+        sendInlayHintRefresh(app);
     refreshImports(app);
     Notice n;
     n.have = true;
@@ -1684,6 +1706,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     if (auto ciIn = jget(compIn, "completionItem"))
                         app.labelDetails = jbool(jget(ciIn, "labelDetailsSupport"), false);
                 app.wantSemantic = jget(tdc, "semanticTokens") !is null;
+                app.clientInlayHint = jget(tdc, "inlayHint") !is null;
             }
             // workspace/semanticTokens/refresh: lets us defer token pulls to
             // the debounced build instead of rebuilding on every keystroke.
@@ -1691,6 +1714,8 @@ private void handleMessage(App* app, ref RawMsg m)
             {
                 if (auto st = jget(ws, "semanticTokens"))
                     app.semanticRefresh = jbool(jget(st, "refreshSupport"), false);
+                if (auto ih = jget(ws, "inlayHint"))
+                    app.inlayHintRefresh = jbool(jget(ih, "refreshSupport"), false);
                 // File watching is client-side; we only register the glob.
                 if (auto wf = jget(ws, "didChangeWatchedFiles"))
                     app.watchFiles = jbool(jget(wf, "dynamicRegistration"), false);
@@ -1726,7 +1751,10 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "implementationProvider", true);
         js.add_bool_to_object(caps, "documentHighlightProvider", true);
         js.add_bool_to_object(caps, "foldingRangeProvider", true);
-        if (app.inlayHints) // opt-in (dls.json / editor); off by default
+        // Advertised whenever the client can use it; the result is empty until
+        // `inlayHints` is enabled (so a dls.json edit takes effect without a
+        // server restart). Off by default.
+        if (app.clientInlayHint)
             js.add_bool_to_object(caps, "inlayHintProvider", true);
         js.add_bool_to_object(caps, "referencesProvider", true);
         js.add_bool_to_object(caps, "hoverProvider", true);
