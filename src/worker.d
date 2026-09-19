@@ -35,6 +35,7 @@ import lint;
 import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
+    dmdModuleResident,
     dmdParseNoRegister, dmdLocCheckpoint, dmdLocRollback,
     dmdSetDoc, dmdRemoveDoc,
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
@@ -2411,17 +2412,28 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 {
                     if (s.sharedReg)
                     {
-                        // Diagnostics must be exact. A root already resident as
-                        // a dependency has had its semantic skipped, so its
-                        // errors would be missing; run a full analysis in a
-                        // fork child (the parent's shared registry is left
-                        // intact). POSIX only — on Windows `forkRun` fails and
-                        // we fall back to the shared reuse below.
-                        if (forkRun(() {
-                            auto a = serverAnalyze(s, path, text);
-                            sendAnalyze(a);
-                        }))
+                        // Diagnostics must be exact. A root already resident has
+                        // had its semantic skipped, so re-emit its errors with a
+                        // full analysis:
+                        //  - POSIX: in a fork child (parent registry intact);
+                        //  - Windows: no fork, so respawn the worker (the retry
+                        //    then sees a fresh, non-resident root).
+                        // A non-resident root is analyzed in the parent — exact,
+                        // and it enters the registry so the next navigation
+                        // reuses it instead of re-parsing.
+                        if (dmdModuleResident(path))
+                        {
+                            version (Posix)
+                            {
+                                if (forkRun(() {
+                                    auto a = serverAnalyze(s, path, text);
+                                    sendAnalyze(a);
+                                }))
+                                    continue;
+                            }
+                            sendNeedRespawn();
                             continue;
+                        }
                         auto a = serverAnalyzeShared(s, path, text);
                         sendAnalyze(a);
                         built = true;
@@ -2443,21 +2455,11 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                // Parse + AST lints on a fresh state. On POSIX this runs in a
-                // fork child and leaves the live universe untouched; on
-                // Windows it runs inline, so invalidate the universe and let
-                // the next semantic request respawn.
-                if (forkRun(() {
-                    auto a = serverLint(s, path, text);
-                    sendAnalyze(a);
-                    version (Windows)
-                        s.uni.valid = false;
-                }))
-                    continue;
+                // Parse-only, registration-free (H3): touches neither the live
+                // universe nor any shared state, so it runs inline — no fork,
+                // no respawn, same on Windows.
                 auto a = serverLint(s, path, text);
                 sendAnalyze(a);
-                version (Windows)
-                    s.uni.valid = false;
                 continue;
             }
             if (ops == "complete")

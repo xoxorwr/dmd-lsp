@@ -36,6 +36,11 @@ struct HitCache
 // needed 5-8 roots). Overridable from dls.json / initializationOptions.
 enum uint defaultMaxWorkers = 4;
 
+// One worker serves every root, so switching files spawns nothing. Default on
+// everywhere; the only fork-specific bit (exact diagnostics for a resident
+// root) uses a respawn where there is no fork.
+enum bool defaultSharedRegistry = true;
+
 // Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): route every root to the MRU
 // worker so one process serves many roots on a shared module registry, and the
 // worker avoids respawning on a root switch.
@@ -77,11 +82,11 @@ struct App
     PoolEntry[] pool;
     uint maxWorkers = defaultMaxWorkers;
     bool maxWorkersSet = false; // editor/CLI explicitly set it
-    // Opt-in shared module registry (PLAN2 Task 2): one worker serves all roots
-    // on a persistent registry, capped at `sharedMaxModules`.
-    bool sharedRegistry = false;
+    // Shared module registry: one worker serves all roots on a persistent
+    // registry, capped at `sharedMaxModules`. Default on for POSIX.
+    bool sharedRegistry = defaultSharedRegistry;
     bool sharedRegistrySet = false;
-    uint sharedMaxModules = 512;
+    uint sharedMaxModules = 2048;
     bool sharedMaxModulesSet = false;
     ulong poolClock = 0; // LRU stamp source
     // Semantic tokens: last result per path and the text hash it was computed
@@ -119,9 +124,9 @@ struct FileConfig
     bool hasInlayHints = false;
     uint maxWorkers = defaultMaxWorkers;
     bool hasMaxWorkers = false;
-    bool sharedRegistry = false;
+    bool sharedRegistry = defaultSharedRegistry;
     bool hasSharedRegistry = false;
-    uint sharedMaxModules = 512;
+    uint sharedMaxModules = 2048;
     bool hasSharedMaxModules = false;
     bool autoImports = false;
     bool hasAutoImports = false;
@@ -1672,9 +1677,9 @@ private void clearFileConfig(App* app)
     if (!app.maxWorkersSet)
         app.maxWorkers = defaultMaxWorkers;
     if (!app.sharedRegistrySet)
-        app.sharedRegistry = false;
+        app.sharedRegistry = defaultSharedRegistry;
     if (!app.sharedMaxModulesSet)
-        app.sharedMaxModules = 512;
+        app.sharedMaxModules = 2048;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);

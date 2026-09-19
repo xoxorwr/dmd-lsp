@@ -23,14 +23,16 @@ How `dmd-lsp` works and the conventions it is built on.
 ## Memory model: warm workers, in-place re-parse
 
 The LSP front end holds only session docs, config and the debounce
-bookkeeping. Analysis runs in worker processes (`worker.d`, cross-platform):
+bookkeeping. Analysis runs in a worker process (`worker.d`, cross-platform):
 POSIX `fork()`s the server, Windows spawns this executable with `--worker`;
-either way each child owns one warm dmd universe and speaks length-prefixed
-frames over pipes. The parent keeps a pool of up to `maxWorkers` single-root
-workers, one per analyzed root, least-recently-used evicted — so switching back
-to a file you already opened reuses its warm universe instead of rebuilding.
-(Workers must close the other pool members' pipe fds in the child, or a killed
-worker never sees EOF and the server blocks in `waitpid`.)
+either way the child speaks length-prefixed frames over pipes. By default there
+is **one** worker, which keeps every loaded module resident and serves every
+root (`sharedRegistry`); switching files re-analyses only the file's own body,
+not the closure. When a dependency/config changes or the `maxModules` cap is
+exceeded the worker is rebuilt. Setting `sharedRegistry: false` restores the
+older pool of up to `maxWorkers` single-root workers, least-recently-used
+evicted. (Pool workers must close the other members' pipe fds in the child, or
+a killed worker never sees EOF and the server blocks in `waitpid`.)
 
 The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
 ~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies), and it is identical

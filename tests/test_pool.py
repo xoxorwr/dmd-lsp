@@ -63,9 +63,12 @@ def workers():
             count += 1
     return count
 
+# Test the pool explicitly: the shared registry (one worker for all roots) is
+# the default, so opt out here.
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
       "params": {"rootUri": 'file://' + root, "capabilities": {},
-                 "initializationOptions": {"maxWorkers": 2}}})
+                 "initializationOptions": {"maxWorkers": 2,
+                                           "sharedRegistry": False}}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 

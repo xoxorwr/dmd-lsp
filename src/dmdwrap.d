@@ -150,19 +150,22 @@ ParseOut dmdParseOnly(const(char)[] path, const(char)[] text)
 // would collide on an already-registered module name and return the live one.
 // The caller must roll back the `Loc` table it appended (`dmdLocCheckpoint`).
 // Hack H3: see docs/hacks.md. Rebuild the FQN from `md.packages` + `ident`.
-ParseOut dmdParseNoRegister(const(char)[] path, const(char)[] text)
+ParseOut dmdParseNoRegister(const(char)[] path, const(char)[] text,
+    bool suppress = true)
 {
     import dmd.root.filename : FileName;
     import dmd.identifier : Identifier;
 
     ParseOut r;
-    // Suppress index-file diagnostics: gag the compiler sink and restore the
-    // counters after, so a project with errors leaves the request untouched.
+    // Restore the error counters afterwards so a parse cannot perturb the live
+    // request. `suppress` also gags the sink (index builds); a consumer that
+    // wants the diagnostics (lint) passes `false` and reads `s.sink`.
     auto savedErrors = global.errors;
     auto savedWarnings = global.warnings;
     auto savedGagged = global.gaggedErrors;
     auto savedGag = global.gag;
-    global.gag = 1;
+    if (suppress)
+        global.gag = 1;
     scope (exit)
     {
         global.errors = savedErrors;
@@ -179,13 +182,25 @@ ParseOut dmdParseNoRegister(const(char)[] path, const(char)[] text)
     m = m.parseModule!ASTCodegen(false);
     if (m is null)
     {
-        r.errors = global.errors;
+        r.errors = global.errors - savedErrors; // delta of this parse
         return r;
     }
     r.module_ = cast(void*)m;
-    r.errors = global.errors;
+    r.errors = global.errors - savedErrors;
     r.ok = true;
     return r;
+}
+
+// True when `path` is already a registered module (loaded as a root or as a
+// dependency of one).
+bool dmdModuleResident(const(char)[] path)
+{
+    import dmd.dmodule : Module;
+
+    foreach (m; Module.amodules)
+        if (m && m.srcfile.toString() == path)
+            return true;
+    return false;
 }
 
 // True when any module in the import closure has a failed load (its `Import.mod`

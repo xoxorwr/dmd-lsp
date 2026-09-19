@@ -98,13 +98,14 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
   "stringImportPaths": ["views/"],   // for import("...") files (-J)
   "flags": ["-preview=rvaluerefparam", "-preview=bitfields", "-betterC"],
   "debounceMs": 500,                 // default: 500
-  "maxWorkers": 4,                   // default: 4 (see below)
+  "maxModules": 2048,                // registry cap (see below)
 
   // Optional features — all off unless you opt in:
   "inlayHints": false,               // default: false
   "autoImports": false,              // default: false
-  "sharedRegistry": false,           // experimental, default: false
-  "maxModules": 512                  // registry cap for sharedRegistry
+
+  "sharedRegistry": true,            // default: true
+  "maxWorkers": 4                    // only when sharedRegistry is false
 }
 ```
 
@@ -119,9 +120,9 @@ loads at `initialize` and on save.
 |-----|---------|--------|
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
-| `maxWorkers` | `4` | Size of the analysis-worker pool. Each worker keeps one file's dependency graph warm; up to `maxWorkers` roots are held, least-recently-used evicted. Raise it if you switch between many open files and see rebuilds. |
-| `sharedRegistry` | `false` | **Experimental.** Serve all files from one worker that keeps every loaded module resident (lower memory; navigation reuses the whole closure). Diagnostics stay exact: a root is diagnosed by a full analysis in a forked child so the shared registry is untouched (Windows has no fork and falls back to reuse, which can under-report). See `PLAN2.md` / `docs/reclamation.md`. |
-| `maxModules` | `512` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (no partial eviction), so a full rebuild follows. |
+| `sharedRegistry` | `true` | One worker serves **every** file, keeping all loaded modules resident, so switching between files re-analyses only the file you're in — no per-file workers, no respawns. Diagnostics stay exact: a file already loaded as a dependency is re-diagnosed by a full analysis in a forked child (POSIX) or by restarting the worker (Windows). Set `false` to use the older per-file worker pool. |
+| `maxModules` | `2048` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. Lower it to bound memory on huge projects. |
+| `maxWorkers` | `4` | Only used when `sharedRegistry` is `false`: size of the per-file worker pool, LRU-evicted. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is
@@ -129,12 +130,13 @@ loads at `initialize` and on save.
 
 ## How it works
 
-`dmd-lsp` runs the real dmd frontend in worker processes. Each worker holds one
-file's dependency graph warm, so an edit re-analyses only the changed file on
-top of it. A pool of up to `maxWorkers` keeps the files you switch between warm
-(least-recently-used evicted), instead of restarting the one worker on every
-move. When a dependency or the configuration changes the affected worker is
-restarted and the OS reclaims the old state.
+`dmd-lsp` runs the real dmd frontend in a worker process. By default a single
+worker keeps every loaded module resident, so an edit re-analyses only the
+changed file on top of the shared closure — switching between files does not
+start anything new. When a dependency or the configuration changes, or the
+`maxModules` cap is exceeded, the worker is rebuilt (the OS reclaims the old
+state). With `sharedRegistry: false` it instead runs a pool of up to
+`maxWorkers` per-file workers, least-recently-used evicted.
 
 Details: [docs/design.md](docs/design.md).
 

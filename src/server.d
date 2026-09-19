@@ -29,7 +29,7 @@ struct ServerState
     Universe uni; // live-universe cache (see below)
     LexCache lex; // reusable NUL-terminated text copy for lexing
     bool sharedReg; // opt-in shared module registry (PLAN2 Task 2)
-    size_t maxModules = 512; // registry cap; over it the worker respawns
+    size_t maxModules = 2048; // registry cap; over it the worker respawns
     bool overCap; // set when the registry crossed the cap
 }
 
@@ -101,13 +101,13 @@ private void stdoutRestore(ref StdoutGuard g)
 }
 
 void serverInit(ref ServerState s, string[] imports, string[] stringImports = null,
-    string[] flags = null, bool sharedReg = false, size_t maxModules = 512)
+    string[] flags = null, bool sharedReg = false, size_t maxModules = 2048)
 {
     s.dmd.importPaths = imports;
     s.dmd.stringPaths = stringImports;
     s.dmd.flags = flags;
     s.sharedReg = sharedReg;
-    s.maxModules = maxModules ? maxModules : 512;
+    s.maxModules = maxModules ? maxModules : 2048;
     dmdInit(s.dmd);
 }
 
@@ -275,14 +275,23 @@ UniState serverUniState(ref ServerState s, const(char)[] path,
 // cannot cascade and a stale warm closure cannot leak into diagnostics.
 // Runs on a fresh dmd state, so the caller must isolate it (fork child on
 // POSIX); on Windows the caller marks the universe invalid afterwards.
+// Parse-only diagnostics (syntax errors + unused imports/params). Uses the
+// registration-free parse (H3), so it does NOT reset or touch the live
+// universe and can run inline in the worker — no fork, no respawn. Diagnostics
+// land in `s.sink`; counters/Loc are restored by the callee/here.
 Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
 {
     Analysis a;
     s.scratch.reset();
-    dmdResetRequest(s.dmd, &s.sink);
+    s.sink.reset();
+    size_t locTableLen;
+    uint locIndex;
+    dmdLocCheckpoint(locTableLen, locIndex);
     StdoutGuard og;
     stdoutToStderr(og);
-    auto pr = dmdParseOnly(path, text);
+    auto pr = dmdParseNoRegister(path, text, false); // false: emit diagnostics
+    stdoutRestore(og);
+    dmdLocRollback(locTableLen, locIndex);
     a.ok = pr.ok;
     a.errors = pr.errors;
     a.diags = s.sink.msgs;
@@ -294,7 +303,6 @@ Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
         pinLint(s.session, a.lintImports);
         pinLint(s.session, a.lintParams);
     }
-    stdoutRestore(og);
     return a;
 }
 
@@ -313,6 +321,13 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     s.scratch.reset();
     s.sink.reset();
     dmdResetCounters();
+    // A dependency changed on disk (or the config changed): every module
+    // resident in the registry may be stale, so rebuild properly instead of
+    // reusing them. Shared-registry equivalent of a respawn, minus the restart.
+    // Checked before the stdout guard so the early return into `serverAnalyze`
+    // cannot leave fd 1 redirected to stderr.
+    if (s.uni.valid && universeDepsChanged(s.uni.deps))
+        return serverAnalyze(s, path, text, identity);
     Analysis a;
     StdoutGuard og;
     stdoutToStderr(og);
