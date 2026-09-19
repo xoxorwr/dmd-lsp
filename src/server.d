@@ -298,24 +298,53 @@ Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
 Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     const(char)[] text)
 {
+    import core.stdc.string : memcmp;
+
     s.scratch.reset();
     s.sink.reset();
     dmdResetCounters();
     Analysis a;
     StdoutGuard og;
     stdoutToStderr(og);
-    auto pr = dmdParseOnly(path, text); // registers into the live registry
-    if (pr.ok && pr.module_)
-        a.syn = snapshotModule(cast(Module)pr.module_, text);
-    auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
+    // If this file is already a registered module (it was loaded as a
+    // dependency of an earlier root), do NOT parse a fresh `Module`: its
+    // declarations would collide with the existing ones ("<symbol> already
+    // exists"). Reuse it when the text matches, else re-parse it in place so
+    // object identity (and every importer's `imp.mod`) is preserved.
+    Module existing = null;
+    foreach (m; Module.amodules)
+        if (m && m.srcfile.toString() == path)
+        {
+            existing = m;
+            break;
+        }
+    void* modp;
+    if (existing)
+    {
+        if (existing.src.length == text.length &&
+            memcmp(existing.src.ptr, text.ptr, text.length) == 0)
+            modp = cast(void*) existing;
+        else
+            modp = dmdReparseModule(cast(void*) existing, text);
+    }
+    else
+    {
+        auto pr = dmdParseOnly(path, text); // registers into the live registry
+        modp = pr.module_;
+        if (!pr.ok)
+            modp = null;
+    }
+    if (modp)
+        a.syn = snapshotModule(cast(Module)modp, text);
+    auto errs = modp ? dmdSemantic(modp) : 1;
     stdoutRestore(og);
-    a.module_ = pr.module_;
-    a.ok = pr.ok;
+    a.module_ = modp;
+    a.ok = modp !is null;
     a.errors = errs;
     a.diags = s.sink.msgs;
-    if (pr.ok && pr.module_)
+    if (modp)
     {
-        auto mod = cast(Module)pr.module_;
+        auto mod = cast(Module)modp;
         lintUnusedImports(&s.scratch, mod, path, text, errs != 0, a.lintImports);
         lintUnusedParams(&s.scratch, mod, path, text, errs != 0, a.lintParams);
         pinLint(s.session, a.lintImports);
