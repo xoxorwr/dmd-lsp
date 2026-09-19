@@ -818,6 +818,7 @@ private PoolEntry* poolAcquire(App* app, const(char)[] path)
         return null;
     }
     app.workerNotified = false;
+    primeWorkerDocs(app, e.wk);
     app.pool ~= e;
     return &app.pool[$ - 1];
 }
@@ -859,6 +860,28 @@ private void poolInvalidateIndex(App* app)
 {
     foreach (ref e; app.pool)
         e.indexBuilt = false;
+}
+
+// Open-document mirror: push an open doc's current text (or its removal) to
+// every pooled worker, so a dependency that is open unsaved is analyzed from
+// the editor buffer, not disk. Best-effort — a failed push just leaves that
+// worker on disk bytes until it is respawned (and primed) again.
+private void pushDocToPool(App* app, const(char)[] path, const(char)[] text)
+{
+    foreach (ref e; app.pool)
+        worker.workerSetDoc(e.wk, path, text);
+}
+
+private void pushDocRemovalToPool(App* app, const(char)[] path)
+{
+    foreach (ref e; app.pool)
+        worker.workerSetDoc(e.wk, path, null);
+}
+
+private void primeWorkerDocs(App* app, ref worker.Worker w)
+{
+    foreach (ref d; app.session.docs)
+        worker.workerSetDoc(w, d.path, d.text);
 }
 
 // Build the workspace index in the worker bound to `path` (null: the MRU
@@ -2001,7 +2024,10 @@ private void handleMessage(App* app, ref RawMsg m)
                     text = "";
                 sessionOpen(app.session, path, text);
                 if (!isDlsJson(path))
+                {
+                    pushDocToPool(app, path, text);
                     publishFor(app, path, text, true);
+                }
             }
             else if (m.method == "textDocument/didChange")
             {
@@ -2051,6 +2077,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 // completion already built the current buffer), so the doc is
                 // analyzed without saving, without a rebuild per key.
                 sessionUpdate(app.session, path, base);
+                pushDocToPool(app, path, base);
                 markPending(app, path);
             }
             else if (m.method == "textDocument/didClose")
@@ -2060,6 +2087,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     return;
                 string path = uriToPath(uri);
                 sessionClose(app.session, path);
+                pushDocRemovalToPool(app, path);
                 clearPending(app, path);
                 app.tokCache.remove(path.idup);
                 app.tokHash.remove(path.idup);
@@ -2088,6 +2116,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     if (text)
                     {
                         sessionUpdate(app.session, path, text);
+                        pushDocToPool(app, path, text);
                         publishFor(app, path, text, true);
                     }
                 }

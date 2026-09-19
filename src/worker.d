@@ -36,6 +36,7 @@ import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
     dmdParseNoRegister, dmdLocCheckpoint, dmdLocRollback,
+    dmdSetDoc, dmdRemoveDoc,
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
 
 import dmd.dmodule : Module;
@@ -2939,6 +2940,27 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 sendIndexBuilt(g_index.length);
                 continue;
             }
+            if (ops == "setDoc")
+            {
+                auto dp = jstr(jget(p, "path"));
+                auto tn = jget(p, "text");
+                if (dp !is null && dp.length)
+                {
+                    if (tn is null || (tn.type & 0xFF) == JsonNull)
+                        dmdRemoveDoc(dp);
+                    else
+                    {
+                        auto dt = jstr(tn);
+                        dmdSetDoc(dp, dt is null ? "" : dt);
+                    }
+                }
+                auto js = jmake();
+                auto root = js.create_object();
+                js.add_bool_to_object(root, "ok", true);
+                js.add_bool_to_object(root, "needRespawn", false);
+                writeFrame(outChan, printJsonStr(root));
+                continue;
+            }
             if (ops == "workspaceSymbol")
             {
                 auto q = jstr(jget(p, "query"));
@@ -4092,6 +4114,26 @@ ExchangeResult workerBuildIndex(ref Worker w, string[] files)
         return ExchangeResult.failed;
     if (jbool(jget(r, "needRespawn"), false))
         return ExchangeResult.respawn;
+    return ExchangeResult.ok;
+}
+
+// Push one open document into the worker's mirror (text) or drop it (null
+// text). The worker reads dependency sources from here, so an unsaved edit to
+// an imported file is visible without saving. Best-effort: a failed push just
+// leaves the worker on disk bytes until it is respawned/primed.
+ExchangeResult workerSetDoc(ref Worker w, const(char)[] path, const(char)[] text)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("setDoc"));
+    js.add_string_to_object(root, "path", zstr(path));
+    if (text is null)
+        js.add_item_to_object(root, "text", js.create_null());
+    else
+        js.add_string_to_object(root, "text", zstr(text));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
     return ExchangeResult.ok;
 }
 

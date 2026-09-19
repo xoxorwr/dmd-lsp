@@ -206,6 +206,52 @@ index build evicts the warm universe (`analyze.full > 1`), and
 
 ---
 
+## H4. `FileManager.setFileContents` — replaceable file contents (open-doc mirror)
+
+**Files**: `src/dmd/file_manager.d` (`setFileContents`, `removeFileContents`)
+**Consumer**: `src/dmdwrap.d` (`g_docMirror`, `dmdSetDoc`, `dmdRemoveDoc`,
+`dmdReapplyDocMirror`, mirror-aware `universeDepsChanged`), `src/worker.d`
+(`setDoc` op), `src/main.d` (push on open/change/save/close + prime on spawn)
+**Tests**: `tests/test_mirror.py` (`unsaved-dep-reflected`)
+**Status**: not upstreamable.
+
+### Problem
+
+dmd reads a dependency's source through `Module.read` →
+`FileManager.getFileContents` (`file_manager.d`), which is cache-first but
+disk-only. A language server holds the *open, unsaved* buffer; without an
+overlay, `app.d` importing an edited-unsaved `lib.d` is analysed against the
+stale on-disk `lib.d` until the user saves. `FileManager.add` cannot fix this:
+it uses `StringTable.insert`, which returns null (no-op) when the key exists
+(`root/stringtable.d`), so it can only populate, never update. And
+`dmdResetRequest` → `global.deinitialize()` → `_init()` builds a **new**
+`FileManager`, so anything stored there is lost on every full rebuild.
+
+### Hack
+
+Two methods on `FileManager`: `setFileContents` (insert-or-update via
+`StringTable.update`) and `removeFileContents` (evict via `removeWhere`, so a
+closed document falls back to disk). `src/dmdwrap.d` keeps the overlay in a
+worker-global `g_docMirror` that **survives resets** and re-installs it from
+`dmdResetRequest`; `universeDepsChanged` compares a mirrored dep against the
+mirror hash and everything else against disk, so an unsaved edit invalidates
+the warm universe exactly like a disk change would.
+
+### Why it is a hack
+
+An editor open-document overlay is meaningless to a compiler; upstream would
+want a general virtual-file-system/`FileManager` injection point, not an
+LSP-shaped API.
+
+### Keeping it honest
+
+`src/dmdwrap.d` calls `setFileContents`/`removeFileContents`: dropping the
+methods is a **compile error**. `tests/test_mirror.py` fails if the overlay
+stops being applied — `app.d` must report `libValue` as undefined after `lib.d`
+is edited unsaved (it resolves from disk without the overlay).
+
+---
+
 ## Adding a hack
 
 1. Keep it as small and self-contained as possible; put the toggle in the

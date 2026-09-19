@@ -817,6 +817,8 @@ void dmdResetRequest(ref DmdState st, DiagSink* sink,
         sink.reset();
     global.gag = 0;
     global.gaggedErrors = 0;
+    // `_init` built a fresh FileManager: re-install the open-doc mirror.
+    dmdReapplyDocMirror();
 }
 
 // ---- Cross-request module cache (hit support) ----
@@ -824,12 +826,12 @@ void dmdResetRequest(ref DmdState st, DiagSink* sink,
 // The last analysis's dmd universe is kept alive across requests. A request
 // with identical inputs (same root text, same dep disk bytes, same config)
 // is served from cache with zero dmd work (see server.Universe).
-// Deps are fingerprinted from DISK bytes (what dmd consumes). Unsaved dep
-// edits in open docs therefore disable the cache until save — same cost as
-// the old always-rebuild behavior, never stale results.
+// Deps are fingerprinted from the bytes dmd consumed (`Module.src`). For an
+// open document that is the server's unsaved buffer (the mirror below); for
+// everything else it is the disk bytes — see `universeDepsChanged`.
 
 // One recorded dependency: path + content hash of what the parser consumed
-// (Module.src, i.e. exact disk bytes for deps).
+// (Module.src: unsaved mirror bytes for open docs, disk bytes otherwise).
 struct DepRec
 {
     string path;
@@ -855,17 +857,61 @@ void universeRecord(ref DepRec[] deps, const(char)[] rootPath)
     }
 }
 
-// True when any recorded dep's current disk bytes differ (missing file
-// counts as changed — the rebuild then reports the proper error).
+// True when any recorded dep's current bytes differ. A dep that is an open
+// document is compared against the pushed mirror (unsaved edits count as a
+// change); everything else against disk (missing counts as changed — the
+// rebuild then reports the proper error).
 bool universeDepsChanged(const DepRec[] deps)
 {
-    import session : hashFileDisk;
+    import session : hashFileDisk, fnv1a64;
 
     foreach (ref d; deps)
     {
+        if (auto mv = d.path in g_docMirror)
+        {
+            if (fnv1a64(*mv) != d.hash)
+                return true;
+            continue;
+        }
         ulong h;
         if (!hashFileDisk(d.path, h) || h != d.hash)
             return true;
     }
     return false;
+}
+
+// ---- Open-document mirror (hack H4, docs/hacks.md) ----
+// The server pushes the current text of open documents; the worker keeps this
+// map (worker-global, so it survives `dmdResetRequest`, which rebuilds the
+// FileManager) and reapplies it after every reset. dmd then reads a dependency
+// that is open in the editor as the unsaved buffer, not stale disk bytes.
+private __gshared const(ubyte)[][string] g_docMirror;
+
+void dmdSetDoc(const(char)[] path, const(char)[] text)
+{
+    import dmd.root.filename : FileName;
+
+    auto buf = cast(const(ubyte)[]) (text.dup ~ '\0');
+    g_docMirror[path.idup] = buf;
+    if (global.fileManager !is null)
+        global.fileManager.setFileContents(FileName(path.idup), buf);
+}
+
+void dmdRemoveDoc(const(char)[] path)
+{
+    import dmd.root.filename : FileName;
+
+    g_docMirror.remove(path.idup);
+    if (global.fileManager !is null)
+        global.fileManager.removeFileContents(FileName(path.idup));
+}
+
+void dmdReapplyDocMirror()
+{
+    import dmd.root.filename : FileName;
+
+    if (global.fileManager is null)
+        return;
+    foreach (path, buf; g_docMirror)
+        global.fileManager.setFileContents(FileName(path), buf);
 }
