@@ -577,10 +577,26 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         ctx.line = line;
         ctx.character = col;
         DefLoc def;
+        // Prefer dmd's own resolved symbol for this position: the AST knows
+        // exactly which expression the cursor is on, so it cannot be fooled by
+        // e.g. an identifier inside an index expression. Fall back to the
+        // text-chain resolver for declaration sites / cases the semantic walk
+        // does not emit (the walk skips declaration names on purpose).
+        auto sym = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
         if (typeDef)
-            typeDefinitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        {
+            if (sym)
+                typeDefinitionSymbol(&s.scratch, sym, def);
+            else
+                typeDefinitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        }
         else
-            definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        {
+            if (sym)
+                defLocOf(&s.scratch, sym, def);
+            else
+                definitionAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, def);
+        }
         sendDefinition(def);
     }
 
@@ -844,7 +860,12 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         ctx.line = line;
         ctx.character = col;
         HoverInfo h;
-        hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
+        // Prefer dmd's resolved symbol at the cursor (see definitionAndSend).
+        auto sym = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
+        if (sym)
+            hoverSymbol(&s.scratch, sym, h);
+        else
+            hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
         sendHover(h);
     }
 

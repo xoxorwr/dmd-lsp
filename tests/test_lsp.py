@@ -472,6 +472,19 @@ dv = def_at(cuna, 2, 24)
 check('def-chain-prefix',
       bool(dv) and dv[0]['range']['start'] == {'line': 2, 'character': 13}, str(dv))
 
+# An identifier inside an index expression is its own chain: hovering `k` in
+# `tbl[k].a` must resolve the parameter, not the array `tbl` (the old text
+# scanner walked left across `[` and merged the chains).
+htext = ('module hidx;\n'
+         'struct E { int a; }\n'
+         'void f(E[4] tbl, int k) { tbl[k].a = 1; }\n')
+hidxuri = open_doctype('hidx.d', htext)
+hcol = htext.split('\n')[2].index('tbl[') + 4
+hv = hover_uri(hidxuri, 2, hcol)
+check('hover-index-identifier', hv is not None and 'int k' in hv, str(hv))
+hv = hover_uri(hidxuri, 2, htext.split('\n')[2].index('tbl[') + 1)
+check('hover-index-array', hv is not None and 'E[4] tbl' in hv, str(hv))
+
 # hover on a type shows the declaration source, not just "struct S".
 hv = hover_uri(cuna, 1, 7)
 check('hover-type-def', hv is not None and 'struct S' in hv and 'int x' in hv,

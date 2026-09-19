@@ -19,6 +19,7 @@ import dmd.aggregate : AggregateDeclaration;
 import dmd.dclass : ClassDeclaration;
 import dmd.dtemplate : TemplateDeclaration, TemplateInstance;
 import dmd.statement : Statement, WithStatement;
+import dmd.tokens : Token;
 import dmd.arraytypes : Dsymbols;
 import dmd.attrib : ConditionalDeclaration;
 import dmd.dsymbol : DSYM;
@@ -2798,27 +2799,102 @@ private const(char)[] lineSlice(const(char)[] text, const(size_t)[] starts,
     return text[s .. e];
 }
 
-// Full chain ending at the identifier at 1-based `col` within `lt` (a single
-// line). The cursor's own segment is found by expanding over identifier
-// chars only (so hovering `allocator` in `allocator.create` targets
-// `allocator`, not `create`); the prefix is then extended back over the chain.
+// Tokens of one source line, via dmd's lexer (comments, strings and raw
+// strings are the frontend's problem). Token charnums are 1-based columns.
+private Token[] lexLineTokens(const(char)[] lt)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    Token[] toks;
+    if (!lt.length)
+        return toks;
+    auto buf = lt.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        toks ~= t;
+    }
+    return toks;
+}
+
+// The dotted chain (as spelled in `lt`) ending at the identifier under `col`
+// (0-based), or null. Token-based, so an identifier inside an index expression
+// (`hate_table[target.ai.hate_count]`) is its own chain and does not merge with
+// the array name, while `arr[0][i].member` keeps its index groups.
+private const(char)[] chainFromTokens(const(char)[] lt, const(Token)[] toks,
+    uint col)
+{
+    import dmd.tokens : TOK;
+
+    int idx = -1;
+    foreach (i, t; toks)
+    {
+        if (t.value != TOK.identifier)
+            continue;
+        // Token charnum is 1-based; compare in 0-based. The inclusive end also
+        // accepts the 1-based columns the batch resolver passes (charnum) and
+        // an end-of-word cursor (completion).
+        uint start0 = cast(uint) t.loc.charnum() - 1;
+        uint len = cast(uint) t.ident.toString().length;
+        if (col >= start0 && col <= start0 + len)
+        {
+            idx = cast(int) i;
+            break;
+        }
+    }
+    if (idx < 0)
+        return null;
+
+    size_t startIdx = idx;
+    while (startIdx >= 1 && toks[startIdx - 1].value == TOK.dot)
+    {
+        int j = cast(int) startIdx - 2;
+        // Skip any index groups attached to the left expression.
+        while (j >= 0 && toks[j].value == TOK.rightBracket)
+        {
+            int depth = 0;
+            int open = -1;
+            for (int k = j; k >= 0; k--)
+            {
+                if (toks[k].value == TOK.rightBracket)
+                    depth++;
+                else if (toks[k].value == TOK.leftBracket)
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        open = k;
+                        break;
+                    }
+                }
+            }
+            if (open < 0)
+                return null;
+            j = open - 1;
+        }
+        if (j < 0 || toks[j].value != TOK.identifier)
+            break;
+        startIdx = cast(size_t) j;
+    }
+
+    uint c0 = cast(uint) toks[startIdx].loc.charnum();
+    uint c1 = cast(uint) toks[idx].loc.charnum() +
+        cast(uint) toks[idx].ident.toString().length;
+    if (c0 < 1 || c0 > c1 || c1 > lt.length + 1)
+        return null;
+    return lt[c0 - 1 .. c1 - 1];
+}
+
 private const(char)[] chainInLine(const(char)[] lt, uint col)
 {
-    size_t e = col - 1;
-    if (e > lt.length)
-        e = lt.length;
-    size_t segS = e;
-    while (segS > 0 && isPc(lt[segS - 1]))
-        segS--;
-    size_t segE = e;
-    while (segE < lt.length && isPc(lt[segE]))
-        segE++;
-    if (segE == segS)
-        return null; // cursor is not on an identifier
-    size_t s = segS;
-    while (s > 0 && isChainChar(lt[s - 1]))
-        s--;
-    return lt[s .. segE];
+    return chainFromTokens(lt, lexLineTokens(lt), col);
 }
 
 private const(char)[] chainUnderCursor(const(char)[] text, uint line, uint col)
@@ -3114,24 +3190,28 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
         collectFuncRanges(m, 1, funcs);
     }
     uint lastLine = uint.max;
+    const(char)[] lineText = null;
+    Token[] lineToks;
     FuncDeclaration fd;
     FuncDeclaration cachedFd;
     bool haveCached = false;
     NameType[] locals;
     foreach (i; 0 .. lines.length)
     {
-        auto chain = chainInLine(lineSlice(text, lineStart, lines[i]), cols[i]);
-        if (!chain.length)
-            continue;
         if (lines[i] != lastLine)
         {
             lastLine = lines[i];
+            lineText = lineSlice(text, lineStart, lines[i]);
+            lineToks = lexLineTokens(lineText);
             fd = enclosingFunc(funcs, lines[i]);
             // AST ranges can be recovery-extended over following functions;
             // accept fd only when the token is inside its lexical body.
             if (!funcScopedToLine(syn, fd, lines[i]))
                 fd = null;
         }
+        auto chain = chainFromTokens(lineText, lineToks, cols[i]);
+        if (!chain.length)
+            continue;
         // Locals depend on position; recompute only when the enclosing
         // function changes (at its end line, i.e. the full local set).
         if (!haveCached || fd !is cachedFd)
@@ -3157,14 +3237,6 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
     }
 }
 
-private size_t lastSegLen(const(char)[] chain)
-{
-    size_t s = chain.length;
-    while (s > 0 && chain[s - 1] != '.')
-        s--;
-    return baseName(chain[s .. $]).length;
-}
-
 // Public: the declaration symbol under the cursor, for references/rename.
 Dsymbol symbolAt(Module mod, const CompleteCtx* ctx, const(char)[] text,
     const ref SynMod syn)
@@ -3172,10 +3244,10 @@ Dsymbol symbolAt(Module mod, const CompleteCtx* ctx, const(char)[] text,
     return resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
 }
 
-void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
-    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+// Build a jump target for an already-resolved symbol (dmd's own answer, from
+// `references.resolvedSymbolAt`) or from the text-chain resolver's result.
+void defLocOf(Arena* arena, Dsymbol sym, ref DefLoc out_)
 {
-    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
     if (!sym)
         return;
     auto loc = sym.loc;
@@ -3187,7 +3259,13 @@ void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     out_.file = arenaDupStr(arena, f[0 .. strlen(f)]);
     out_.line = loc.linnum();
     out_.col = loc.charnum();
-    out_.len = lastSegLen(chainUnderCursor(text, ctx.line, ctx.character));
+    out_.len = sym.ident ? sym.ident.toString().length : 0;
+}
+
+void definitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref DefLoc out_)
+{
+    defLocOf(arena, resolveSymbolAt(mod, syn, ctx.line, ctx.character, text), out_);
 }
 
 // The declaration a symbol is *typed* as, for `textDocument/typeDefinition`:
@@ -3242,20 +3320,13 @@ private Dsymbol typeDeclSymbol(Type t)
 void typeDefinitionAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref DefLoc out_)
 {
-    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
-    auto target = typeDeclOf(sym);
-    if (!target)
-        return;
-    auto loc = target.loc;
-    const(char)* f = loc.filename();
-    if (!f)
-        return;
-    import core.stdc.string : strlen;
-    out_.found = true;
-    out_.file = arenaDupStr(arena, f[0 .. strlen(f)]);
-    out_.line = loc.linnum();
-    out_.col = loc.charnum();
-    out_.len = target.ident ? target.ident.toString().length : 0;
+    defLocOf(arena, typeDeclOf(resolveSymbolAt(mod, syn, ctx.line, ctx.character, text)), out_);
+}
+
+// The type-declaration target of an already-resolved symbol.
+void typeDefinitionSymbol(Arena* arena, Dsymbol sym, ref DefLoc out_)
+{
+    defLocOf(arena, typeDeclOf(sym), out_);
 }
 
 // ---------- hover ----------
@@ -3343,10 +3414,10 @@ private const(char)[] hdrgenDecl(Arena* a, Dsymbol sym)
     return arenaDupStr(a, buf.opSlice());
 }
 
-void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
-    const(char)[] text, const ref SynMod syn, ref HoverInfo out_)
+// Render hover for an already-resolved symbol (dmd's `resolvedSymbolAt`, or
+// the text-chain resolver's result).
+void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_)
 {
-    auto sym = resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
     if (!sym)
         return;
     // Prefer dmd's own declaration renderer for functions/types/templates/
@@ -3361,6 +3432,12 @@ void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     }
     out_.doc = arenaDupStr(arena, docOf(sym));
     out_.found = out_.detail.length > 0 || out_.doc.length > 0;
+}
+
+void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
+    const(char)[] text, const ref SynMod syn, ref HoverInfo out_)
+{
+    hoverSymbol(arena, resolveSymbolAt(mod, syn, ctx.line, ctx.character, text), out_);
 }
 
 // ---------- entry ----------
