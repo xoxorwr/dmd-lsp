@@ -120,7 +120,7 @@ loads at `initialize` and on save.
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 | `maxWorkers` | `4` | Size of the analysis-worker pool. Each worker keeps one file's dependency graph warm; up to `maxWorkers` roots are held, least-recently-used evicted. Raise it if you switch between many open files and see rebuilds. |
-| `sharedRegistry` | `false` | **Experimental; known to under-report diagnostics — not recommended.** Serves all files from one worker that keeps every loaded module resident (lower memory, no per-root rebuild), but a file already loaded as a dependency is not re-analysed, so errors emitted during that dependency load are not re-reported. See `PLAN2.md` / `docs/reclamation.md`. |
+| `sharedRegistry` | `false` | **Experimental.** Serve all files from one worker that keeps every loaded module resident (lower memory; navigation reuses the whole closure). Diagnostics stay exact: a root is diagnosed by a full analysis in a forked child so the shared registry is untouched (Windows has no fork and falls back to reuse, which can under-report). See `PLAN2.md` / `docs/reclamation.md`. |
 | `maxModules` | `512` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (no partial eviction), so a full rebuild follows. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the

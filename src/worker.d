@@ -2411,8 +2411,17 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 {
                     if (s.sharedReg)
                     {
-                        // Load/analyze the new root on the warm registry
-                        // instead of respawning (PLAN2 Task 2).
+                        // Diagnostics must be exact. A root already resident as
+                        // a dependency has had its semantic skipped, so its
+                        // errors would be missing; run a full analysis in a
+                        // fork child (the parent's shared registry is left
+                        // intact). POSIX only — on Windows `forkRun` fails and
+                        // we fall back to the shared reuse below.
+                        if (forkRun(() {
+                            auto a = serverAnalyze(s, path, text);
+                            sendAnalyze(a);
+                        }))
+                            continue;
                         auto a = serverAnalyzeShared(s, path, text);
                         sendAnalyze(a);
                         built = true;
