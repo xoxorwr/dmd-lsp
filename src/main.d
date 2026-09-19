@@ -68,6 +68,8 @@ struct App
     ulong nextReqId = 0; // ids for our own server->client requests
     bool inlayHints = false; // opt-in (dls.json / editor); off by default
     bool inlayHintsSet = false; // editor/CLI explicitly set it
+    bool autoImports = false; // opt-in: offer not-yet-imported symbols
+    bool autoImportsSet = false; // editor/CLI explicitly set it
     bool clientInlayHint = false; // client supports textDocument/inlayHint
     bool inlayHintRefresh = false; // client supports workspace/inlayHint/refresh
 }
@@ -87,6 +89,8 @@ struct FileConfig
     bool hasDebounce = false;
     bool inlayHints = false;
     bool hasInlayHints = false;
+    bool autoImports = false;
+    bool hasAutoImports = false;
 }
 
 // Monotonic milliseconds (debounce clock; no phobos).
@@ -1215,6 +1219,11 @@ private void applyConfig(App* app, JsonNode* node)
         app.inlayHints = jbool(ih, false);
         app.inlayHintsSet = true;
     }
+    if (auto ai = jget(obj, "autoImports"))
+    {
+        app.autoImports = jbool(ai, false);
+        app.autoImportsSet = true;
+    }
 }
 
 // Workspace root from initialize params: first workspace folder, else
@@ -1378,6 +1387,11 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         fc.hasInlayHints = true;
         fc.inlayHints = jbool(ih, false);
     }
+    if (auto ai = jget(doc, "autoImports"))
+    {
+        fc.hasAutoImports = true;
+        fc.autoImports = jbool(ai, false);
+    }
     // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
     fc.flags = jstrArray(jget(doc, "flags"));
     app.fileCfg = fc;
@@ -1385,6 +1399,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.debounceMs = fc.debounceMs;
     if (!app.inlayHintsSet && fc.hasInlayHints)
         app.inlayHints = fc.inlayHints;
+    if (!app.autoImportsSet && fc.hasAutoImports)
+        app.autoImports = fc.autoImports;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -1393,7 +1409,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
     n.text = "dls.json: " ~ ulongStr(fc.imports.length) ~ " import paths, "
         ~ ulongStr(fc.stringImports.length) ~ " string paths, "
         ~ ulongStr(fc.flags.length) ~ " flags (inlayHints "
-        ~ (app.inlayHints ? "on" : "off") ~ ") from " ~ cfg;
+        ~ (app.inlayHints ? "on" : "off") ~ ", autoImports "
+        ~ (app.autoImports ? "on" : "off") ~ ") from " ~ cfg;
     log("%.*s", cast(int)n.text.length, n.text.ptr);
     foreach (p; fc.imports)
         if (!fileExists(p))
@@ -1411,6 +1428,8 @@ private void clearFileConfig(App* app)
     app.fileCfg = FileConfig.init;
     if (!app.inlayHintsSet)
         app.inlayHints = false;
+    if (!app.autoImportsSet)
+        app.autoImports = false;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -2142,7 +2161,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 // Auto-import: for a bare identifier prefix, offer symbols from
                 // modules the file does not import, inserting the import as an
                 // additional edit.
-                if (prefix.length >= 2 && app.root.length &&
+                if (app.autoImports && prefix.length >= 2 && app.root.length &&
                     posInCode(text, line, col) &&
                     !prefixAfterDot(text, line, col, prefix.length))
                 {

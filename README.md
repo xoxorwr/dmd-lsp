@@ -97,7 +97,11 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
   "importPaths": ["src/", "sandbox/"],
   "stringImportPaths": ["views/"],   // for import("...") files (-J)
   "flags": ["-preview=rvaluerefparam", "-preview=bitfields", "-betterC"],
-  "debounceMs": 500
+  "debounceMs": 500,                 // default: 500
+
+  // Optional features — all off unless you opt in:
+  "inlayHints": false,               // default: false
+  "autoImports": false               // default: false
 }
 ```
 
@@ -105,6 +109,13 @@ Editor `initializationOptions`/settings take the same keys (bare, or under
 `"dmd-lsp"`/`"d"`/`"D"`). Mirrored dmd flags matter: previews change overload
 resolution, so a build that omits one here shows spurious errors. `dls.json`
 loads at `initialize` and on save.
+
+### Opt-in features
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
+| `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is

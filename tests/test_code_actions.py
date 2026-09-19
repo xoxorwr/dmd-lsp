@@ -58,7 +58,8 @@ def drain(t=0.4):
         pass
 
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-      "params": {"rootUri": 'file://' + root, "capabilities": {}}})
+      "params": {"rootUri": 'file://' + root, "capabilities": {},
+                 "initializationOptions": {"autoImports": True}}})
 check('initialize', read_msg() is not None)
 send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
