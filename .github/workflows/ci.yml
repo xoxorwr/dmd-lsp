@@ -17,16 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The vendored frontend is 2.113.0-beta.1. A newer compiler's druntime
+      # (2.113.0 release or rc) does not analyse cleanly under it, while
+      # 2.112.1's does and is still new enough to build the frontend. The
+      # action sets `$DC` (build) and `$DMD` (stdlib for the tests) to it.
       - uses: dlang-community/setup-dlang@v2
         with:
-          compiler: dmd
+          compiler: dmd-2.112.1
 
       - name: Test
         shell: bash
         run: |
           set -euo pipefail
-          # The server derives its stdlib import paths from the dmd executable,
-          # so point DMD at the installed compiler (an absolute path).
-          export DMD="$(command -v dmd)"
           dmd --version
           make check
