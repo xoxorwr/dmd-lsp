@@ -1290,7 +1290,7 @@ private void publishFor(App* app, const(char)[] path, const(char)[] text,
     auto js = jmake();
     auto diags = buildDiagnostics(js, a);
     auto params = js.create_object();
-    js.add_string_to_object(params, "uri", zstr("file://" ~ path.idup));
+    js.add_string_to_object(params, "uri", zstr(pathToUri(path)));
     js.add_item_to_object(params, "diagnostics", diags);
     lspNotify(`"textDocument/publishDiagnostics"`, printJsonStr(params));
     // Precompute tokens from the fresh build *before* the refresh, so the
