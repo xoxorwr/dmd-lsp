@@ -51,14 +51,17 @@ def read_msg(timeout=60):
         data += proc.stdout.read(n - len(data))
     return json.loads(data)
 
-def complete(uri, line, ch):
+def complete_items(uri, line, ch):
     send({"jsonrpc": "2.0", "id": 200, "method": "textDocument/completion",
           "params": {"textDocument": {"uri": uri},
                      "position": {"line": line, "character": ch}}})
     while True:
         m = read_msg()
         if m.get('id') == 200:
-            return [i['label'] for i in m['result']['items']]
+            return m['result']['items']
+
+def complete(uri, line, ch):
+    return [i['label'] for i in complete_items(uri, line, ch)]
 
 send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
       "params": {"rootUri": 'file://' + root, "capabilities": {}}})
@@ -74,8 +77,16 @@ time.sleep(1)
 while read_msg(0.3):
     pass
 
-names = complete(muri, 1, len('import std.st'))
+items = complete_items(muri, 1, len('import std.st'))
+names = [i['label'] for i in items]
 check('import-module-completion', 'std.stdio' in names, str(names[:8]))
+# The edit must replace the whole typed path (`std.st`), not just `st`.
+it = next((i for i in items if i['label'] == 'std.stdio'), None)
+check('import-module-edit',
+      it is not None and it.get('textEdit', {}).get('newText') == 'std.stdio'
+      and it['textEdit']['range']['start'] == {'line': 1, 'character': 7}
+      and it['textEdit']['range']['end'] == {'line': 1, 'character': 13},
+      str(it))
 
 mems = complete(auri, 1, len('import lib : '))
 check('import-selective-completion',

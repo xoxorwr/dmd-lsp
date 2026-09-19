@@ -1649,17 +1649,43 @@ private bool completeImportAndSend(ref ServerState s, const(char)[] text,
     // context is ours.
     if (smod !is null)
         return false;
-    string[] names;
-    ubyte[] kinds;
+    // Module labels are dotted and longer than the token the client would
+    // replace (`rt.str` -> `rt.stream`), so send an explicit textEdit that
+    // replaces the whole typed module path.
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    uint sl = line > 0 ? line - 1 : 0;
+    uint sc = col > 0 ? col - 1 : 0;
+    uint startCol = sc >= mprefix.length ? sc - cast(uint) mprefix.length : 0;
+    bool[string] seen;
     foreach (mn; allModuleNames(s))
-        if (startsWith(mn, mprefix))
-        {
-            names ~= mn.idup;
-            kinds ~= cast(ubyte) 9; // CompletionItemKind.Module
-        }
-    CompleteOut out_;
-    addImportItems(&s.scratch, out_, names, kinds, "module");
-    sendComplete(out_);
+    {
+        if (!startsWith(mn, mprefix) || mn in seen)
+            continue;
+        seen[mn] = true;
+        auto o = js.create_object();
+        js.add_string_to_object(o, "label", zstr(mn));
+        js.add_number_to_object(o, "kind", 9); // CompletionItemKind.Module
+        js.add_string_to_object(o, "detail", "module");
+        auto te = js.create_object();
+        auto range = js.create_object();
+        auto st = js.create_object();
+        js.add_number_to_object(st, "line", sl);
+        js.add_number_to_object(st, "character", startCol);
+        auto en = js.create_object();
+        js.add_number_to_object(en, "line", sl);
+        js.add_number_to_object(en, "character", sc);
+        js.add_item_to_object(range, "start", st);
+        js.add_item_to_object(range, "end", en);
+        js.add_item_to_object(te, "range", range);
+        js.add_string_to_object(te, "newText", zstr(mn));
+        js.add_item_to_object(o, "textEdit", te);
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "items", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
     return true;
 }
 
@@ -3153,6 +3179,11 @@ struct WItem
     string sortText;
     string labelDetail;
     string labelDesc;
+    // Explicit replacement (0-based), for items whose label is longer than the
+    // text the client would replace (e.g. dotted module names).
+    bool hasEdit = false;
+    uint editSl, editSc, editEl, editEc;
+    string editText;
 }
 
 struct WSigParam
@@ -3380,6 +3411,18 @@ ExchangeResult workerComplete(ref Worker w, const(char)[] path, const(char)[] at
             it.sortText = dupOrEmpty(jstr(jget(c, "sortText")));
             it.labelDetail = dupOrEmpty(jstr(jget(c, "labelDetail")));
             it.labelDesc = dupOrEmpty(jstr(jget(c, "labelDesc")));
+            if (auto te = jget(c, "textEdit"))
+            {
+                it.hasEdit = true;
+                auto rg = jget(te, "range");
+                auto st = jget(rg, "start");
+                auto en = jget(rg, "end");
+                it.editSl = cast(uint)jint(jget(st, "line"));
+                it.editSc = cast(uint)jint(jget(st, "character"));
+                it.editEl = cast(uint)jint(jget(en, "line"));
+                it.editEc = cast(uint)jint(jget(en, "character"));
+                it.editText = dupOrEmpty(jstr(jget(te, "newText")));
+            }
             items ~= it;
         }
     }

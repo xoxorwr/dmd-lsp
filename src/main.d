@@ -2258,6 +2258,23 @@ private void handleMessage(App* app, ref RawMsg m)
                             jaddStrOpt(js, j, "detail", it.detail);
                         jaddStrOpt(js, j, "documentation", it.documentation);
                         jaddStrOpt(js, j, "sortText", it.sortText);
+                        if (it.hasEdit)
+                        {
+                            // Explicit replacement (dotted module names etc.).
+                            auto te = js.create_object();
+                            auto rg = js.create_object();
+                            auto st = js.create_object();
+                            js.add_number_to_object(st, "line", it.editSl);
+                            js.add_number_to_object(st, "character", it.editSc);
+                            auto en = js.create_object();
+                            js.add_number_to_object(en, "line", it.editEl);
+                            js.add_number_to_object(en, "character", it.editEc);
+                            js.add_item_to_object(rg, "start", st);
+                            js.add_item_to_object(rg, "end", en);
+                            js.add_item_to_object(te, "range", rg);
+                            js.add_string_to_object(te, "newText", zstr(it.editText));
+                            js.add_item_to_object(j, "textEdit", te);
+                        }
                         js.add_item_to_array(items, j);
                     }
                 }
