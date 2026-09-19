@@ -137,6 +137,7 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_symbols.py
 	python3 tests/test_references.py
 	python3 tests/test_links.py
+	python3 tests/test_imports.py
 	python3 tests/test_rename.py
 	python3 tests/test_inlay_hints.py
 	python3 tests/test_workspace_symbols.py

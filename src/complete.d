@@ -3602,6 +3602,20 @@ private const(char)[] structInitializerType(const(char)[] text, uint line,
     return tn;
 }
 
+// Import-statement completion: emit caller-provided names (module names, or a
+// module's exported top-level members) directly. No analysis; the worker
+// supplies the candidates.
+void addImportItems(Arena* arena, ref CompleteOut out_, const(string)[] names,
+    const(ubyte)[] kinds, const(char)[] detail)
+{
+    bool[const(char)[]] seen;
+    foreach (i, nm; names)
+    {
+        ubyte k = i < kinds.length ? kinds[i] : cast(ubyte) 2;
+        pushItem(arena, out_, nm, k, detail, null, "0", seen, null);
+    }
+}
+
 void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref CompleteOut out_)
 {

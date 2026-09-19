@@ -1513,6 +1513,156 @@ private void typeHierarchyAndSend(ref ServerState s, const ref Analysis a,
     sendTypeItems(uniq);
 }
 
+// ---------- import-statement completion ----------
+
+private bool startsWith(const(char)[] s, const(char)[] prefix)
+{
+    return s.length >= prefix.length && s[0 .. prefix.length] == prefix;
+}
+
+// If the cursor is completing an `import`, report the module-path prefix
+// (module context) or the module + partial member (selective context).
+// Textual: this is completion's own concern, no analysis.
+private bool importContext(const(char)[] text, uint line, uint col,
+    out const(char)[] modulePrefix, out const(char)[] selectModule,
+    out const(char)[] selectPrefix)
+{
+    modulePrefix = null;
+    selectModule = null;
+    selectPrefix = null;
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    size_t cursor = ls;
+    size_t want = col > 0 ? col - 1 : 0;
+    while (cursor < text.length && text[cursor] != '\n' && cursor - ls < want)
+        cursor++;
+    auto lt = text[ls .. cursor];
+    size_t a = 0;
+    while (a < lt.length && (lt[a] == ' ' || lt[a] == '\t'))
+        a++;
+    lt = lt[a .. $];
+    foreach (kw; ["static ", "public "])
+        if (startsWith(lt, kw))
+        {
+            lt = lt[kw.length .. $];
+            break;
+        }
+    if (!startsWith(lt, "import "))
+        return false;
+    lt = lt[7 .. $];
+    size_t k = 0;
+    while (k < lt.length && (isIdChar(lt[k]) || lt[k] == '.'))
+        k++;
+    auto path = lt[0 .. k];
+    size_t r = k;
+    while (r < lt.length && (lt[r] == ' ' || lt[r] == '\t'))
+        r++;
+    if (r < lt.length && lt[r] == ':')
+    {
+        r++;
+        while (r < lt.length && (lt[r] == ' ' || lt[r] == '\t'))
+            r++;
+        selectModule = path;
+        selectPrefix = lt[r .. $];
+        return true;
+    }
+    if (r != lt.length) // trailing tokens: not a plain module path
+        return false;
+    modulePrefix = path;
+    return true;
+}
+
+// Module name of a file under import dir `dir`, or null.
+private string moduleNameOfFile(const(char)[] dir, const(char)[] file)
+{
+    size_t dl = dir.length;
+    while (dl > 0 && (dir[dl - 1] == '/' || dir[dl - 1] == '\\'))
+        dl--;
+    if (file.length <= dl)
+        return null;
+    const(char)[] rel = file[dl .. $];
+    while (rel.length && (rel[0] == '/' || rel[0] == '\\'))
+        rel = rel[1 .. $];
+    size_t e = rel.length;
+    if (e >= 3 && rel[e - 3 .. e] == ".di")
+        e -= 3;
+    else if (e >= 2 && rel[e - 2 .. e] == ".d")
+        e -= 2;
+    rel = rel[0 .. e];
+    size_t bs = e;
+    while (bs > 0 && rel[bs - 1] != '/' && rel[bs - 1] != '\\')
+        bs--;
+    if (rel[bs .. e] == "package")
+    {
+        rel = rel[0 .. bs];
+        while (rel.length && (rel[rel.length - 1] == '/' ||
+            rel[rel.length - 1] == '\\'))
+            rel = rel[0 .. rel.length - 1];
+    }
+    if (!rel.length)
+        return null;
+    string out_;
+    foreach (c; rel)
+        out_ ~= (c == '/' || c == '\\') ? '.' : c;
+    return out_;
+}
+
+private __gshared string[] g_stdModules;
+
+private string[] allModuleNames(ref ServerState s)
+{
+    string[] out_;
+    foreach (fi; g_files)
+        if (fi.moduleName.length)
+            out_ ~= fi.moduleName;
+    if (!g_stdModules.length)
+    {
+        import fsutil : findDFiles;
+        foreach (dir; s.dmd.importPaths)
+            foreach (f; findDFiles(dir))
+            {
+                auto mn = moduleNameOfFile(dir, f);
+                if (mn.length)
+                    g_stdModules ~= mn;
+            }
+    }
+    out_ ~= g_stdModules;
+    return out_;
+}
+
+// Handle an import-statement completion; true when it answered.
+private bool completeImportAndSend(ref ServerState s, const(char)[] text,
+    uint line, uint col)
+{
+    const(char)[] mprefix, smod, sprefix;
+    if (!importContext(text, line, col, mprefix, smod, sprefix))
+        return false;
+    // `import m : ` is handled semantically by `completeAt` (its
+    // `selectiveImportAt`, incl. public re-exports); only the module-list
+    // context is ours.
+    if (smod !is null)
+        return false;
+    string[] names;
+    ubyte[] kinds;
+    foreach (mn; allModuleNames(s))
+        if (startsWith(mn, mprefix))
+        {
+            names ~= mn.idup;
+            kinds ~= cast(ubyte) 9; // CompletionItemKind.Module
+        }
+    CompleteOut out_;
+    addImportItems(&s.scratch, out_, names, kinds, "module");
+    sendComplete(out_);
+    return true;
+}
+
 // ---------- document links ----------
 
 struct WLink
@@ -2086,6 +2236,10 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 auto prefix = jstr(jget(p, "prefix"));
                 if (prefix is null)
                     prefix = "";
+                // Import-statement completion is textual: module names, or a
+                // module's members after `import m : `.
+                if (completeImportAndSend(s, orig, line, col))
+                    continue;
                 // Keyed on the analysis text only, never the document
                 // identity: while a member name grows, the neutralised buffer
                 // is unchanged and the warm universe already answers it, so

@@ -927,6 +927,33 @@ private void classBodyInsert(const(char)[] text, uint fromLine, out uint line,
     }
 }
 
+// Cheap check that the cursor line is an `import` statement, so module/member
+// completion can ensure the workspace index first.
+private bool lineIsImport(const(char)[] text, uint line)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t e = i;
+    while (e < text.length && text[e] != '\n')
+        e++;
+    auto lt = text[i .. e];
+    size_t a = 0;
+    while (a < lt.length && (lt[a] == ' ' || lt[a] == '\t'))
+        a++;
+    lt = lt[a .. $];
+    if (lt.length >= 7 && lt[0 .. 7] == "static ")
+        lt = lt[7 .. $];
+    else if (lt.length >= 7 && lt[0 .. 7] == "public ")
+        lt = lt[7 .. $];
+    return lt.length >= 6 && lt[0 .. 6] == "import";
+}
+
 // True when the identifier prefix ending at 1-based (line,col) follows a `.`
 // (member access), where an add-import would be wrong.
 private bool prefixAfterDot(const(char)[] text, uint line, uint col, size_t plen)
@@ -2205,6 +2232,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 // so semantic survives. Chain/positions come from `text`.
                 string atext = analysisText(text, line, col);
                 auto prefix = extractPrefix(text, line, col);
+                if (lineIsImport(text, line))
+                    ensureIndex(app); // module/member completion needs it
                 worker.WItem[] witems;
                 if (workerCompleteRetry(app, path, atext, text, line, col, prefix, witems))
                 {

@@ -476,11 +476,12 @@ send({"jsonrpc": "2.0", "id": 121, "method": "textDocument/completion",
                  "position": {"line": 1, "character": 16}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
 check('selective-import-all', 'Cfg' in labels and 'globalCfg' in labels, str(labels))
+# Module-name completion after `import `: the workspace index supplies `autolib`.
 send({"jsonrpc": "2.0", "id": 122, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": seluri},
                  "position": {"line": 1, "character": 10}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('import-module-no-complete', labels == [], str(labels))
+check('import-module-completion', 'autolib' in labels, str(labels[:8]))
 
 # Module-qualified completion: `import nm.a;` -> `nm.` / `nm.a.`
 mquri = open_doctype('modqual.d',
