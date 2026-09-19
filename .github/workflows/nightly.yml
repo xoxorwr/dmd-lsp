@@ -1,8 +1,7 @@
 name: nightly
 
-# Rolling nightly binaries for the VS Code extension. Published as a
-# prerelease tagged `nightly` with stable asset names, so the client can
-# always fetch:
+# Rolling binaries for the VS Code extension. Published as a prerelease
+# tagged `nightly` with stable asset names, so the client can always fetch:
 #   https://github.com/<owner>/<repo>/releases/download/nightly/<asset>
 # Assets:
 #   dmd-lsp-linux-x64.tar.gz
@@ -11,12 +10,9 @@ name: nightly
 #   dmd-lsp-win-x64.zip
 #   dmd-lsp.vsix
 #   SHA256SUMS
+# Manual only: run it from the Actions tab or `gh workflow run nightly.yml`.
 
 on:
-  push:
-    branches: [master]
-  schedule:
-    - cron: "0 6 * * *" # 06:00 UTC daily
   workflow_dispatch:
 
 permissions:
