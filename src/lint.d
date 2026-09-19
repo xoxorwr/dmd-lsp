@@ -474,8 +474,9 @@ void lintUnusedParams(Arena* arena, Module mod, const(char)[] path, const(char)[
             {
                 UnusedHit hit;
                 hit.path = path.idup;
-                hit.line = sl;
-                hit.col = 1;
+                // Point at the parameter's declaration, not the function start.
+                hit.line = v.loc.linnum() >= 1 ? v.loc.linnum() : sl;
+                hit.col = v.loc.charnum() >= 1 ? v.loc.charnum() : 1;
                 hit.kind = 1;
                 hit.name = pn.idup;
                 pushHit(arena, out_, hit);

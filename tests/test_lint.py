@@ -115,6 +115,23 @@ check('param-still-hinted', any('unused parameter' in m for m in diags),
       str(diags))
 d.close()
 
+# The unused-parameter hint must point at the parameter, not the line start.
+d2 = Daemon(['--debounce-ms=0'])
+r2 = tempfile.mkdtemp(prefix='dmd-lsp-lint2-')
+p2 = os.path.join(r2, 'u.d')
+d2.init(r2)
+d2.send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": 'file://' + p2, "languageId": "d",
+                                     "version": 1,
+                                     "text": 'module u;\nvoid f(int unusedParam) {}\n'}}})
+hit = next((x for x in d2.read_msg()['params']['diagnostics']
+            if x.get('code') == 'unused-param'), None)
+check('unused-param-range',
+      hit is not None and hit['range']['start'] == {'line': 1, 'character': 11},
+      str(hit))
+d2.close()
+
 shutil.rmtree(root, ignore_errors=True)
+shutil.rmtree(r2, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)
