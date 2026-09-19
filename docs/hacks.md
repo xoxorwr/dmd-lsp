@@ -235,7 +235,11 @@ closed document falls back to disk). `src/dmdwrap.d` keeps the overlay in a
 worker-global `g_docMirror` that **survives resets** and re-installs it from
 `dmdResetRequest`; `universeDepsChanged` compares a mirrored dep against the
 mirror hash and everything else against disk, so an unsaved edit invalidates
-the warm universe exactly like a disk change would.
+the warm universe exactly like a disk change would. Dep hashes go through
+`depHash`, which ignores a trailing NUL: mirrored buffers are NUL-terminated
+(like the root parse) while disk reads are not, and hashing verbatim made
+opening a dependency flip its hash and respawn the worker on the next
+completion.
 
 ### Why it is a hack
 

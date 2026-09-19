@@ -853,7 +853,7 @@ void universeRecord(ref DepRec[] deps, const(char)[] rootPath)
         string p = m.srcfile.toString().idup;
         if (p == rootPath)
             continue;
-        deps ~= DepRec(p, fnv1a64(cast(const(ubyte)[])m.src));
+        deps ~= DepRec(p, depHash(cast(const(ubyte)[])m.src));
     }
 }
 
@@ -869,7 +869,7 @@ bool universeDepsChanged(const DepRec[] deps)
     {
         if (auto mv = d.path in g_docMirror)
         {
-            if (fnv1a64(*mv) != d.hash)
+            if (depHash(*mv) != d.hash)
                 return true;
             continue;
         }
@@ -886,6 +886,20 @@ bool universeDepsChanged(const DepRec[] deps)
 // FileManager) and reapplies it after every reset. dmd then reads a dependency
 // that is open in the editor as the unsaved buffer, not stale disk bytes.
 private __gshared const(ubyte)[][string] g_docMirror;
+
+// Content hash of a source buffer, ignoring a trailing NUL. Mirrored buffers
+// are NUL-terminated (like the root parse) while disk reads are not, so
+// hashing verbatim made opening a dependency flip its hash and spuriously
+// invalidate the warm universe — respawning the worker per keystroke.
+private ulong depHash(const(ubyte)[] b)
+{
+    import session : fnv1a64;
+
+    auto s = b;
+    if (s.length && s[$ - 1] == 0)
+        s = s[0 .. $ - 1];
+    return fnv1a64(s);
+}
 
 void dmdSetDoc(const(char)[] path, const(char)[] text)
 {
