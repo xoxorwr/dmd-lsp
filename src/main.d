@@ -1623,6 +1623,9 @@ private void handleMessage(App* app, ref RawMsg m)
             return;
         if (m.method == "exit")
         {
+            // C `exit` skips `scope (exit)`, so kill the worker explicitly;
+            // otherwise an orphaned child keeps the client's pipes open.
+            dropWorker(app);
             import core.stdc.stdlib : exit;
             exit(app.shutdownRequested ? 0 : 1);
         }

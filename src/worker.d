@@ -2064,6 +2064,10 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
         // when this process exits.
         SetHandleInformation(toChildW, HANDLE_FLAG_INHERIT, 0);
         SetHandleInformation(fromChildR, HANDLE_FLAG_INHERIT, 0);
+        // Nor the LSP transport: an orphaned worker holding this process's
+        // stdout would keep the client's pipe open and the server "running".
+        SetHandleInformation(GetStdHandle(STD_INPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
         STARTUPINFOA si;
         si.cb = STARTUPINFOA.sizeof;
         si.dwFlags = STARTF_USESTDHANDLES;
