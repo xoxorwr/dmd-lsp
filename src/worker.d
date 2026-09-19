@@ -2062,6 +2062,10 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
             CloseHandle(toChildR); CloseHandle(toChildW);
             return false;
         }
+        // Don't inherit the parent's pipe ends, so the worker sees stdin EOF
+        // when this process exits.
+        SetHandleInformation(toChildW, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(fromChildR, HANDLE_FLAG_INHERIT, 0);
         STARTUPINFOA si;
         si.cb = STARTUPINFOA.sizeof;
         si.dwFlags = STARTF_USESTDHANDLES;
