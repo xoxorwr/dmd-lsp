@@ -185,17 +185,16 @@ bool fileExists(const(char)[] p)
     else
     {
         import core.sys.windows.winbase : GetFileAttributesA;
-        import core.sys.windows.winnt : DWORD, INVALID_FILE_ATTRIBUTES,
-            FILE_ATTRIBUTE_DIRECTORY;
+        import core.sys.windows.winnt : DWORD, INVALID_FILE_ATTRIBUTES;
 
         if (p.length + 1 >= 4096)
             return false;
         char[4096] buf;
         buf[0 .. p.length] = p[];
         buf[p.length] = 0;
-        DWORD a = GetFileAttributesA(buf.ptr);
-        return a != INVALID_FILE_ATTRIBUTES &&
-            (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        // Like access(F_OK): files and directories both exist. Import paths
+        // are directories, so excluding them here hides valid configs.
+        return GetFileAttributesA(buf.ptr) != INVALID_FILE_ATTRIBUTES;
     }
 }
 
