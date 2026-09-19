@@ -57,9 +57,9 @@ supply, and the checklist to re-run on every dmd bump are in
 The universe records which buffer it parsed (`analysisHash`) and which
 document version it was keyed to (`rootHash`): that decides whether a request
 is served from the warm universe (`reuse`), re-parsed in place
-(`incremental`) or rebuilt (`miss`). A neutralised (completion) parse and a
-real (diagnostics/semantic) parse share the one universe. See *Neutralised
-variants*.
+(`incremental`) or rebuilt (`miss`). Completion does not participate in this
+classification: it reads the per-root cache the debounce leaves behind (see
+*Completion never analyses*).
 
 ## Semantic pipeline
 
@@ -72,8 +72,9 @@ variants*.
   public/export re-exports) and unused params (declare-before-use counting;
   skips `out` params, generated `__param_N`, files with errors).
 - Completion merges a pre-semantic structure snapshot (function ranges,
-  local names — immune to `ErrorStatement` rewrites) with semantic types;
-  unresolved identifier types resolve via scope lookup.
+  local names — immune to `ErrorStatement` rewrites) with semantic types from
+  the cached analysis (H5 keeps the body usable); unresolved identifier types
+  resolve via scope lookup. It never builds.
 - Semantic tokens (`semanticTokens/full`) lex identifiers, resolve each
   through the same symbol machinery as goto-definition, and walk the symbol
   tree for declaration names the use-pass can't reach (fields, enum
@@ -93,18 +94,14 @@ variants*.
   *before* it sends `workspace/semanticTokens/refresh`, so the client's
   re-pull is a pure cache hit — the editor never waits on a scan/resolve.
   So the debounce governs analysis even though tokens are pulled eagerly.
-  Token resolution requires a universe built from the real text
-  (`serverWouldHitAnalysis`), never a completion placeholder: the
-  placeholder is a neutralised buffer with synthetic `__dmd_lsp_ph` code,
-  and resolving against it would make highlighting depend on completion
-  request order. The cost is one extra build when a placeholder completion
-  precedes a token pull; the precompute above absorbs it during the idle
-  flush. Locals the pre-semantic snapshot knows but semantic dropped (a
-  body collapsed by a syntax error) are classified from the snapshot, so
-  the real, potentially-invalid buffer still highlights. The snapshot also
-  recovers an `auto` local's constructed type from its initializer
-  (`auto q = Point(...)`, `new Point(...)`, `auto s = factory!(State)()`),
-  so member access above the error keeps its `property`/`method` colour.
+  Token resolution runs against the universe built from the real text, so
+  highlighting never depends on completion request order. Locals the
+  pre-semantic snapshot knows but semantic dropped are classified from the
+  snapshot, so the real, potentially-invalid buffer still highlights. The
+  snapshot also recovers an `auto` local's constructed type from its
+  initializer (`auto q = Point(...)`, `new Point(...)`,
+  `auto s = factory!(State)()`), so member access above the error keeps its
+  `property`/`method` colour.
 - dmd's message-kind output is rerouted to stderr: it
   bypasses `DiagnosticHandler` straight to stdout, which would corrupt LSP
   framing. `initDMD` leaves the lexer identifier tables unset (stock sets
@@ -121,37 +118,43 @@ is served with zero dmd work; the residual cost is piping the document in. A
 (evict root, re-analyze it in place on the warm closure), see *Memory model*. A miss for any other reason (different
 root, config generation, dep bytes) replies `needRespawn`.
 
-Deps are fingerprinted from disk bytes, so unsaved dep edits are not seen
-until save — never stale results, but a dep edit in an open doc does not
-invalidate the closure until it is saved. Dep changes are noticed on the
-dependent's next analysis (no file watching); a same-text `didChange` still
-marks pending for exactly that reason.
+Deps are fingerprinted from the bytes dmd consumed (`Module.src`): disk bytes
+for an unopened file, and the pushed **open-doc mirror** for a draft (H4,
+[hacks.md](hacks.md#h4-filemanagersetfilecontents--replaceable-file-contents-open-doc-mirror)),
+so an unsaved dependency edit invalidates the closure immediately. A same-text
+`didChange` still marks pending, so a change on disk under an open buffer is
+re-checked.
 
-### Neutralised variants
+### Completion never analyses
 
-dmd collapses a whole function body to one `ErrorStatement` on any statement
-error, wiping every local's inferred `auto` type. To keep completion working
-while typing, the request is analysed against a **neutralised variant** of the
-buffer: a partial member after a dot has its whole segment replaced with
-`__dmd_lsp_ph()` plus an appended unconstrained UFCS template; a lone partial
-identifier is dropped; a partial identifier after other code (`auto x = st`)
-or an unfinished call/array argument blanks its statement. The last two make
-the parsed text identical for every prefix length, so a whole word costs one
-build, not one per keystroke. Import/module lines are never blanked — their
-path/selective lists drive completion from the AST.
+Completion answers from the **warm universe**, never by re-parsing the buffer
+mid-typing. The worker keeps a per-root cache (`ServerState.roots`, path → the
+last `Analysis` of that file), written by every open/save/debounce analysis. The
+`complete` op looks the document's path up there and completes against it — it
+touches no semantic state and forks no child. A document with no cached
+analysis highlights/decorates as empty rather than forcing a build.
 
-The universe records both hashes (`Universe.rootHash` = document identity,
-`Universe.analysisHash` = what was parsed). `serverWouldHit` matches on
-identity (diagnostics, hover, definition, signature, semantic);
-`serverWouldHitAnalysis` matches on the analysis text (completion). Because
-`s.a`, `s.ab`, `s.abc` all neutralise to the same buffer, completion reuses
-one universe while a member name grows; it also refreshes `rootHash` to the
-current document version, so the debounced analyze for the same text hits
-that universe instead of rebuilding the real one. The cursor and prefix still
-come from the real text, so filtering is live. Placeholder diagnostics are
-rewritten back to document columns (`mapFixDiags`). `tests/test_spawn.py`,
-`test_completion_prefix.py`, `test_completion_burst.py` and
-`test_realworld.py` lock the spawn accounting in.
+The one freshness cost is a **debounce**: as-you-type completion can be one idle
+cycle behind the last edit. That is invisible in practice because a member name
+growing after a dot does not change the enclosing declarations, and it is the
+price of removing the per-keystroke process. `tests/test_realworld.py` locks the
+spawn accounting, and `tests/test_spawn.py` waits for the flush before asserting
+an edit is reflected.
+
+Keeping bodies of a broken buffer usable is H5
+([hacks.md](hacks.md#h5-lspkeeperroredbodies--keep-a-body-past-a-broken-statement)):
+`visitCompound` no longer discards the whole function on the first bad
+statement, so the real-text analysis keeps the function's scope. Neutralisation
+still exists and is still used by **signature help** (and `mapFixDiags` rewrites
+placeholder columns back): the request is analysed against a variant of the
+buffer where a partial member after a dot is replaced with `__dmd_lsp_ph()`
+plus an appended unconstrained UFCS template. Completion no longer uses it.
+
+The debounce itself refreshes the universe: re-parse the edited root in place
+(`serverAnalyzeIncremental`) when it is the live universe's root, otherwise warm
+the shared registry (`serverAnalyzeShared`, or a full `serverAnalyze` when a
+dependency changed). For the pool (`sharedRegistry: false`) the same logic runs
+against the worker's single universe.
 
 ## Request loop
 
@@ -161,14 +164,11 @@ abort point, so debouncing is the cancellation story. The default is 500 ms
 (`--debounce-ms`, `dls.json`, editor setting): a fixed debounce only coalesces
 keystrokes whose gap is *below* it, and a realistic typing cadence has
 300–500 ms thinking pauses, so 300 ms analysed most characters individually.
-The idle clock is restarted *after* each message is handled, so a slow request
-(a completion's build) can't make the debounce look elapsed the instant
-it returns and trigger a flush between keystrokes. Typing with the suggest
-widget open never relies on the debounce at all: completion neutralises the
-partial token, so the flush hits the same universe (see *Neutralised
-variants*). Each pending path is always unmarked by
-the flush, even on failure — a pending path that survives makes the idle loop
-retry it immediately (timeout 0). stdin runs
+The idle clock is restarted *after* each message is handled. The debounced
+analysis is the only thing that advances the semantic universe; completion
+reads the cache it leaves behind (see *Completion never analyses*). Each
+pending path is always unmarked by the flush, even on failure — a pending path
+that survives makes the idle loop retry it immediately (timeout 0). stdin runs
 unbuffered so kernel pipe state (what `poll` observes) and stdio agree; mixing
 `poll` with buffered stdio silently strands messages in the userspace buffer.
 Semantic pulls during an edit are served from the token cache; the debounced
@@ -176,7 +176,7 @@ build precomputes the new set before its `workspace/semanticTokens/refresh`.
 
 ## Status
 
-Verified by `make check` (141 assertions across the LSP, semantic-token,
+Verified by `make check` (377 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
 debounce, config and memory suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):

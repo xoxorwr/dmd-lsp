@@ -2457,9 +2457,30 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     text = "";
                 // Parse-only, registration-free (H3): touches neither the live
                 // universe nor any shared state, so it runs inline — no fork,
-                // no respawn, same on Windows.
+                // no respawn, same on Windows. Published diagnostics stay
+                // parse-only (semantic errors are a save/open concern).
                 auto a = serverLint(s, path, text);
                 sendAnalyze(a);
+                // Analysis is debounce-only now: completion never re-analyzes,
+                // so this idle pass is the one place that refreshes the warm
+                // semantic universe behind the per-root cache. Re-parse the
+                // edited root in place when it is the live universe's root
+                // (cheap, exact, keeps the dependency closure); otherwise warm
+                // the shared registry. Its result is never sent.
+                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
+                if (st == UniState.incremental)
+                    serverAnalyzeIncremental(s, path, text, null);
+                else if (st != UniState.reuse)
+                {
+                    if (s.sharedReg)
+                        serverAnalyzeShared(s, path, text);
+                    else
+                        serverAnalyze(s, path, text);
+                    // A resident root skips semantic errors, so this warm is
+                    // not a valid diagnostics source for a later open/save.
+                    s.uni.valid = false;
+                }
+                built = true;
                 continue;
             }
             if (ops == "complete")
@@ -2482,43 +2503,21 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (completeVersionAndSend(s, orig, line, col))
                     continue;
-                // Keyed on the analysis text only, never the document
-                // identity: while a member name grows, the neutralised buffer
-                // is unchanged and the warm universe already answers it, so
-                // matching on the document (which did move) would be a false
-                // reuse of the wrong analysis.
-                auto st = built ? serverUniState(s, path, null, atext) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a2 = serverAnalyzeIncremental(s, path, atext, orig);
-                    completeAndSend(s, a2, orig, line, col, prefix);
-                }))
-                    continue;
-                if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                }
-                Analysis a;
-                if (built)
-                {
-                    // Record the current document version so the debounced
-                    // keypress analyze reuses this universe (cheap) instead of
-                    // forking. open/save pass realOnly and get the real text.
-                    import session : fnv1a64;
-                    s.uni.rootHash = fnv1a64(cast(const(ubyte)[])orig);
-                    s.scratch.rewind(s.uni.mark);
-                    a = s.uni.analysis;
-                }
+                // Completion NEVER analyses: it answers from the warm universe
+                // (the last debounced analysis). The debounce refreshes it, so
+                // as-you-type completion is best-effort on declarations that may
+                // be one debounce old — invisible in practice and far cheaper
+                // than re-analysing the file on every keystroke. No request here
+                // touches the semantic universe or forks.
+                // Per-root cache: the last analysis of *this* file (from
+                // open/save/the debounce).
+                if (auto c = path.idup in s.roots)
+                    completeAndSend(s, *c, orig, line, col, prefix);
                 else
                 {
-                    a = serverAnalyze(s, path, atext, orig);
+                    Analysis none;
+                    completeAndSend(s, none, orig, line, col, prefix);
                 }
-                completeAndSend(s, a, orig, line, col, prefix);
-                built = true;
                 continue;
             }
             if (ops == "signature")

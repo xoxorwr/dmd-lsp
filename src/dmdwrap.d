@@ -718,6 +718,12 @@ void dmdInit(ref DmdState st)
     };
     FatalErrorHandler f = () { return onFatal(); };
     initDMD(h, f);
+    // H5: keep function bodies past a broken statement (hacks.md), so a
+    // half-typed line does not blank the whole scope for completion.
+    {
+        import dmd.statementsem : lspKeepErroredBodies;
+        lspKeepErroredBodies = true;
+    }
     global.errorSink.errorLimit = 0; // unlimited; daemon must survive error storms
     // initDMD leaves the identifier tables unset (stock sets them from CLI
     // flags in main.d); without them any non-ASCII identifier segfaults the

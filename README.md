@@ -133,10 +133,13 @@ loads at `initialize` and on save.
 `dmd-lsp` runs the real dmd frontend in a worker process. By default a single
 worker keeps every loaded module resident, so an edit re-analyses only the
 changed file on top of the shared closure — switching between files does not
-start anything new. When a dependency or the configuration changes, or the
-`maxModules` cap is exceeded, the worker is rebuilt (the OS reclaims the old
-state). With `sharedRegistry: false` it instead runs a pool of up to
-`maxWorkers` per-file workers, least-recently-used evicted.
+start anything new. Analysis is **debounce-only**: a keystroke never builds;
+the worker caches each file's last analysis and completion answers from that
+warm cache, so an open suggest widget costs no process and no re-parse. When a
+dependency or the configuration changes, or the `maxModules` cap is exceeded,
+the worker is rebuilt (the OS reclaims the old state). With
+`sharedRegistry: false` it instead runs a pool of up to `maxWorkers` per-file
+workers, least-recently-used evicted.
 
 Details: [docs/design.md](docs/design.md).
 

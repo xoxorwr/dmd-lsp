@@ -2408,15 +2408,31 @@ private void collectSlots(Module mod, const ref SynMod syn, uint line,
         synVd[vl.name] = cast(VarDeclaration) vl.vd;
     }
     foreach (name, tn; synType)
-        if (!has(name))
-        {
-            // dmd resolved `.type` on the same node, even if a later
-            // statement error collapsed the body; prefer it over the
-            // pre-semantic spelling.
-            auto vd = synVd[name];
-            Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
-            slots ~= NameType(name, t, tn, vd);
-        }
+    {
+        // A semantic slot whose resolved type errored (Terror: the declaration
+        // was rewritten by a bad statement in the body) keeps the pre-semantic
+        // spelling, so a dotted chain can still resolve the type by name.
+        auto vd = synVd[name];
+        bool merged = false;
+        foreach (ref sl; slots)
+            if (sl.name == name)
+            {
+                merged = true;
+                if ((!sl.type || sl.type.ty == TY.Terror) && tn.length)
+                {
+                    if (!sl.typeName.length)
+                        sl.typeName = tn;
+                }
+                break;
+            }
+        if (merged)
+            continue;
+        // dmd resolved `.type` on the same node, even if a later
+        // statement error collapsed the body; prefer it over the
+        // pre-semantic spelling.
+        Type t = vd && vd.type && vd.type.ty != TY.Terror ? vd.type : null;
+        slots ~= NameType(name, t, tn, vd);
+    }
     // Implicit `this`: the enclosing aggregate's members are in scope inside a
     // member function (or the aggregate body) even though they are not locals.
     // Locals already collected above win by name, matching D shadowing.

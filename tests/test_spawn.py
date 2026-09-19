@@ -108,11 +108,14 @@ check('definition-reuses',
       dfn is not None and dfn[0]['range']['start']['line'] == 1, str(dfn))
 
 # A semantic root edit must be picked up by the in-place re-parse: the added
-# field has to show up.
+# field has to show up. Analysis is debounce-only now, so the edit lands on the
+# idle flush; completion reflects it after that (it never triggers a build).
 v2 = v1.replace('int y; }', 'int y; int z; }')
 send({"jsonrpc": "2.0", "method": "textDocument/didChange",
       "params": {"textDocument": {"uri": URI, "version": 3},
                  "contentChanges": [{"text": v2}]}})
+time.sleep(0.6)  # let the debounced analysis land
+msg = read_msg()  # publishDiagnostics from the flush
 send({"jsonrpc": "2.0", "id": 6, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": URI}, "position": {"line": 5, "character": 6}}})
 while True:

@@ -31,6 +31,7 @@ struct ServerState
     bool sharedReg; // opt-in shared module registry (PLAN2 Task 2)
     size_t maxModules = 2048; // registry cap; over it the worker respawns
     bool overCap; // set when the registry crossed the cap
+    Analysis[string] roots; // per-root analysis cache (path -> analysis)
 }
 
 // dmd's message-kind diagnostics bypass DiagnosticHandler and write to
@@ -325,8 +326,10 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     // resident in the registry may be stale, so rebuild properly instead of
     // reusing them. Shared-registry equivalent of a respawn, minus the restart.
     // Checked before the stdout guard so the early return into `serverAnalyze`
-    // cannot leave fd 1 redirected to stderr.
-    if (s.uni.valid && universeDepsChanged(s.uni.deps))
+    // cannot leave fd 1 redirected to stderr. Deps are checked even when the
+    // live-universe hit flag is off (the debounce invalidates it after warming
+    // the per-root cache, but its dep fingerprints stay valid).
+    if (universeDepsChanged(s.uni.deps))
         return serverAnalyze(s, path, text, identity);
     Analysis a;
     StdoutGuard og;
@@ -395,6 +398,7 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     s.uni.valid = true;
     if (Module.amodules.length > s.maxModules)
         s.overCap = true;
+    s.roots[path.idup] = a;
     return a;
 }
 
@@ -447,6 +451,7 @@ Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     s.uni.configGen = s.dmd.configGen;
     s.uni.mark = s.scratch.mark();
     s.uni.analysis = a;
+    s.roots[path.idup] = a;
     return a;
 }
 
@@ -516,6 +521,10 @@ Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text
     s.uni.mark = s.scratch.mark();
     s.uni.analysis = a;
     dmdLocCheckpoint(s.uni.locTableLen, s.uni.locIndex);
+    // A full reset drops every previously parsed module, so the per-root cache
+    // (which holds module pointers) is now entirely stale.
+    s.roots = null;
+    s.roots[path.idup] = a;
     // Reclaim dmd GC garbage so the daemon stays flat.
     GC.collect();
     return a;

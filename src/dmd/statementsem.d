@@ -15,6 +15,11 @@ module dmd.statementsem;
 
 import core.stdc.stdio;
 
+// Hack H5 (docs/hacks.md): when set by the consumer, a child statement error
+// does not discard the enclosing compound/function body, so a language server
+// can keep analysing (diagnostics, completion, scopes) past one bad statement.
+__gshared bool lspKeepErroredBodies;
+
 import dmd.aggregate;
 import dmd.arrayop;
 import dmd.arraytypes;
@@ -503,15 +508,26 @@ Statement statementSemanticVisit(Statement s, Scope* sc)
          */
         flattenStatements(cs.statements);
 
-        foreach (s; cs.statements)
+        if (lspKeepErroredBodies)
         {
-            if (!s)
-                continue;
-
-            if (auto se = s.isErrorStatement())
+            // H5: neutralise bad statements and keep the body instead of
+            // replacing the whole compound with one ErrorStatement.
+            foreach (ref s; cs.statements)
+                if (s && s.isErrorStatement())
+                    s = new ExpStatement(s.loc, cast(Expression) null);
+        }
+        else
+        {
+            foreach (s; cs.statements)
             {
-                result = se;
-                return;
+                if (!s)
+                    continue;
+
+                if (auto se = s.isErrorStatement())
+                {
+                    result = se;
+                    return;
+                }
             }
         }
 

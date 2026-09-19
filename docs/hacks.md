@@ -256,6 +256,58 @@ is edited unsaved (it resolves from disk without the overlay).
 
 ---
 
+## H5. `lspKeepErroredBodies` — keep a body past a broken statement
+
+**Files**: `src/dmd/statementsem.d` (global + `visitCompound`)
+**Consumer**: `src/dmdwrap.d` (`dmdInit` sets it)
+**Tests**: `tests/test_realworld.py` (`typing-completion-items`),
+`tests/test_completion_scope.py`, `tests/test_recovery_scope.py`
+**Status**: not upstreamable.
+
+### Problem
+
+`statementSemanticVisit`'s `visitCompound` flattens a compound and, on the
+first child that semantically fails (an `ErrorStatement`), **replaces the whole
+compound with that one error** and returns. So a single bad statement – exactly
+what a half-typed line is – discards the entire enclosing function body.
+
+A language server analysing the real, unsaved buffer loses the function's
+locals, scopes and `with`/`foreach` structure the moment the user is mid-edit.
+Previously the server papered over this by re-analysing a *neutralised* buffer
+on every completion request, which is the per-keystroke cost this hack removes.
+
+### Hack
+
+A process-global `__gshared bool lspKeepErroredBodies` in `dmd.statementsem`
+(default `false`). When set, `visitCompound` does not collapse: it walks the
+statements, replaces each `ErrorStatement` with a no-op
+`new ExpStatement(s.loc, cast(Expression) null)`, and keeps the body. The
+function's scope survives, so the warm real-text analysis can answer
+completion. `dmdInit` sets it once at startup.
+
+```d
+// src/dmdwrap.d (dmdInit)
+import dmd.statementsem : lspKeepErroredBodies;
+lspKeepErroredBodies = true;
+```
+
+### Why it is a hack
+
+Error recovery that deliberately keeps semantically broken bodies is the wrong
+default for a compiler (it hides errors), and it changes what semantic leaves
+behind. It is only wanted by a consumer that must stay useful while the buffer
+does not compile.
+
+### Keeping it honest
+
+`src/dmdwrap.d` imports `lspKeepErroredBodies`, so a `make vendor` that drops
+the global is a **compile error**. `tests/test_realworld.py`
+(`typing-completion-items`) completes a member chain on a struct local in a
+function whose next line is a dangling `w.assets.`: it yields nothing if the
+body is collapsed away.
+
+---
+
 ## Adding a hack
 
 1. Keep it as small and self-contained as possible; put the toggle in the
