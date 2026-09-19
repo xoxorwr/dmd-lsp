@@ -241,26 +241,48 @@ extern (C++) final class HintWalker : SemanticTimeTransitiveVisitor
             col = cast(uint) start;
     }
 
-    // Call argument names, when not obvious.
+    // True when the argument at (line, col) is a *named* argument, i.e. the
+    // source right before it is `name:`. dmd drops the labels during semantic
+    // (`CallExp.names` is null), so this is read back from the source. The
+    // argument start is the value expression, so a `:` immediately before it
+    // can only be a named-argument label.
+    private bool isNamedArg(uint line, uint col)
+    {
+        if (line >= lineStarts.length)
+            return false;
+        size_t ls = lineStarts[line];
+        size_t i = ls + col;
+        while (i > ls && (text[i - 1] == ' ' || text[i - 1] == '\t'))
+            i--;
+        return i >= ls + 2 && text[i - 1] == ':' && identChar(text[i - 2]);
+    }
+
+    // Call argument names, when not obvious. Named arguments already carry
+    // their label in the source and are skipped; positional arguments map to
+    // the parameters in order (`f(1, y: 2)` -> `x:`, `f(y: 2, x: 1)` -> none).
     override void visit(CallExp e)
     {
         auto fd = e.f ? e.f.isFuncDeclaration() : null;
         auto tf = fd && fd.type ? fd.type.isTypeFunction() : null;
         if (tf && tf.parameterList.parameters && e.arguments)
         {
-            size_t nparam = (*tf.parameterList.parameters).length;
-            size_t startArg = e.isUfcsRewrite ? 1 : 0; // skip the receiver
+            auto plist = tf.parameterList.parameters;
+            size_t nparam = (*plist).length;
+            size_t pos = e.isUfcsRewrite ? 1 : 0; // receiver fills parameter 0
             foreach (i, arg; *e.arguments)
             {
-                if (i < startArg || !arg)
-                    continue;
-                if (i >= nparam)
-                    break;
-                auto p = (*tf.parameterList.parameters)[i];
-                if (!p || !p.ident || obviousArg(arg, p.ident))
+                if (!arg || (e.isUfcsRewrite && i == 0))
                     continue;
                 uint aline, acol;
                 argStart(arg, aline, acol);
+                if (isNamedArg(aline, acol))
+                    continue; // the label is already written
+                if (pos >= nparam)
+                    break;
+                auto p = (*plist)[pos];
+                pos++;
+                if (!p || !p.ident || obviousArg(arg, p.ident))
+                    continue;
                 out_ ~= InlayHint(aline, acol,
                     cast(const(char)[]) (p.ident.toString() ~ ":"),
                     false, true);

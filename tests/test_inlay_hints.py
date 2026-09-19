@@ -65,6 +65,13 @@ TEXT = ('module m;\n'
         '    takeBox(Box!int());\n'
         '    g(a, 5);\n'
         '    g(makeData(), makeT!(int)(1));\n'
+        '}\n'
+        'void named(int alpha, int beta) {}\n'
+        'void f2()\n{\n'
+        '    int v1 = 1; int v2 = 2;\n'
+        '    named(v1, beta: v2);\n'
+        '    named(alpha: v1, beta: v2);\n'
+        '    named(beta: v2, alpha: v1);\n'
         '}\n')
 PATH = os.path.join(SRC, 'm.d')
 open(PATH, 'w').write(TEXT)
@@ -90,7 +97,7 @@ def run(enable):
     d.send({"jsonrpc": "2.0", "id": 2, "method": "textDocument/inlayHint",
             "params": {"textDocument": {"uri": URI},
                        "range": {"start": {"line": 0, "character": 0},
-                                 "end": {"line": 17, "character": 0}}}})
+                                 "end": {"line": 26, "character": 0}}}})
     hints = d.read().get('result') or []
     d.proc.kill()
     got = sorted((h['position']['line'], h['position']['character'], h['label'])
@@ -118,6 +125,16 @@ check('inlay-hints-struct-literal-arg',
 check('inlay-hints-template-arg',
       (14, 12, 'b:') in on_hints and (16, 18, 'second:') in on_hints,
       str(on_hints))
+# Named arguments already carry their label, so no hint; a positional argument
+# mixed with a named one maps to the correct (first) parameter.
+check('inlay-hints-mixed-named-arg',
+      (22, 10, 'alpha:') in on_hints
+      and not any(h[0] == 22 and h[2] == 'beta:' for h in on_hints),
+      str(on_hints))
+check('inlay-hints-named-args',
+      not any(h[0] == 23 for h in on_hints), str(on_hints))
+check('inlay-hints-unordered-named-args',
+      not any(h[0] == 24 for h in on_hints), str(on_hints))
 
 shutil.rmtree(SRC, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
