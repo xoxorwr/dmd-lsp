@@ -36,6 +36,20 @@ struct HitCache
 // needed 5-8 roots). Overridable from dls.json / initializationOptions.
 enum uint defaultMaxWorkers = 4;
 
+// Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): route every root to the MRU
+// worker so one process serves many roots on a shared module registry, and the
+// worker avoids respawning on a root switch.
+private bool sharedMode()
+{
+    __gshared int cached = -1;
+    if (cached < 0)
+    {
+        import core.stdc.stdlib : getenv;
+        cached = getenv("DMD_LSP_SHARED") !is null ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 // One single-root worker. `root` is the file whose universe it currently
 // holds; `indexBuilt` tracks the per-process workspace index.
 struct PoolEntry
@@ -775,6 +789,12 @@ private void poolNotifyFail(App* app)
 // the pool is full. Returns null only when a spawn fails.
 private PoolEntry* poolAcquire(App* app, const(char)[] path)
 {
+    if (sharedMode() && app.pool.length)
+    {
+        auto e = poolMRU(app);
+        e.stamp = ++app.poolClock;
+        return e;
+    }
     if (path !is null)
     {
         if (auto hit = poolFind(app, path))

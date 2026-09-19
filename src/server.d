@@ -290,6 +290,41 @@ Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
     return a;
 }
 
+// EXPERIMENTAL (PLAN2 Task 2, `DMD_LSP_SHARED`): analyze `path` on the existing
+// module registry, without a full reset, so a second root whose closure is
+// already loaded reuses those modules (`importAll` skips modules already at
+// `semanticDone`). No universe cache: dep tracking is one-root today, so this
+// deliberately invalidates the cache and re-analyzes each request.
+Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
+    const(char)[] text)
+{
+    s.scratch.reset();
+    s.sink.reset();
+    dmdResetCounters();
+    Analysis a;
+    StdoutGuard og;
+    stdoutToStderr(og);
+    auto pr = dmdParseOnly(path, text); // registers into the live registry
+    if (pr.ok && pr.module_)
+        a.syn = snapshotModule(cast(Module)pr.module_, text);
+    auto errs = pr.ok ? dmdSemantic(pr.module_) : pr.errors;
+    stdoutRestore(og);
+    a.module_ = pr.module_;
+    a.ok = pr.ok;
+    a.errors = errs;
+    a.diags = s.sink.msgs;
+    if (pr.ok && pr.module_)
+    {
+        auto mod = cast(Module)pr.module_;
+        lintUnusedImports(&s.scratch, mod, path, text, errs != 0, a.lintImports);
+        lintUnusedParams(&s.scratch, mod, path, text, errs != 0, a.lintParams);
+        pinLint(s.session, a.lintImports);
+        pinLint(s.session, a.lintParams);
+    }
+    s.uni.valid = false; // no reuse until per-root closure tracking lands
+    return a;
+}
+
 Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     const(char)[] text, const(char)[] identity)
 {

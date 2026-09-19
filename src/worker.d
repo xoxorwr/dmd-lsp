@@ -82,6 +82,19 @@ private __gshared Chan outChan;  // child: responses
 // Workspace symbol index (worker process). Parse-only declarations collected
 // from the parent's file discovery. Built lazily, invalidated on watched
 // changes; rebuilding is registration-free (H3) and keeps the universe.)
+// Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): serve a root switch on the
+// existing warm module registry instead of respawning the worker.
+private bool sharedMode()
+{
+    __gshared int cached = -1;
+    if (cached < 0)
+    {
+        import core.stdc.stdlib : getenv;
+        cached = getenv("DMD_LSP_SHARED") !is null ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 struct WIndexSym
 {
     string name;
@@ -2398,6 +2411,15 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (built && st != UniState.reuse)
                 {
+                    if (sharedMode())
+                    {
+                        // EXPERIMENTAL: load/analyze the new root on the warm
+                        // registry instead of respawning (Task 2 prototype).
+                        auto a = serverAnalyzeShared(s, path, text);
+                        sendAnalyze(a);
+                        built = true;
+                        continue;
+                    }
                     sendNeedRespawn();
                     continue;
                 }
