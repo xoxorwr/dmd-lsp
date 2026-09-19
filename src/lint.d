@@ -19,6 +19,7 @@ import dmd.func : FuncDeclaration;
 import dmd.declaration : VarDeclaration;
 import dmd.astenums : STC;
 import dmd.arraytypes : Dsymbols;
+import dmd.statement : Statement;
 
 // Flat member list with attribute blocks expanded recursively.
 private void flattenScopeMembers(Dsymbols* mem, ref Dsymbol[] out_)
@@ -192,32 +193,172 @@ struct ImportRec
     uint line = 0;
     uint col = 0;
     uint endLine = 0;
+    // Function-local imports: the enclosing function's line range. Names bound
+    // by a local import are only in scope there (and after the import), so a
+    // use elsewhere in the file must not clear the hint. 0,0 = module scope.
+    uint scopeStart = 0;
+    uint scopeEnd = 0;
 }
 
 private void collectImportsRec(Dsymbol s, const(char)[] rootBase, ref ImportRec[] acc)
 {
     if (auto imp = s.isImport())
     {
-        // Only imports spelled in the root file (edits are local).
-        auto fn = imp.loc.filename();
-        string f = fn ? fn[0 .. strLen(fn)].idup : "";
-        if (baseName(f) == rootBase)
-        {
-            ImportRec r;
-            r.imp = imp;
-            r.line = imp.loc.linnum();
-            r.col = imp.loc.charnum();
-            acc ~= r;
-        }
+        addImportRec(imp, rootBase, acc);
+        return;
+    }
+    // Function-local imports live in the statement tree, not the member list.
+    if (auto fd = s.isFuncDeclaration())
+    {
+        if (fd.fbody)
+            collectBodyImports(fd.fbody, rootBase, acc,
+                fd.loc.linnum(), fd.endloc.linnum());
         return;
     }
     // Recurse into member scopes (aggregates, namespaces, templates,
     // attribute blocks like `private:` — declarations hide inside them).
-    // Function bodies excluded v1 (function-local imports never reported).
     Dsymbol[] subs = null;
     appendScopeSubs(s, subs);
     foreach (m; subs)
         collectImportsRec(m, rootBase, acc);
+}
+
+// Record an import spelled in the root file (edits are local).
+private void addImportRec(Import imp, const(char)[] rootBase, ref ImportRec[] acc,
+    uint scopeStart = 0, uint scopeEnd = 0)
+{
+    auto fn = imp.loc.filename();
+    string f = fn ? fn[0 .. strLen(fn)].idup : "";
+    if (baseName(f) != rootBase)
+        return;
+    ImportRec r;
+    r.imp = imp;
+    r.line = imp.loc.linnum();
+    r.col = imp.loc.charnum();
+    r.scopeStart = scopeStart;
+    r.scopeEnd = scopeEnd;
+    acc ~= r;
+}
+
+// Walk a function body for `import` statements (`import m;` / `import m : x;`),
+// including nested functions, conditional blocks and every compound statement.
+// Mirrors `complete.synWalkBody`'s statement coverage. `scopeStart`/`scopeEnd`
+// bound the enclosing function (a local import's names are only in scope
+// there); a nested function resets them to its own range.
+private void collectBodyImports(Statement s, const(char)[] rootBase,
+    ref ImportRec[] acc, uint scopeStart, uint scopeEnd)
+{
+    if (!s)
+        return;
+    if (auto is_ = s.isImportStatement())
+    {
+        if (is_.imports)
+            foreach (i; 0 .. (*is_.imports).length)
+            {
+                auto imp = (*is_.imports)[i] ? (*is_.imports)[i].isImport() : null;
+                if (imp)
+                    addImportRec(imp, rootBase, acc, scopeStart, scopeEnd);
+            }
+        return;
+    }
+    if (auto c = s.isConditionalStatement())
+    {
+        collectBodyImports(c.ifbody, rootBase, acc, scopeStart, scopeEnd);
+        collectBodyImports(c.elsebody, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto es = s.isExpStatement())
+    {
+        if (es.exp)
+            if (auto de = es.exp.isDeclarationExp())
+                if (auto nfd = de.declaration.isFuncDeclaration())
+                    collectBodyImports(nfd.fbody, rootBase, acc,
+                        nfd.loc.linnum(), nfd.endloc.linnum());
+        return;
+    }
+    if (auto cs = s.isCompoundStatement())
+    {
+        foreach (i; 0 .. cs.statements.length)
+            collectBodyImports(cs.statements[i], rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto ss = s.isScopeStatement())
+    {
+        collectBodyImports(ss.statement, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto is_ = s.isIfStatement())
+    {
+        collectBodyImports(is_.ifbody, rootBase, acc, scopeStart, scopeEnd);
+        collectBodyImports(is_.elsebody, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto ws = s.isWhileStatement())
+    {
+        collectBodyImports(ws._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto ds = s.isDoStatement())
+    {
+        collectBodyImports(ds._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto fs = s.isForStatement())
+    {
+        collectBodyImports(fs._init, rootBase, acc, scopeStart, scopeEnd);
+        collectBodyImports(fs._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto fes = s.isForeachStatement())
+    {
+        collectBodyImports(fes._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto sw = s.isSwitchStatement())
+    {
+        collectBodyImports(sw._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto c1 = s.isCaseStatement())
+    {
+        collectBodyImports(c1.statement, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto d1 = s.isDefaultStatement())
+    {
+        collectBodyImports(d1.statement, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto lb = s.isLabelStatement())
+    {
+        collectBodyImports(lb.statement, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto tc = s.isTryCatchStatement())
+    {
+        collectBodyImports(tc._body, rootBase, acc, scopeStart, scopeEnd);
+        if (tc.catches)
+            foreach (i; 0 .. (*tc.catches).length)
+                collectBodyImports((*tc.catches)[i].handler, rootBase, acc,
+                    scopeStart, scopeEnd);
+        return;
+    }
+    if (auto tf = s.isTryFinallyStatement())
+    {
+        collectBodyImports(tf._body, rootBase, acc, scopeStart, scopeEnd);
+        collectBodyImports(tf.finalbody, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto w = s.isWithStatement())
+    {
+        collectBodyImports(w._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
+    if (auto sy = s.isSynchronizedStatement())
+    {
+        collectBodyImports(sy._body, rootBase, acc, scopeStart, scopeEnd);
+        return;
+    }
 }
 
 private size_t strLen(const(char)* p) nothrow @nogc
@@ -369,6 +510,14 @@ void lintUnusedImports(Arena* arena, Module mod, const(char)[] path, const(char)
         {
             if (!inSet(binds, h.name))
                 continue;
+            // A local import's names are in scope only after it and inside its
+            // enclosing function; a use elsewhere in the file is not a use of
+            // this import and must not clear the hint.
+            if (r.scopeEnd)
+            {
+                if (h.line < r.line || h.line > r.scopeEnd)
+                    continue;
+            }
             // exclude occurrences inside any import span
             bool inImport = false;
             foreach (ref q; imports)

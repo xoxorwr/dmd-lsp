@@ -115,6 +115,35 @@ check('param-still-hinted', any('unused parameter' in m for m in diags),
       str(diags))
 d.close()
 
+# Function-local imports are linted too: an unused `import` inside a body (or a
+# nested block) is reported, a used one is not.
+LOCAL = ('module locallint;\n'
+         'void fn()\n{\n'
+         '    import usedmod;\n'
+         '    import unusedmod;\n'
+         '    usedFn();\n'
+         '}\n'
+         'void fn2()\n{\n'
+         '    if (true) { import unusedmod; }\n'
+         '}\n'
+         'void fn3()\n{\n'
+         '    import unusedmod;\n'
+         '    unusedmod.x = 1;\n'
+         '}\n')
+lp = os.path.join(root, 'locallint.d')
+open(lp, 'w').write(LOCAL)
+d3 = Daemon(['--debounce-ms=0', '--import=' + root])
+d3.init(root)
+ldiags = d3.open_doc(lp, LOCAL)
+check('local-unused-import-hinted',
+      any('unused import' in m and 'unusedmod' in m for m in ldiags), str(ldiags))
+check('local-used-import-not-hinted',
+      not any('unused import `usedmod`' in m for m in ldiags), str(ldiags))
+# fn and fn2's unusedmod imports are flagged; fn3's is used.
+check('local-import-count',
+      sum(1 for m in ldiags if 'unusedmod' in m) == 2, str(ldiags))
+d3.close()
+
 # The unused-parameter hint must point at the parameter, not the line start.
 d2 = Daemon(['--debounce-ms=0'])
 r2 = tempfile.mkdtemp(prefix='dmd-lsp-lint2-')
