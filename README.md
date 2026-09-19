@@ -102,7 +102,9 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
 
   // Optional features — all off unless you opt in:
   "inlayHints": false,               // default: false
-  "autoImports": false               // default: false
+  "autoImports": false,              // default: false
+  "sharedRegistry": false,           // experimental, default: false
+  "maxModules": 512                  // registry cap for sharedRegistry
 }
 ```
 
@@ -118,6 +120,8 @@ loads at `initialize` and on save.
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 | `maxWorkers` | `4` | Size of the analysis-worker pool. Each worker keeps one file's dependency graph warm; up to `maxWorkers` roots are held, least-recently-used evicted. Raise it if you switch between many open files and see rebuilds. |
+| `sharedRegistry` | `false` | **Experimental.** Serve all files from a single worker that keeps every loaded module resident, so switching files reuses the whole dependency closure (lower memory, no per-root rebuild). The registry is capped by `maxModules`; over the cap the worker restarts. |
+| `maxModules` | `512` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is

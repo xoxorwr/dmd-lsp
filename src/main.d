@@ -39,17 +39,6 @@ enum uint defaultMaxWorkers = 4;
 // Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): route every root to the MRU
 // worker so one process serves many roots on a shared module registry, and the
 // worker avoids respawning on a root switch.
-private bool sharedMode()
-{
-    __gshared int cached = -1;
-    if (cached < 0)
-    {
-        import core.stdc.stdlib : getenv;
-        cached = getenv("DMD_LSP_SHARED") !is null ? 1 : 0;
-    }
-    return cached == 1;
-}
-
 // One single-root worker. `root` is the file whose universe it currently
 // holds; `indexBuilt` tracks the per-process workspace index.
 struct PoolEntry
@@ -88,6 +77,12 @@ struct App
     PoolEntry[] pool;
     uint maxWorkers = defaultMaxWorkers;
     bool maxWorkersSet = false; // editor/CLI explicitly set it
+    // Opt-in shared module registry (PLAN2 Task 2): one worker serves all roots
+    // on a persistent registry, capped at `sharedMaxModules`.
+    bool sharedRegistry = false;
+    bool sharedRegistrySet = false;
+    uint sharedMaxModules = 512;
+    bool sharedMaxModulesSet = false;
     ulong poolClock = 0; // LRU stamp source
     // Semantic tokens: last result per path and the text hash it was computed
     // from, so a pull that arrives mid-edit is served from cache instead of
@@ -124,6 +119,10 @@ struct FileConfig
     bool hasInlayHints = false;
     uint maxWorkers = defaultMaxWorkers;
     bool hasMaxWorkers = false;
+    bool sharedRegistry = false;
+    bool hasSharedRegistry = false;
+    uint sharedMaxModules = 512;
+    bool hasSharedMaxModules = false;
     bool autoImports = false;
     bool hasAutoImports = false;
 }
@@ -789,7 +788,7 @@ private void poolNotifyFail(App* app)
 // the pool is full. Returns null only when a spawn fails.
 private PoolEntry* poolAcquire(App* app, const(char)[] path)
 {
-    if (sharedMode() && app.pool.length)
+    if (app.sharedRegistry && app.pool.length)
     {
         auto e = poolMRU(app);
         e.stamp = ++app.poolClock;
@@ -832,7 +831,8 @@ private PoolEntry* poolAcquire(App* app, const(char)[] path)
         workerChildFds(other.wk, closeInChild);
         workerDisinherit(other.wk);
     }
-    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, closeInChild))
+    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, closeInChild,
+        app.sharedRegistry, app.sharedMaxModules))
     {
         poolNotifyFail(app);
         return null;
@@ -850,7 +850,7 @@ private void poolDrop(App* app, const(char)[] path)
     // Shared-registry mode has one worker serving every root, so a
     // `needRespawn` (root switch, cap hit, config) is not bound to `path`:
     // drop the MRU worker.
-    if (sharedMode())
+    if (app.sharedRegistry)
         path = null;
     size_t idx = size_t.max;
     if (path is null)
@@ -1414,6 +1414,20 @@ private void applyConfig(App* app, JsonNode* node)
             app.maxWorkersSet = true;
         }
     }
+    if (auto sr = jget(obj, "sharedRegistry"))
+    {
+        app.sharedRegistry = jbool(sr, false);
+        app.sharedRegistrySet = true;
+    }
+    if (auto mm = jget(obj, "maxModules"))
+    {
+        long v = jint(mm);
+        if (v > 0 && v <= 1_000_000)
+        {
+            app.sharedMaxModules = cast(uint) v;
+            app.sharedMaxModulesSet = true;
+        }
+    }
 }
 
 // Workspace root from initialize params: first workspace folder, else
@@ -1594,6 +1608,23 @@ private Notice loadFileConfig(App* app, const(char)[] root)
             }
         }
     }
+    if (auto sr = jget(doc, "sharedRegistry"))
+    {
+        fc.hasSharedRegistry = true;
+        fc.sharedRegistry = jbool(sr, false);
+    }
+    if (auto mm = jget(doc, "maxModules"))
+    {
+        if ((mm.type & 0xFF) == JsonNumber)
+        {
+            long v = jint(mm);
+            if (v > 0 && v <= 1_000_000)
+            {
+                fc.hasSharedMaxModules = true;
+                fc.sharedMaxModules = cast(uint) v;
+            }
+        }
+    }
     // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
     fc.flags = jstrArray(jget(doc, "flags"));
     app.fileCfg = fc;
@@ -1605,6 +1636,10 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.autoImports = fc.autoImports;
     if (!app.maxWorkersSet && fc.hasMaxWorkers)
         app.maxWorkers = fc.maxWorkers;
+    if (!app.sharedRegistrySet && fc.hasSharedRegistry)
+        app.sharedRegistry = fc.sharedRegistry;
+    if (!app.sharedMaxModulesSet && fc.hasSharedMaxModules)
+        app.sharedMaxModules = fc.sharedMaxModules;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -1636,6 +1671,10 @@ private void clearFileConfig(App* app)
         app.autoImports = false;
     if (!app.maxWorkersSet)
         app.maxWorkers = defaultMaxWorkers;
+    if (!app.sharedRegistrySet)
+        app.sharedRegistry = false;
+    if (!app.sharedMaxModulesSet)
+        app.sharedMaxModules = 512;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -3960,6 +3999,24 @@ int main(string[] args)
     app.baseImports = imports;
     app.baseStringImports = stringImports;
     app.baseFlags = flags;
+    // `DMD_LSP_SHARED` / `DMD_LSP_SHARED_MAX_MODULES` override config (tests).
+    {
+        import core.stdc.stdlib : getenv, atol;
+        if (getenv("DMD_LSP_SHARED") !is null)
+        {
+            app.sharedRegistry = true;
+            app.sharedRegistrySet = true;
+        }
+        if (auto e = getenv("DMD_LSP_SHARED_MAX_MODULES"))
+        {
+            auto v = atol(e);
+            if (v > 0)
+            {
+                app.sharedMaxModules = cast(uint) v;
+                app.sharedMaxModulesSet = true;
+            }
+        }
+    }
     refreshImports(&app);
     version (Posix)
         signal(SIGPIPE, SIG_IGN); // client may close stdout

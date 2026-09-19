@@ -82,21 +82,6 @@ private __gshared Chan outChan;  // child: responses
 // Workspace symbol index (worker process). Parse-only declarations collected
 // from the parent's file discovery. Built lazily, invalidated on watched
 // changes; rebuilding is registration-free (H3) and keeps the universe.)
-// Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): serve a root switch on the
-// existing warm module registry instead of respawning the worker.
-private bool sharedMode()
-{
-    __gshared int cached = -1;
-    if (cached < 0)
-    {
-        import core.stdc.stdlib : getenv;
-        cached = getenv("DMD_LSP_SHARED") !is null ? 1 : 0;
-    }
-    return cached == 1;
-}
-
-
-
 struct WIndexSym
 {
     string name;
@@ -2335,7 +2320,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
             auto ops = p ? jstr(jget(p, "op")) : null;
             // Registry cap hit on a previous op: force a respawn so the OS
             // reclaims the accumulated universe before doing more work.
-            if (serverRegistryOverCap() && ops != "shutdown" && ops != "init")
+            if (s.overCap && ops != "shutdown" && ops != "init")
             {
                 sendNeedRespawn();
                 continue;
@@ -2371,7 +2356,11 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                             if (v.length)
                                 flags ~= v.idup;
                         }
-                serverInit(s, imports, strings, flags);
+                bool sharedReg = jbool(jget(p, "shared"), false);
+                size_t maxModules = cast(size_t) jint(jget(p, "maxModules"));
+                if (maxModules == 0)
+                    maxModules = 512;
+                serverInit(s, imports, strings, flags, sharedReg, maxModules);
                 auto js = jmake();
                 auto root = js.create_object();
                 js.add_bool_to_object(root, "ok", true);
@@ -2420,10 +2409,10 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    if (sharedMode())
+                    if (s.sharedReg)
                     {
-                        // EXPERIMENTAL: load/analyze the new root on the warm
-                        // registry instead of respawning (Task 2 prototype).
+                        // Load/analyze the new root on the warm registry
+                        // instead of respawning (PLAN2 Task 2).
                         auto a = serverAnalyzeShared(s, path, text);
                         sendAnalyze(a);
                         built = true;
@@ -2495,7 +2484,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2540,7 +2529,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2574,7 +2563,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2607,7 +2596,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2638,7 +2627,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2696,7 +2685,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2730,7 +2719,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2768,7 +2757,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2806,7 +2795,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2866,7 +2855,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2960,7 +2949,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -2988,7 +2977,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -3094,7 +3083,7 @@ if (built && st != UniState.reuse)
                     continue;
 if (built && st != UniState.reuse)
                 {
-                    if (!sharedMode())
+                    if (!s.sharedReg)
                     {
                         sendNeedRespawn();
                         continue;
@@ -3200,7 +3189,7 @@ void workerDisinherit(ref Worker w)
 }
 
 bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flags,
-    scope const(int)[] closeInChild = null)
+    scope const(int)[] closeInChild = null, bool sharedReg = false, uint maxModules = 512)
 {
     version (Posix)
     {
@@ -3309,6 +3298,8 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
     auto js = jmake();
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("init"));
+    js.add_bool_to_object(root, "shared", sharedReg);
+    js.add_number_to_object(root, "maxModules", cast(double) maxModules);
     auto ia = js.create_array();
     foreach (p; imports)
         js.add_item_to_array(ia, js.create_string(zstr(p)));
