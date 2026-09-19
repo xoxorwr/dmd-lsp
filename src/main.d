@@ -23,7 +23,7 @@ import session;
 import worker;
 import pathutil : dirOf, isDFilePath, isDlsJson, resolveCfgPath, sameDir;
 import fsutil : findDFiles;
-import complete : extractPrefix;
+import complete : extractPrefix, posInCode;
 import semantic : tokenTypes, tokenModifiers;
 import log : log;
 
@@ -769,9 +769,10 @@ private bool ensureIndex(App* app)
     return true;
 }
 
-// Modules exporting `name` that the document does not already import.
+// Modules exporting `name` (exact) or starting with it (`prefix`) that the
+// document does not already import.
 private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
-    ref worker.WIndexSym[] out_)
+    ref worker.WIndexSym[] out_, bool prefix = false)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -780,7 +781,9 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
             if (!respawnWorker(app))
                 return false;
         }
-        auto r = workerImportCandidates(app.wk, name, path, out_);
+        auto r = prefix
+            ? workerImportCompletions(app.wk, name, path, out_)
+            : workerImportCandidates(app.wk, name, path, out_);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
@@ -791,6 +794,29 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
         return false;
     }
     return false;
+}
+
+// True when the identifier prefix ending at 1-based (line,col) follows a `.`
+// (member access), where an add-import would be wrong.
+private bool prefixAfterDot(const(char)[] text, uint line, uint col, size_t plen)
+{
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    while (i < text.length && text[i] != '\n')
+        i++;
+    size_t lineLen = i - ls;
+    size_t e = col > 0 ? col - 1 : 0;
+    if (e > lineLen)
+        e = lineLen;
+    size_t s = e >= plen ? e - plen : 0;
+    return s > 0 && text[ls + s - 1] == '.';
 }
 
 // The name in dmd's "undefined identifier `X`" message, or null.
@@ -2054,6 +2080,43 @@ private void handleMessage(App* app, ref RawMsg m)
                         jaddStrOpt(js, j, "documentation", it.documentation);
                         jaddStrOpt(js, j, "sortText", it.sortText);
                         js.add_item_to_array(items, j);
+                    }
+                }
+                // Auto-import: for a bare identifier prefix, offer symbols from
+                // modules the file does not import, inserting the import as an
+                // additional edit.
+                if (prefix.length >= 2 && app.root.length &&
+                    posInCode(text, line, col) &&
+                    !prefixAfterDot(text, line, col, prefix.length))
+                {
+                    ensureIndex(app);
+                    worker.WIndexSym[] cands;
+                    if (workerImportRetry(app, prefix, path, cands, true))
+                    {
+                        bool[string] have;
+                        foreach (ref it; witems)
+                            have[it.label] = true;
+                        uint il = 0, ic = 0;
+                        importInsertPos(text, il, ic);
+                        foreach (cand; cands)
+                        {
+                            if (!cand.name.length || cand.name in have)
+                                continue;
+                            have[cand.name] = true;
+                            auto j = js.create_object();
+                            js.add_string_to_object(j, "label", zstr(cand.name));
+                            js.add_number_to_object(j, "kind", cand.kind);
+                            js.add_string_to_object(j, "detail", zstr(cand.moduleName));
+                            js.add_string_to_object(j, "sortText", zstr("9" ~ cand.name));
+                            auto ta = js.create_array();
+                            auto ed = js.create_object();
+                            js.add_item_to_object(ed, "range", jrange(js, il, ic, il, ic));
+                            js.add_string_to_object(ed, "newText",
+                                zstr("import " ~ cand.moduleName ~ ";\n"));
+                            js.add_item_to_array(ta, ed);
+                            js.add_item_to_object(j, "additionalTextEdits", ta);
+                            js.add_item_to_array(items, j);
+                        }
                     }
                 }
             }

@@ -1082,6 +1082,7 @@ private void sendImportCandidates(const(WIndexSym)[] cands)
     foreach (s; cands)
     {
         auto o = js.create_object();
+        js.add_string_to_object(o, "name", zstr(s.name));
         js.add_string_to_object(o, "module", zstr(s.moduleName));
         js.add_string_to_object(o, "file", zstr(s.file));
         js.add_number_to_object(o, "kind", s.kind);
@@ -1092,6 +1093,36 @@ private void sendImportCandidates(const(WIndexSym)[] cands)
     js.add_item_to_object(root, "cands", arr);
     js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
+}
+
+// Indexed symbols whose name starts with `prefix` in modules `path` does not
+// import, for auto-import completion. One per (name, module).
+private WIndexSym[] importCompletions(const(char)[] prefix, const(char)[] path)
+{
+    WIndexSym[] out_;
+    if (!g_indexBuilt || prefix.length < 2)
+        return out_;
+    bool[string] imported;
+    foreach (fi; g_files)
+        if (fi.file == path)
+            foreach (im; fi.imports)
+                imported[im] = true;
+    bool[string] seen;
+    foreach (s; g_index)
+    {
+        if (s.file == path || s.moduleName in imported)
+            continue;
+        if (s.name.length < prefix.length || s.name[0 .. prefix.length] != prefix)
+            continue;
+        string key = s.name ~ "\x1f" ~ s.moduleName;
+        if (key in seen)
+            continue;
+        seen[key] = true;
+        out_ ~= s;
+        if (out_.length >= 50)
+            break;
+    }
+    return out_;
 }
 
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
@@ -2000,6 +2031,13 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 auto nm = dupOrEmpty(jstr(jget(p, "name")));
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
                 sendImportCandidates(importCandidates(nm, path));
+                continue;
+            }
+            if (ops == "importCompletions")
+            {
+                auto pfx = dupOrEmpty(jstr(jget(p, "prefix")));
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                sendImportCandidates(importCompletions(pfx, path));
                 continue;
             }
             if (ops == "invalidateIndex")
@@ -3044,14 +3082,14 @@ ExchangeResult workerWorkspaceSymbol(ref Worker w, const(char)[] query,
     return ExchangeResult.ok;
 }
 
-// Modules exporting `name` that `path` does not already import.
-ExchangeResult workerImportCandidates(ref Worker w, const(char)[] name,
-    const(char)[] path, ref WIndexSym[] out_)
+private ExchangeResult workerImportCands(ref Worker w, const(char)[] op,
+    const(char)[] key, const(char)[] keyName, const(char)[] path,
+    ref WIndexSym[] out_)
 {
     auto js = jmake();
     auto root = js.create_object();
-    js.add_string_to_object(root, "op", zstr("importCandidates"));
-    js.add_string_to_object(root, "name", zstr(name));
+    js.add_string_to_object(root, "op", zstr(op));
+    js.add_string_to_object(root, zstr(keyName), zstr(key));
     js.add_string_to_object(root, "path", zstr(path));
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
@@ -3065,6 +3103,7 @@ ExchangeResult workerImportCandidates(ref Worker w, const(char)[] name,
         for (auto c = arr.child; c; c = c.next)
         {
             WIndexSym s;
+            s.name = dupOrEmpty(jstr(jget(c, "name")));
             s.moduleName = dupOrEmpty(jstr(jget(c, "module")));
             s.file = dupOrEmpty(jstr(jget(c, "file")));
             s.kind = cast(ubyte)jint(jget(c, "kind"));
@@ -3072,6 +3111,20 @@ ExchangeResult workerImportCandidates(ref Worker w, const(char)[] name,
             out_ ~= s;
         }
     return ExchangeResult.ok;
+}
+
+// Modules exporting `name` that `path` does not already import.
+ExchangeResult workerImportCandidates(ref Worker w, const(char)[] name,
+    const(char)[] path, ref WIndexSym[] out_)
+{
+    return workerImportCands(w, "importCandidates", name, "name", path, out_);
+}
+
+// Indexed symbols starting with `prefix` (auto-import completion).
+ExchangeResult workerImportCompletions(ref Worker w, const(char)[] prefix,
+    const(char)[] path, ref WIndexSym[] out_)
+{
+    return workerImportCands(w, "importCompletions", prefix, "prefix", path, out_);
 }
 
 ExchangeResult workerInvalidateIndex(ref Worker w)

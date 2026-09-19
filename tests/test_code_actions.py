@@ -21,6 +21,7 @@ main = ('module main;\n'
         '{\n'
         '    helperFn();\n'
         '    missingFn();\n'
+        '    help\n'
         '}\n')
 mpath = os.path.join(src, 'main.d')
 open(mpath, 'w').write(main)
@@ -94,6 +95,18 @@ acts = read_msg()['result']
 check('no-candidate-no-action',
       not any('missingFn' in a['title'] for a in acts),
       str([a['title'] for a in acts]))
+
+# Completion auto-import: `help` offers `helperFn` from lib with the import as
+# an additional edit.
+send({"jsonrpc": "2.0", "id": 102, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": uri},
+                 "position": {"line": 6, "character": 8}}})
+items = read_msg()['result']['items']
+auto = [i for i in items if i['label'] == 'helperFn' and i.get('additionalTextEdits')]
+check('auto-import-completion',
+      len(auto) == 1 and
+      auto[0]['additionalTextEdits'][0]['newText'] == 'import lib;\n',
+      str(auto))
 
 proc.stdin.close()
 proc.wait(timeout=5)
