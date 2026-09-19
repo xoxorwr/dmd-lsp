@@ -18,7 +18,7 @@ import dmd.dstruct : StructDeclaration, UnionDeclaration;
 import dmd.dclass : ClassDeclaration, InterfaceDeclaration;
 import dmd.visitor : SemanticTimeTransitiveVisitor;
 import dmd.dsymbolsem : toAlias;
-import dmd.expression : Expression, CallExp;
+import dmd.expression : Expression, CallExp, StructLiteralExp;
 import dmd.identifier : Identifier;
 import dmd.astenums : STC, TY;
 
@@ -152,6 +152,95 @@ extern (C++) final class HintWalker : SemanticTimeTransitiveVisitor
         super.visit(d);
     }
 
+    // Start of a call argument. `CallExp` keeps its callee (`e1`), whose loc is
+    // the expression's start. `StructLiteralExp` does not keep the type-use loc
+    // (its `loc` is the `(`), so lex the line up to the `(` with dmd's Lexer.
+    private void argStart(Expression arg, out uint line, out uint col)
+    {
+        if (auto ce = arg.isCallExp())
+            if (ce.e1)
+            {
+                line = ce.e1.loc.linnum() - 1;
+                col = cast(uint) ce.e1.loc.charnum() - 1;
+                return;
+            }
+        if (auto sl = arg.isStructLiteralExp())
+        {
+            structLitStart(sl, line, col);
+            return;
+        }
+        line = arg.loc.linnum() - 1;
+        col = cast(uint) arg.loc.charnum() - 1;
+    }
+
+    private void structLitStart(StructLiteralExp e, out uint line, out uint col)
+    {
+        line = e.loc.linnum() - 1;
+        col = cast(uint) e.loc.charnum() - 1;
+        if (line >= lineStarts.length)
+            return;
+        size_t ls = lineStarts[line];
+        size_t le = line + 1 < lineStarts.length ? lineStarts[line + 1]
+            : text.length;
+        while (le > ls && (text[le - 1] == '\n' || text[le - 1] == '\r'))
+            le--;
+        auto lt = text[ls .. le];
+        size_t off = col; // 0-based offset of `(` within the line
+        if (off >= lt.length || lt[off] != '(')
+            return;
+
+        import dmd.lexer : Lexer;
+        import dmd.tokens : Token, TOK;
+        import dmd.globals : global;
+        auto buf = lt.dup ~ '\0';
+        scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+            false, false, global.errorSinkNull, &global.compileEnv);
+        Token[] toks;
+        while (true)
+        {
+            Token tok;
+            lex.scan(&tok);
+            if (tok.value == TOK.endOfFile)
+                break;
+            if (cast(size_t)(tok.loc.charnum() - 1) >= off)
+                break;
+            toks ~= tok;
+        }
+        // Walk back over the type name: identifiers, dots, `!`, and balanced
+        // template-argument parens (`Box!int()`, `pkg.Box!(int)()`). A `(` at
+        // depth 0 is the enclosing call, so stop there.
+        size_t i = toks.length;
+        size_t start = off;
+        int depth = 0;
+        while (i > 0)
+        {
+            auto tok = toks[i - 1];
+            uint to = cast(uint)(tok.loc.charnum() - 1);
+            if (tok.value == TOK.rightParenthesis)
+                depth++;
+            else if (tok.value == TOK.leftParenthesis)
+            {
+                if (depth == 0)
+                    break;
+                depth--;
+            }
+            else if (depth == 0)
+            {
+                // A name-like token (identifier or keyword, e.g. `int` in
+                // `Box!int`); punctuation ends the type name.
+                if (to >= lt.length)
+                    break;
+                char c0 = lt[to];
+                if (!(identChar(c0) || c0 == '!' || c0 == '.'))
+                    break;
+            }
+            i--;
+            start = to;
+        }
+        if (start < off)
+            col = cast(uint) start;
+    }
+
     // Call argument names, when not obvious.
     override void visit(CallExp e)
     {
@@ -170,8 +259,9 @@ extern (C++) final class HintWalker : SemanticTimeTransitiveVisitor
                 auto p = (*tf.parameterList.parameters)[i];
                 if (!p || !p.ident || obviousArg(arg, p.ident))
                     continue;
-                out_ ~= InlayHint(arg.loc.linnum() - 1,
-                    cast(uint) arg.loc.charnum() - 1,
+                uint aline, acol;
+                argStart(arg, aline, acol);
+                out_ ~= InlayHint(aline, acol,
                     cast(const(char)[]) (p.ident.toString() ~ ":"),
                     false, true);
             }
