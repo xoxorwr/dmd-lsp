@@ -48,7 +48,9 @@ so the OS reclaims the discarded universe. A root switch is absorbed by the
 pool when the root is warm, and otherwise spawns/binds a worker (evicting the
 LRU when full). Process isolation is the reclamation boundary because the
 conservative GC cannot prove a discarded universe unreachable in-process (see
-[findings.md](findings.md)).
+[findings.md](findings.md)). The decision, the policy any in-process store must
+supply, and the checklist to re-run on every dmd bump are in
+[reclamation.md](reclamation.md).
 
 The universe records which buffer it parsed (`analysisHash`) and which
 document version it was keyed to (`rootHash`): that decides whether a request

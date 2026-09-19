@@ -241,7 +241,9 @@ it and the OS reclaims the discarded universe.
 
 **Why not in-process (kept as a future path).** Process isolation is the
 reclamation boundary: the conservative GC cannot prove a discarded universe
-unreachable in-process, so distinct roots retain ~one universe each.
+unreachable in-process, so distinct roots retain ~one universe each. The
+operational decision, the policy an in-process store would have to supply, and
+the vendor-update checklist live in [reclamation.md](reclamation.md).
 `Mem.enableZero()` (§7 patch) fixes the worst case (uninitialized `xmalloc`
 words acting as false roots), but stale stack/register roots remain, so an
 in-process host still grows with distinct roots and doesn't return pools.

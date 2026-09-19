@@ -39,6 +39,11 @@ make vendor   # re-derive the closure from ../dmd and re-copy (+ PLATFORM_EXTRA)
 Run it after pulling the dev tree. Once the patches land upstream, delete
 `src/dmd/`, point `-I` at `../dmd/compiler/src` again, and drop `make vendor`.
 
+**Always run the [reclamation.md](reclamation.md) vendor-update checklist after
+a refresh.** It is what tells you whether a dmd bump invalidated a reset
+invariant, broke the in-place re-parse field list, or finally unlocked a
+reclamation trigger.
+
 ## Makefile
 
 ```sh

@@ -141,3 +141,4 @@ Details: [docs/design.md](docs/design.md).
 - [releases.md](docs/releases.md) — nightly CI, VS Code extension
 - [upstream.md](docs/upstream.md) — patches in `../dmd`, roadmap
 - [findings.md](docs/findings.md) — memory/GC investigation
+- [reclamation.md](docs/reclamation.md) — reclamation boundary + vendor-update checklist
