@@ -15,6 +15,7 @@ import session;
 import dmdwrap;
 import lint;
 import complete;
+import lexutil : LexCache;
 
 import dmd.dmodule : Module;
 import core.memory : GC;
@@ -26,6 +27,7 @@ struct ServerState
     DmdState dmd;
     DiagSink sink;
     Universe uni; // live-universe cache (see below)
+    LexCache lex; // reusable NUL-terminated text copy for lexing
 }
 
 // dmd's message-kind diagnostics bypass DiagnosticHandler and write to

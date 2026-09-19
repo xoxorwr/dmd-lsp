@@ -41,6 +41,80 @@ private void pushHit(ref ScanOut o, Arena* a, const(char)[] name, uint line, uin
 }
 
 import arena;
+import dmd.lexer : Lexer;
+
+// Reusable lexer input: a NUL-terminated copy of the current text, kept across
+// requests and rebuilt whenever the text changes. It never points at a caller's
+// transient buffer, so a lexer over it stays valid for the cache's lifetime.
+struct LexCache
+{
+    char* buf = null;
+    size_t cap = 0;
+    size_t len = size_t.max; // forces the first build
+    ulong hash = 0;
+
+    @disable this(this);
+    ~this()
+    {
+        import core.stdc.stdlib : free;
+        if (buf)
+        {
+            free(buf);
+            buf = null;
+        }
+    }
+}
+
+private ulong lexHash(const(ubyte)[] data)
+{
+    ulong h = 14695981039346656037UL;
+    foreach (b; data)
+    {
+        h ^= b;
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
+// Copy `text` into `c` if it differs from the cached copy.
+void lexSet(ref LexCache c, const(char)[] text)
+{
+    import core.stdc.stdlib : realloc;
+    import core.stdc.string : memcpy;
+
+    ulong h = lexHash(cast(const(ubyte)[]) text);
+    if (c.buf !is null && c.hash == h && c.len == text.length)
+        return;
+    if (text.length + 1 > c.cap)
+    {
+        size_t ncap = text.length + 1;
+        auto p = cast(char*) realloc(c.buf, ncap);
+        if (!p)
+            return;
+        c.buf = p;
+        c.cap = ncap;
+    }
+    if (text.length)
+        memcpy(c.buf, text.ptr, text.length);
+    c.buf[text.length] = 0;
+    c.hash = h;
+    c.len = text.length;
+}
+
+// A lexer over byte range `[from, to]` of the cached buffer (no copy). `to`
+// must address the terminating NUL or a byte within the buffer.
+Lexer lexOver(ref LexCache c, size_t from, size_t to)
+{
+    import dmd.globals : global;
+    if (c.buf is null)
+        lexSet(c, "");
+    if (to > c.len)
+        to = c.len;
+    if (from > to)
+        from = to;
+    return new Lexer(null, cast(const(char)*) c.buf, from, to, false, false,
+        global.errorSinkNull, &global.compileEnv);
+}
 
 // Scan identifiers in `src` (full text or sub-range starting at baseLine).
 // Lines reported as baseLine + internal offset.

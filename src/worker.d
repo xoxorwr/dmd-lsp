@@ -32,6 +32,7 @@ import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     collectCalls, collectCallsIn, FuncInfo, funcInfo, keyMatches, moduleOf;
 
 import lint;
+import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
@@ -40,6 +41,7 @@ import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
 import dmd.func : FuncDeclaration;
 import dmd.dclass : ClassDeclaration;
+import dmd.tokens : Token;
 
 version (Posix)
 {
@@ -1523,59 +1525,109 @@ private bool startsWith(const(char)[] s, const(char)[] prefix)
 // If the cursor is completing an `import`, report the module-path prefix
 // (module context) or the module + partial member (selective context).
 // Textual: this is completion's own concern, no analysis.
-private bool importContext(const(char)[] text, uint line, uint col,
-    out const(char)[] modulePrefix, out const(char)[] selectModule,
+// Tokens of the current line up to the cursor, lexed from the cached buffer
+// (which is NUL-terminated at the cursor for the duration of the scan).
+private Token[] lineTokens(ref LexCache c, const(char)[] text, uint line,
+    uint col)
+{
+    import dmd.tokens : Token, TOK;
+
+    Token[] toks;
+    lexSet(c, text);
+    if (c.buf is null)
+        return toks;
+    auto buf = cast(const(char)[]) c.buf[0 .. c.len];
+    size_t ls = 0;
+    uint l = 1;
+    while (ls < c.len && l < line)
+    {
+        if (buf[ls] == '\n')
+            l++;
+        ls++;
+    }
+    size_t want = col > 0 ? col - 1 : 0;
+    size_t avail = 0;
+    while (ls + avail < c.len && buf[ls + avail] != '\n' && avail < want)
+        avail++;
+    size_t end = ls + avail;
+    char saved = c.buf[end];
+    c.buf[end] = 0;
+    scope (exit)
+        c.buf[end] = saved;
+    scope lex = lexOver(c, ls, end);
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        toks ~= t;
+    }
+    return toks;
+}
+
+private bool importContext(ref LexCache c, const(char)[] text, uint line,
+    uint col, out const(char)[] modulePrefix, out const(char)[] selectModule,
     out const(char)[] selectPrefix)
 {
+    import dmd.tokens : TOK;
+
     modulePrefix = null;
     selectModule = null;
     selectPrefix = null;
-    size_t i = 0;
-    uint l = 1;
-    while (i < text.length && l < line)
-    {
-        if (text[i] == '\n')
-            l++;
-        i++;
-    }
-    size_t ls = i;
-    size_t cursor = ls;
-    size_t want = col > 0 ? col - 1 : 0;
-    while (cursor < text.length && text[cursor] != '\n' && cursor - ls < want)
-        cursor++;
-    auto lt = text[ls .. cursor];
-    size_t a = 0;
-    while (a < lt.length && (lt[a] == ' ' || lt[a] == '\t'))
-        a++;
-    lt = lt[a .. $];
-    foreach (kw; ["static ", "public "])
-        if (startsWith(lt, kw))
-        {
-            lt = lt[kw.length .. $];
-            break;
-        }
-    if (!startsWith(lt, "import "))
+    auto toks = lineTokens(c, text, line, col);
+    size_t idx = 0;
+    if (idx < toks.length &&
+        (toks[idx].value == TOK.static_ || toks[idx].value == TOK.public_))
+        idx++;
+    if (idx >= toks.length || toks[idx].value != TOK.import_)
         return false;
-    lt = lt[7 .. $];
-    size_t k = 0;
-    while (k < lt.length && (isIdChar(lt[k]) || lt[k] == '.'))
-        k++;
-    auto path = lt[0 .. k];
-    size_t r = k;
-    while (r < lt.length && (lt[r] == ' ' || lt[r] == '\t'))
-        r++;
-    if (r < lt.length && lt[r] == ':')
+    idx++;
+    const(char)[] path;
+    bool wantIdent = true;
+    while (idx < toks.length)
     {
-        r++;
-        while (r < lt.length && (lt[r] == ' ' || lt[r] == '\t'))
-            r++;
-        selectModule = path;
-        selectPrefix = lt[r .. $];
+        auto tv = toks[idx].value;
+        if (tv == TOK.identifier && wantIdent)
+        {
+            path ~= toks[idx].ident.toString();
+            wantIdent = false;
+            idx++;
+        }
+        else if (tv == TOK.dot && !wantIdent)
+        {
+            path ~= ".";
+            wantIdent = true;
+            idx++;
+        }
+        else
+            break;
+    }
+    if (idx < toks.length && toks[idx].value == TOK.colon)
+    {
+        idx++;
+        const(char)[] sp;
+        while (idx < toks.length)
+        {
+            auto tv = toks[idx].value;
+            if (tv == TOK.identifier)
+            {
+                sp = toks[idx].ident.toString();
+                idx++;
+            }
+            else if (tv == TOK.comma)
+            {
+                sp = null;
+                idx++;
+            }
+            else
+                break;
+        }
+        selectModule = path.idup;
+        selectPrefix = sp.length ? sp.idup : null;
         return true;
     }
-    if (r != lt.length) // trailing tokens: not a plain module path
-        return false;
-    modulePrefix = path;
+    modulePrefix = path.idup;
     return true;
 }
 
@@ -1642,7 +1694,7 @@ private bool completeImportAndSend(ref ServerState s, const(char)[] text,
     uint line, uint col)
 {
     const(char)[] mprefix, smod, sprefix;
-    if (!importContext(text, line, col, mprefix, smod, sprefix))
+    if (!importContext(s.lex, text, line, col, mprefix, smod, sprefix))
         return false;
     // `import m : ` is handled semantically by `completeAt` (its
     // `selectiveImportAt`, incl. public re-exports); only the module-list
@@ -1710,56 +1762,40 @@ private immutable string[] versionPredefined =
 ];
 
 // `version(Pos` / `debug(foo` — the partial condition inside the parens.
-private bool versionContext(const(char)[] text, uint line, uint col,
-    out const(char)[] prefix)
+private bool versionContext(ref LexCache c, const(char)[] text, uint line,
+    uint col, out const(char)[] prefix)
 {
+    import dmd.tokens : TOK;
+
     prefix = null;
-    size_t i = 0;
-    uint l = 1;
-    while (i < text.length && l < line)
-    {
-        if (text[i] == '\n')
-            l++;
-        i++;
-    }
-    size_t ls = i;
-    size_t cursor = ls;
-    size_t want = col > 0 ? col - 1 : 0;
-    while (cursor < text.length && text[cursor] != '\n' && cursor - ls < want)
-        cursor++;
-    auto lt = text[ls .. cursor];
-    size_t s = lt.length;
-    while (s > 0 && (isIdChar(lt[s - 1]) || lt[s - 1] == '.'))
-        s--;
-    prefix = lt[s .. $];
-    size_t p = s;
-    while (p > 0 && (lt[p - 1] == ' ' || lt[p - 1] == '\t'))
-        p--;
-    if (p == 0 || lt[p - 1] != '(')
+    auto toks = lineTokens(c, text, line, col);
+    size_t idx = 0;
+    if (idx >= toks.length ||
+        (toks[idx].value != TOK.version_ && toks[idx].value != TOK.debug_))
         return false;
-    p--;
-    while (p > 0 && (lt[p - 1] == ' ' || lt[p - 1] == '\t'))
-        p--;
-    size_t we = p;
-    while (p > 0 && isIdChar(lt[p - 1]))
-        p--;
-    auto word = lt[p .. we];
-    return word == "version" || word == "debug";
+    idx++;
+    if (idx >= toks.length || toks[idx].value != TOK.leftParenthesis)
+        return false;
+    idx++;
+    if (idx < toks.length && toks[idx].value == TOK.identifier)
+    {
+        prefix = toks[idx].ident.toString().idup;
+        idx++;
+    }
+    // The cursor must still be inside the parens (no `)` seen yet).
+    return idx == toks.length;
 }
 
 // `version = X;` / `debug = X;` identifiers declared in `text`.
-private string[] userVersionNames(const(char)[] text)
+private string[] userVersionNames(ref LexCache c, const(char)[] text)
 {
-    import dmd.lexer : Lexer;
     import dmd.tokens : Token, TOK;
-    import dmd.globals : global;
 
     string[] out_;
     if (!text.length)
         return out_;
-    auto buf = text.dup ~ '\0';
-    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
-        false, false, global.errorSinkNull, &global.compileEnv);
+    lexSet(c, text);
+    scope lex = lexOver(c, 0, c.len);
     int state = 0; // 1 after version/debug, 2 after `=`
     while (true)
     {
@@ -1792,7 +1828,7 @@ private bool completeVersionAndSend(ref ServerState s, const(char)[] text,
     uint line, uint col)
 {
     const(char)[] prefix;
-    if (!versionContext(text, line, col, prefix))
+    if (!versionContext(s.lex, text, line, col, prefix))
         return false;
     string[] names;
     ubyte[] kinds;
@@ -1808,7 +1844,7 @@ private bool completeVersionAndSend(ref ServerState s, const(char)[] text,
     }
     foreach (n; versionPredefined)
         add(n);
-    foreach (n; userVersionNames(text))
+    foreach (n; userVersionNames(s.lex, text))
         add(n);
     CompleteOut out_;
     addImportItems(&s.scratch, out_, names, kinds, "version");
@@ -1826,18 +1862,16 @@ struct WLink
 
 // `import("...")` string imports, resolved against `dirs`. Lexer-based, so
 // comments/strings cannot confuse it.
-private WLink[] documentLinks(const(char)[] text, const(string)[] dirs)
+private WLink[] documentLinks(ref LexCache c, const(char)[] text,
+    const(string)[] dirs)
 {
-    import dmd.lexer : Lexer;
     import dmd.tokens : Token, TOK;
-    import dmd.globals : global;
 
     WLink[] out_;
     if (!text.length)
         return out_;
-    auto buf = text.dup ~ '\0';
-    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
-        false, false, global.errorSinkNull, &global.compileEnv);
+    lexSet(c, text);
+    scope lex = lexOver(c, 0, c.len);
     int state = 0; // 0 none, 1 after `import`, 2 after its `(`
     while (true)
     {
@@ -2567,7 +2601,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                             if (v.length)
                                 dirs ~= v.idup;
                         }
-                sendDocumentLinks(documentLinks(text, dirs));
+                sendDocumentLinks(documentLinks(s.lex, text, dirs));
                 continue;
             }
             if (ops == "documentHighlight")
