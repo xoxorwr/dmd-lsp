@@ -306,7 +306,7 @@ RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl
 
 // Recursively collect class/interface declarations, descending through
 // attribute/conditional blocks and nested aggregate scopes.
-private void collectClassDecls(Dsymbol[] members, ref ClassDeclaration[] out_)
+void collectClassDecls(Dsymbol[] members, ref ClassDeclaration[] out_)
 {
     foreach (s; members)
     {
@@ -510,7 +510,7 @@ private string udec(uint v)
     return b[n .. $].idup;
 }
 
-private Module moduleOf(Dsymbol d)
+Module moduleOf(Dsymbol d)
 {
     for (Dsymbol p = d; p; p = p.parent)
         if (auto m = p.isModule())

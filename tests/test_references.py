@@ -737,6 +737,39 @@ d.close()
 os.remove(cbp)
 os.remove(cmp_)
 
+# Type hierarchy: supertypes (base class + interfaces) and direct subtypes.
+tb = ('module thier;\n'
+      'interface Animal { void speak(); }\n'
+      'class Base : Animal { void speak() {} }\n'
+      'class Derived : Base { }\n')
+tbp = os.path.join(root, 'thier.d')
+open(tbp, 'w').write(tb)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(tbp, tb)
+d.drain(1.5)
+
+def th_rpc(rid, method, params):
+    d.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    return d.read_msg().get('result')
+
+base = th_rpc(210, 'textDocument/prepareTypeHierarchy',
+              {"textDocument": {"uri": 'file://' + tbp},
+               "position": {"line": 2, "character": 6}})  # `Base`
+check('typehierarchy-prepare',
+      bool(base) and base[0]['name'] == 'Base' and base[0]['kind'] == 5,
+      str(base))
+sup = th_rpc(211, 'typeHierarchy/supertypes', {"item": base[0]}) if base else None
+check('typehierarchy-supertypes',
+      bool(sup) and any(s['name'] == 'Animal' and s['kind'] == 11 for s in sup),
+      str(sup))
+sub = th_rpc(212, 'typeHierarchy/subtypes', {"item": base[0]}) if base else None
+check('typehierarchy-subtypes',
+      bool(sub) and any(s['name'] == 'Derived' for s in sub), str(sub))
+d.close()
+os.remove(tbp)
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

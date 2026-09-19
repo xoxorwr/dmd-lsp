@@ -387,6 +387,34 @@ private bool workerCallHierarchyRetry(App* app, const(char)[] path,
     return false;
 }
 
+// Type hierarchy (prepare/supertypes/subtypes).
+private bool workerTypeHierarchyRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] mode, ref worker.WTypeItem[] items)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!respawnWorker(app))
+                return false;
+        }
+        auto r = workerTypeHierarchy(app.wk, path, atext, origText, line, col,
+            mode, items);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 // A JSON range from 0-based positions.
 private JsonNode* makeRange(Json js, uint sl, uint sc, uint el, uint ec)
 {
@@ -416,6 +444,22 @@ private JsonNode* callItemJson(Json js, const ref worker.WCallItem it)
     js.add_item_to_object(o, "range", makeRange(js, sl, sc, el, ec));
     js.add_item_to_object(o, "selectionRange",
         makeRange(js, sl, sc, sl, sc + cast(uint) it.name.length));
+    return o;
+}
+
+// A `TypeHierarchyItem` from a worker item.
+private JsonNode* typeItemJson(Json js, const ref worker.WTypeItem it)
+{
+    auto o = js.create_object();
+    js.add_string_to_object(o, "name", zstr(it.name));
+    js.add_number_to_object(o, "kind", it.kind);
+    js.add_string_to_object(o, "uri", zstr(pathToUri(it.file)));
+    uint l = it.line > 0 ? it.line - 1 : 0;
+    uint c = it.col > 0 ? it.col - 1 : 0;
+    js.add_item_to_object(o, "range",
+        makeRange(js, l, c, l, c + it.len));
+    js.add_item_to_object(o, "selectionRange",
+        makeRange(js, l, c, l, c + it.len));
     return o;
 }
 
@@ -2050,6 +2094,7 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "implementationProvider", true);
         js.add_bool_to_object(caps, "documentHighlightProvider", true);
         js.add_bool_to_object(caps, "callHierarchyProvider", true);
+        js.add_bool_to_object(caps, "typeHierarchyProvider", true);
         js.add_bool_to_object(caps, "foldingRangeProvider", true);
         // Advertised whenever the client can use it; the result is empty until
         // `inlayHints` is enabled (so a dls.json edit takes effect without a
@@ -2379,6 +2424,71 @@ private void handleMessage(App* app, ref RawMsg m)
                         js.add_item_to_array(arr, o);
                     }
                 }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/prepareTypeHierarchy" ||
+            m.method == "typeHierarchy/supertypes" ||
+            m.method == "typeHierarchy/subtypes")
+        {
+            string path;
+            uint line = 0;
+            uint col = 0;
+            string mode;
+            if (m.method == "textDocument/prepareTypeHierarchy")
+            {
+                const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+                if (uri is null)
+                {
+                    lspRespond(m.idJson, "null");
+                    return;
+                }
+                path = uriToPath(uri);
+                auto pos = jget(p, "position");
+                line = cast(uint) jint(jget(pos, "line")) + 1;
+                col = cast(uint) jint(jget(pos, "character")) + 1;
+                mode = "prepare";
+            }
+            else
+            {
+                auto item = jget(p, "item");
+                const(char)[] uri = jstr(jget(item, "uri"));
+                if (uri is null)
+                {
+                    lspRespond(m.idJson, "null");
+                    return;
+                }
+                path = uriToPath(uri);
+                auto st = jget(jget(item, "selectionRange"), "start");
+                line = cast(uint) jint(jget(st, "line")) + 1;
+                col = cast(uint) jint(jget(st, "character")) + 1;
+                mode = m.method == "typeHierarchy/supertypes" ? "supertypes"
+                                                                : "subtypes";
+            }
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            if (mode == "subtypes")
+                ensureIndex(app); // subtypes are workspace-wide
+            worker.WTypeItem[] items;
+            if (workerTypeHierarchyRetry(app, path, text, text, line, col, mode,
+                items))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (it; items)
+                    js.add_item_to_array(arr, typeItemJson(js, it));
                 lspRespond(m.idJson, printJsonStr(arr));
             }
             else

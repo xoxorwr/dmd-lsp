@@ -28,8 +28,8 @@ import symbols : DocSymbol, documentSymbols, FoldRange, foldingRanges,
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
-    isAggregateMember, implementationLocs, CallSite, collectCalls,
-    collectCallsIn, FuncInfo, funcInfo, keyMatches;
+    isAggregateMember, implementationLocs, collectClassDecls, CallSite,
+    collectCalls, collectCallsIn, FuncInfo, funcInfo, keyMatches, moduleOf;
 
 import lint;
 import semantic : SemTok, semanticTokens;
@@ -1275,6 +1275,196 @@ private void implementStubsAndSend(ref ServerState s, const ref Analysis a,
     sendImplementStubs(stubs);
 }
 
+// ---------- type hierarchy ----------
+
+struct WTypeItem
+{
+    string name;
+    ubyte kind; // LSP SymbolKind (class 5, interface 11)
+    string file;
+    uint line; // 1-based
+    uint col; // 1-based
+    uint len;
+}
+
+// Column of `name` on 1-based `line`, searching the line from 1-based
+// `fromCol` (aggregate `loc` points at the declaration keyword, not the name).
+private void nameSpan(const(char)[] text, uint line, uint fromCol,
+    const(char)[] name, out uint col, out uint len)
+{
+    col = fromCol;
+    len = cast(uint) name.length;
+    if (!name.length)
+        return;
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    while (i < text.length && text[i] != '\n')
+        i++;
+    size_t lineLen = i - ls;
+    size_t s = fromCol > 0 ? fromCol - 1 : 0;
+    if (s > lineLen)
+        s = lineLen;
+    for (size_t k = s; k + name.length <= lineLen; k++)
+        if (text[ls + k .. ls + k + name.length] == name)
+        {
+            col = cast(uint)(k + 1);
+            return;
+        }
+}
+
+private WTypeItem typeItem(ClassDeclaration cd)
+{
+    import core.stdc.string : strlen;
+
+    WTypeItem it;
+    it.name = cd.ident ? cd.ident.toString().idup : null;
+    it.kind = cd.isInterfaceDeclaration() ? 11 : 5;
+    const(char)* f = cd.loc.filename();
+    it.file = f ? f[0 .. strlen(f)].idup : null;
+    it.line = cd.loc.linnum();
+    it.col = cast(uint) cd.loc.charnum();
+    it.len = cd.ident ? cast(uint) cd.ident.toString().length : 0;
+    if (cd.ident && it.line >= 1)
+    {
+        auto mod = moduleOf(cd);
+        if (mod && mod.src.length)
+            nameSpan(cast(const(char)[]) mod.src, it.line, it.col,
+                cd.ident.toString(), it.col, it.len);
+    }
+    return it;
+}
+
+private void sendTypeItems(const(WTypeItem)[] items)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    foreach (it; items)
+    {
+        auto o = js.create_object();
+        js.add_string_to_object(o, "name", zstr(it.name));
+        js.add_number_to_object(o, "kind", it.kind);
+        js.add_string_to_object(o, "file", zstr(it.file));
+        js.add_number_to_object(o, "line", it.line);
+        js.add_number_to_object(o, "col", it.col);
+        js.add_number_to_object(o, "len", it.len);
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "items", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
+// Classes in `mod` that directly derive from / implement `baseKey`.
+private void collectSubtypesIn(Module mod, ref const DeclKey baseKey,
+    ref WTypeItem[] out_)
+{
+    if (!mod || !mod.members)
+        return;
+    Dsymbol[] top;
+    foreach (i; 0 .. (*mod.members).length)
+        top ~= (*mod.members)[i];
+    ClassDeclaration[] classes;
+    collectClassDecls(top, classes);
+    foreach (cd; classes)
+    {
+        bool direct = cd.baseClass && keyMatches(declKey(cd.baseClass), baseKey);
+        if (!direct)
+            foreach (bc; cd.interfaces)
+                if (bc.sym && keyMatches(declKey(bc.sym), baseKey))
+                {
+                    direct = true;
+                    break;
+                }
+        if (direct)
+            out_ ~= typeItem(cd);
+    }
+}
+
+private void typeHierarchyAndSend(ref ServerState s, const ref Analysis a,
+    const(char)[] path, const(char)[] orig, uint line, uint col,
+    const(char)[] mode)
+{
+    import core.stdc.string : strlen;
+
+    WTypeItem[] items;
+    auto cd = classAt(cast(Module)a.module_, line, col, orig);
+    if (!cd)
+    {
+        sendTypeItems(items);
+        return;
+    }
+    if (mode == "prepare")
+    {
+        items ~= typeItem(cd);
+        sendTypeItems(items);
+        return;
+    }
+    if (mode == "supertypes")
+    {
+        // `baseClass` is null for interfaces; `interfaces` covers both a
+        // class's implemented interfaces and an interface's base interfaces.
+        for (auto b = cd.baseClass; b; b = b.baseClass)
+            items ~= typeItem(b);
+        foreach (bc; cd.interfaces)
+            if (bc.sym)
+                items ~= typeItem(bc.sym);
+        sendTypeItems(items);
+        return;
+    }
+    // subtypes: workspace-wide, mirroring the `implementation` op.
+    auto baseKey = declKey(cd);
+    const(char)* df = cd.loc.filename();
+    string declFile = df ? df[0 .. strlen(df)].idup : null;
+    string declName = declFile.length ? indexModuleOfFile(declFile) : null;
+    if (!declName.length)
+    {
+        sendTypeItems(items);
+        return;
+    }
+    bool[string] want;
+    want[declName] = true;
+    string reqName = indexModuleOfFile(path);
+    if (reqName.length)
+        want[reqName] = true;
+    foreach (mn; importerModules(declName))
+        want[mn] = true;
+    foreach (mn, _; want)
+    {
+        auto f = indexFileOf(mn);
+        if (!f.length)
+            continue;
+        const(char)[] text = (f == path && orig.length) ? orig : sessionReadDisk(f);
+        if (!text.length)
+            continue;
+        auto ca = serverAnalyze(s, f, text);
+        if (!ca.ok || !ca.module_)
+            continue;
+        collectSubtypesIn(cast(Module)ca.module_, baseKey, items);
+    }
+    WTypeItem[] uniq;
+    foreach (it; items)
+    {
+        bool dup = false;
+        foreach (u; uniq)
+            if (u.file == it.file && u.line == it.line && u.col == it.col)
+            {
+                dup = true;
+                break;
+            }
+        if (!dup)
+            uniq ~= it;
+    }
+    sendTypeItems(uniq);
+}
+
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
     const(char)[] path, const(char)[] orig, uint line, uint col,
     bool includeDecl)
@@ -1980,6 +2170,41 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 }))
                     continue;
                 sendCalls(mode, null, null);
+                built = true;
+                continue;
+            }
+            if (ops == "typeHierarchy")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto mode = dupOrEmpty(jstr(jget(p, "mode")));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    typeHierarchyAndSend(s, a, path, orig, line, col, mode);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                if (forkRun(() {
+                    typeHierarchyAndSend(s, a, path, orig, line, col, mode);
+                }))
+                    continue;
+                WTypeItem[] none;
+                sendTypeItems(none);
                 built = true;
                 continue;
             }
@@ -2919,6 +3144,43 @@ ExchangeResult workerCallHierarchy(ref Worker w, const(char)[] path,
                         }
                 calls ~= call;
             }
+    return ExchangeResult.ok;
+}
+
+// Type hierarchy (prepare/supertypes/subtypes).
+ExchangeResult workerTypeHierarchy(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] mode, ref WTypeItem[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("typeHierarchy"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    js.add_string_to_object(root, "mode", zstr(mode));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto arr = jget(r, "items"))
+        for (auto c = arr.child; c; c = c.next)
+        {
+            WTypeItem it;
+            it.name = dupOrEmpty(jstr(jget(c, "name")));
+            it.kind = cast(ubyte) jint(jget(c, "kind"));
+            it.file = dupOrEmpty(jstr(jget(c, "file")));
+            it.line = cast(uint) jint(jget(c, "line"));
+            it.col = cast(uint) jint(jget(c, "col"));
+            it.len = cast(uint) jint(jget(c, "len"));
+            out_ ~= it;
+        }
     return ExchangeResult.ok;
 }
 
