@@ -2940,7 +2940,8 @@ private void refreshImports(App* app)
     }
 }
 
-// The dmd executable: $DMD when set, else the first `dmd` on PATH.
+// The dmd executable used to locate the default stdlib: `$DMD` (a path or a
+// command name) when set, else `dmd` on PATH.
 private string dmdExecutable()
 {
     import core.stdc.string : strlen;
@@ -2948,13 +2949,27 @@ private string dmdExecutable()
     if (auto env = getenv("DMD"))
     {
         auto s = env[0 .. strlen(env)];
-        if (fileExists(s))
-            return absolutePath(s);
+        if (s.length)
+        {
+            if (fileExists(s))
+                return absolutePath(s);
+            if (auto p = whichOnPath(s))
+                return p;
+            return null; // an explicit $DMD we cannot resolve
+        }
     }
     version (Windows)
         immutable name = "dmd.exe";
     else
         immutable name = "dmd";
+    return whichOnPath(name);
+}
+
+// `name` looked up in PATH, or null.
+private string whichOnPath(const(char)[] name)
+{
+    import core.stdc.string : strlen;
+
     auto envPath = getenv("PATH");
     if (!envPath)
         return null;
