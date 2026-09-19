@@ -3043,7 +3043,38 @@ void workerKill(ref Worker w)
     w.alive = false;
 }
 
-bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flags)
+// Pipe fds of `w` that a newly forked worker must close. Without this, a
+// second worker inherits the first's pipe ends; killing the first then cannot
+// EOF it (another process still holds the write end) and the server blocks in
+// waitpid. Windows has no fork; use workerDisinherit instead.
+void workerChildFds(ref Worker w, ref int[] out_)
+{
+    version (Posix)
+    {
+        if (w.req.fd >= 0)
+            out_ ~= w.req.fd;
+        if (w.resp.fd >= 0)
+            out_ ~= w.resp.fd;
+    }
+}
+
+// Windows: mark the server's ends of `w` non-inheritable so a later worker
+// (CreateProcess inherits inheritable handles) cannot hold them open.
+void workerDisinherit(ref Worker w)
+{
+    version (Windows)
+    {
+        import core.sys.windows.winbase : SetHandleInformation,
+            HANDLE_FLAG_INHERIT;
+        if (w.req.h)
+            SetHandleInformation(w.req.h, HANDLE_FLAG_INHERIT, 0);
+        if (w.resp.h)
+            SetHandleInformation(w.resp.h, HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flags,
+    scope const(int)[] closeInChild = null)
 {
     version (Posix)
     {
@@ -3069,6 +3100,11 @@ bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flag
             dup2(fromChild[1], 1);
             close(toChild[0]); close(toChild[1]);
             close(fromChild[0]); close(fromChild[1]);
+            // Drop the server's other workers' pipe ends: inheriting them
+            // would keep those workers alive after the server closes its end.
+            foreach (fd; closeInChild)
+                if (fd >= 0)
+                    close(fd);
             workerMain();
             _exit(0);
         }

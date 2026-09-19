@@ -20,13 +20,17 @@ How `dmd-lsp` works and the conventions it is built on.
 - Toolchain targets the 2.113.0 line (never system dmd). LDC's `ldmd2` is
   supported (`make DC=ldmd2`) and is what CI/nightlies use.
 
-## Memory model: warm worker, in-place re-parse
+## Memory model: warm workers, in-place re-parse
 
 The LSP front end holds only session docs, config and the debounce
-bookkeeping. Analysis runs in a worker process (`worker.d`, cross-platform):
+bookkeeping. Analysis runs in worker processes (`worker.d`, cross-platform):
 POSIX `fork()`s the server, Windows spawns this executable with `--worker`;
-either way the child owns one warm dmd universe and speaks length-prefixed
-frames over pipes.
+either way each child owns one warm dmd universe and speaks length-prefixed
+frames over pipes. The parent keeps a pool of up to `maxWorkers` single-root
+workers, one per analyzed root, least-recently-used evicted — so switching back
+to a file you already opened reuses its warm universe instead of rebuilding.
+(Workers must close the other pool members' pipe fds in the child, or a killed
+worker never sees EOF and the server blocks in `waitpid`.)
 
 The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
 ~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies), and it is identical
@@ -38,9 +42,11 @@ template-instance links stay valid (~43 ms for the same frontend). The
 per-generation frontend caches are reset by the patches in
 [upstream.md](upstream.md).
 
-A dependency, config or root-path change replies `needRespawn`: the parent
-discards the worker and starts a fresh one, so the OS reclaims the discarded
-universe. Process isolation is the reclamation boundary because the
+A dependency or config change replies `needRespawn` (or drops every worker on a
+config change): the parent discards the affected worker and starts a fresh one,
+so the OS reclaims the discarded universe. A root switch is absorbed by the
+pool when the root is warm, and otherwise spawns/binds a worker (evicting the
+LRU when full). Process isolation is the reclamation boundary because the
 conservative GC cannot prove a discarded universe unreachable in-process (see
 [findings.md](findings.md)).
 

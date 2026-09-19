@@ -98,6 +98,7 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
   "stringImportPaths": ["views/"],   // for import("...") files (-J)
   "flags": ["-preview=rvaluerefparam", "-preview=bitfields", "-betterC"],
   "debounceMs": 500,                 // default: 500
+  "maxWorkers": 4,                   // default: 4 (see below)
 
   // Optional features — all off unless you opt in:
   "inlayHints": false,               // default: false
@@ -116,6 +117,7 @@ loads at `initialize` and on save.
 |-----|---------|--------|
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
+| `maxWorkers` | `4` | Size of the analysis-worker pool. Each worker keeps one file's dependency graph warm; up to `maxWorkers` roots are held, least-recently-used evicted. Raise it if you switch between many open files and see rebuilds. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is
@@ -123,10 +125,12 @@ loads at `initialize` and on save.
 
 ## How it works
 
-`dmd-lsp` runs the real dmd frontend in a worker process. The imported
-dependency graph is compiled once and kept warm, so an edit re-analyses only
-the changed file on top of it. When a dependency, the configuration or the
-entry file changes, the worker is restarted and the OS reclaims the old state.
+`dmd-lsp` runs the real dmd frontend in worker processes. Each worker holds one
+file's dependency graph warm, so an edit re-analyses only the changed file on
+top of it. A pool of up to `maxWorkers` keeps the files you switch between warm
+(least-recently-used evicted), instead of restarting the one worker on every
+move. When a dependency or the configuration changes the affected worker is
+restarted and the OS reclaims the old state.
 
 Details: [docs/design.md](docs/design.md).
 

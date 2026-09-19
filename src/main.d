@@ -32,6 +32,20 @@ struct HitCache
     worker.WAnalysis analysis; // last analysis (lint, for codeAction)
 }
 
+// Default pool size: a handful of genuinely-open files (measured sessions
+// needed 5-8 roots). Overridable from dls.json / initializationOptions.
+enum uint defaultMaxWorkers = 4;
+
+// One single-root worker. `root` is the file whose universe it currently
+// holds; `indexBuilt` tracks the per-process workspace index.
+struct PoolEntry
+{
+    string root; // bound root path ("" when unbound)
+    worker.Worker wk;
+    ulong stamp; // LRU clock
+    bool indexBuilt; // this worker's workspace index is warm
+}
+
 struct App
 {
     Session session; // open document texts (perm arena inside)
@@ -54,7 +68,13 @@ struct App
     string[] flags; // effective dmd flags (CLI ++ dls.json)
     ulong configGen = 0; // bumped on import-path change; invalidates worker
     FileConfig fileCfg; // project dls.json (see below)
-    worker.Worker wk; // analysis worker (lazy)
+    // Single-root analysis workers, one per analyzed root, LRU-evicted at
+    // `maxWorkers`. Revisited roots stay warm instead of paying a fresh
+    // kill+spawn+re-init on every switch. MRU entry is last.
+    PoolEntry[] pool;
+    uint maxWorkers = defaultMaxWorkers;
+    bool maxWorkersSet = false; // editor/CLI explicitly set it
+    ulong poolClock = 0; // LRU stamp source
     // Semantic tokens: last result per path and the text hash it was computed
     // from, so a pull that arrives mid-edit is served from cache instead of
     // forcing a synchronous rebuild per keystroke.
@@ -64,7 +84,6 @@ struct App
     bool semanticRefresh = false; // client supports workspace/semanticTokens/refresh
     bool watchFiles = false; // client supports workspace/didChangeWatchedFiles
     string root; // workspace root from initialize (scopes the config watcher)
-    bool indexBuilt = false; // workspace symbol index is warm in the worker
     ulong nextReqId = 0; // ids for our own server->client requests
     bool inlayHints = false; // opt-in (dls.json / editor); off by default
     bool inlayHintsSet = false; // editor/CLI explicitly set it
@@ -89,6 +108,8 @@ struct FileConfig
     bool hasDebounce = false;
     bool inlayHints = false;
     bool hasInlayHints = false;
+    uint maxWorkers = defaultMaxWorkers;
+    bool hasMaxWorkers = false;
     bool autoImports = false;
     bool hasAutoImports = false;
 }
@@ -205,17 +226,15 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerAnalyze(app.wk, path, text, out_, realOnly);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerAnalyze(w.wk, path, text, out_, realOnly);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.failed || r == worker.ExchangeResult.respawn)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
         return false;
@@ -230,22 +249,18 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerComplete(app.wk, path, atext, origText, line, col, prefix, items);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerComplete(w.wk, path, atext, origText, line, col, prefix, items);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn the worker.
-            dropWorker(app);
+            // Drop it; the next attempt rebinds (spawning as needed).
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -257,22 +272,18 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerSignature(app.wk, path, atext, origText, line, col, sig);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerSignature(w.wk, path, atext, origText, line, col, sig);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn the worker.
-            dropWorker(app);
+            // Drop it; the next attempt rebinds (spawning as needed).
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -284,22 +295,18 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerDefinition(app.wk, path, atext, origText, line, col, def);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerDefinition(w.wk, path, atext, origText, line, col, def);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn the worker.
-            dropWorker(app);
+            // Drop it; the next attempt rebinds (spawning as needed).
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -312,21 +319,17 @@ private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerTypeDefinition(app.wk, path, atext, origText, line, col, def);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerTypeDefinition(w.wk, path, atext, origText, line, col, def);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -339,21 +342,17 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerImplementation(app.wk, path, atext, origText, line, col, locs);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerImplementation(w.wk, path, atext, origText, line, col, locs);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -366,22 +365,18 @@ private bool workerCallHierarchyRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerCallHierarchy(app.wk, path, atext, origText, line, col,
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerCallHierarchy(w.wk, path, atext, origText, line, col,
             mode, items, calls);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -394,22 +389,18 @@ private bool workerTypeHierarchyRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerTypeHierarchy(app.wk, path, atext, origText, line, col,
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerTypeHierarchy(w.wk, path, atext, origText, line, col,
             mode, items);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -469,21 +460,17 @@ private bool workerInlayHintsRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerInlayHints(app.wk, path, atext, origText, hints);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerInlayHints(w.wk, path, atext, origText, hints);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -494,21 +481,17 @@ private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[]
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerFolding(app.wk, text, folds);
+        auto w = poolAcquire(app, null);
+        if (w is null)
+            return false;
+        auto r = workerFolding(w.wk, text, folds);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, null);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -520,21 +503,17 @@ private bool workerDocumentLinksRetry(App* app, const(char)[] text,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerDocumentLinks(app.wk, text, dirs, links);
+        auto w = poolAcquire(app, null);
+        if (w is null)
+            return false;
+        auto r = workerDocumentLinks(w.wk, text, dirs, links);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, null);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -547,21 +526,17 @@ private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerDocumentHighlight(app.wk, path, atext, origText, line, col, locs);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerDocumentHighlight(w.wk, path, atext, origText, line, col, locs);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -573,22 +548,18 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerHover(app.wk, path, atext, origText, line, col, hov);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerHover(w.wk, path, atext, origText, line, col, hov);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            // Respawn the worker.
-            dropWorker(app);
+            // Drop it; the next attempt rebinds (spawning as needed).
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -600,21 +571,17 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerDocumentSymbol(app.wk, path, text, resultJson);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerDocumentSymbol(w.wk, path, text, resultJson);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -627,22 +594,18 @@ private bool workerReferencesRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerReferences(app.wk, path, atext, origText, line, col,
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerReferences(w.wk, path, atext, origText, line, col,
             includeDecl, refs);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -655,22 +618,18 @@ private bool workerPrepareRenameRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerPrepareRename(app.wk, path, atext, origText, line, col,
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerPrepareRename(w.wk, path, atext, origText, line, col,
             prep);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -683,22 +642,18 @@ private bool workerRenameRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerRename(app.wk, path, atext, origText, line, col, newName,
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerRename(w.wk, path, atext, origText, line, col, newName,
             res);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -754,18 +709,16 @@ private bool inProject(App* app, const(char)[] file)
 
 // Workspace symbol index: build (parse-only; resets the warm universe in the
 // worker), query, invalidate.
-private bool workerBuildIndexRetry(App* app, string[] files)
+private bool workerBuildIndexRetry(App* app, const(char)[] path, string[] files)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        if (workerBuildIndex(app.wk, files) == worker.ExchangeResult.ok)
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        if (workerBuildIndex(w.wk, files) == worker.ExchangeResult.ok)
             return true;
-        dropWorker(app);
+        poolDrop(app, path);
     }
     return false;
 }
@@ -775,57 +728,147 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerWorkspaceSymbol(app.wk, query, syms);
+        auto w = poolAcquire(app, null);
+        if (w is null)
+            return false;
+        auto r = workerWorkspaceSymbol(w.wk, query, syms);
         if (r == worker.ExchangeResult.ok)
             return true;
-        dropWorker(app);
+        poolDrop(app, null);
     }
     return false;
 }
 
-// Kill the worker and drop state that lived only in it. The workspace index is
-// per-process: a respawned worker starts with none, so a stale `indexBuilt`
-// would make later requests skip the rebuild and see an empty module map
-// ("declaring module not indexed").
-private void dropWorker(App* app)
+// Find the pool entry bound to `path`, or null.
+private PoolEntry* poolFind(App* app, const(char)[] path)
 {
-    workerKill(app.wk);
-    app.indexBuilt = false;
+    if (path !is null)
+        foreach (ref e; app.pool)
+            if (e.root == path)
+                return &e;
+    return null;
 }
 
-// Spawn the worker, notifying the user once if it cannot start. Wrapping
-// workerSpawn keeps a dead worker from silently yielding empty results.
-private bool respawnWorker(App* app)
+// Most-recently-used entry, or null when the pool is empty.
+private PoolEntry* poolMRU(App* app)
 {
-    if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+    return app.pool.length ? &app.pool[$ - 1] : null;
+}
+
+// Notify the user once if a worker cannot start.
+private void poolNotifyFail(App* app)
+{
+    log("worker: start failed");
+    if (!app.workerNotified)
     {
-        log("worker: start failed");
-        if (!app.workerNotified)
+        app.workerNotified = true;
+        Notice n;
+        n.have = true;
+        n.type = 1;
+        n.text = "dmd-lsp: could not start the analysis worker; see the dmd-lsp output channel";
+        notifyNotice(n);
+    }
+}
+
+// Find or create the worker bound to `path` (null: the MRU worker, created
+// unbound when the pool is empty). Evicts the least-recently-used worker when
+// the pool is full. Returns null only when a spawn fails.
+private PoolEntry* poolAcquire(App* app, const(char)[] path)
+{
+    if (path !is null)
+    {
+        if (auto hit = poolFind(app, path))
         {
-            app.workerNotified = true;
-            Notice n;
-            n.have = true;
-            n.type = 1;
-            n.text = "dmd-lsp: could not start the analysis worker; see the dmd-lsp output channel";
-            notifyNotice(n);
+            hit.stamp = ++app.poolClock;
+            return hit;
         }
-        return false;
+    }
+    else if (app.pool.length)
+    {
+        auto e = poolMRU(app);
+        e.stamp = ++app.poolClock;
+        return e;
+    }
+    immutable uint cap = app.maxWorkers ? app.maxWorkers : 1;
+    if (app.pool.length && app.pool.length >= cap)
+    {
+        size_t lru = 0;
+        foreach (i; 1 .. app.pool.length)
+            if (app.pool[i].stamp < app.pool[lru].stamp)
+                lru = i;
+        workerKill(app.pool[lru].wk);
+        foreach (i; lru .. app.pool.length - 1)
+            app.pool[i] = app.pool[i + 1];
+        app.pool.length--;
+    }
+    PoolEntry e;
+    e.root = path is null ? null : path.idup;
+    e.stamp = ++app.poolClock;
+    // The new worker must not inherit (and thus keep alive) the pipes of
+    // workers already in the pool, or killing one would block in waitpid.
+    int[] closeInChild;
+    foreach (ref other; app.pool)
+    {
+        workerChildFds(other.wk, closeInChild);
+        workerDisinherit(other.wk);
+    }
+    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, closeInChild))
+    {
+        poolNotifyFail(app);
+        return null;
     }
     app.workerNotified = false;
-    return true;
+    app.pool ~= e;
+    return &app.pool[$ - 1];
 }
 
-// Build the workspace index once per worker/config generation.
-private bool ensureIndex(App* app)
+// Kill and remove the worker bound to `path` (null: the MRU worker). Its
+// universe and workspace index die with it.
+private void poolDrop(App* app, const(char)[] path)
 {
-    if (!app.wk.alive)
-        app.indexBuilt = false; // silent crash: the fresh worker has no index
-    if (app.indexBuilt)
+    size_t idx = size_t.max;
+    if (path is null)
+    {
+        if (app.pool.length)
+            idx = app.pool.length - 1;
+    }
+    else
+        foreach (i, ref e; app.pool)
+            if (e.root == path)
+            {
+                idx = i;
+                break;
+            }
+    if (idx == size_t.max)
+        return;
+    workerKill(app.pool[idx].wk);
+    foreach (i; idx .. app.pool.length - 1)
+        app.pool[i] = app.pool[i + 1];
+    app.pool.length--;
+}
+
+private void poolDropAll(App* app)
+{
+    foreach (ref e; app.pool)
+        workerKill(e.wk);
+    app.pool = null;
+}
+
+// A workspace source changed: every worker's parse-only index is stale.
+private void poolInvalidateIndex(App* app)
+{
+    foreach (ref e; app.pool)
+        e.indexBuilt = false;
+}
+
+// Build the workspace index in the worker bound to `path` (null: the MRU
+// worker) once per worker/config generation.
+private bool ensureIndex(App* app, const(char)[] path)
+{
+    auto e = poolAcquire(app, path);
+    if (e is null)
+        return false;
+    if (e.indexBuilt)
         return true;
     if (!app.root.length)
         return false;
@@ -833,13 +876,14 @@ private bool ensureIndex(App* app)
     ulong t0 = nowMs();
     auto files = indexFiles(app);
     traceMs("index.discovery", nowMs() - t0);
-    if (!workerBuildIndexRetry(app, files))
+    if (!workerBuildIndexRetry(app, path, files))
     {
         log("worker: workspace index build failed");
         return false;
     }
     traceMs("index.build", nowMs() - t0);
-    app.indexBuilt = true;
+    if (auto e2 = poolAcquire(app, path))
+        e2.indexBuilt = true;
     return true;
 }
 
@@ -850,19 +894,17 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
         auto r = prefix
-            ? workerImportCompletions(app.wk, name, path, out_)
-            : workerImportCandidates(app.wk, name, path, out_);
+            ? workerImportCompletions(w.wk, name, path, out_)
+            : workerImportCandidates(w.wk, name, path, out_);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
         return false;
@@ -877,17 +919,15 @@ private bool workerImplementRetry(App* app, const(char)[] path,
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerImplementStubs(app.wk, path, atext, origText, line, col, out_);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerImplementStubs(w.wk, path, atext, origText, line, col, out_);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
         return false;
@@ -1059,21 +1099,17 @@ private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] tex
     ref worker.WToken[] toks){
     for (int attempt = 0; attempt < 2; attempt++)
     {
-        if (!app.wk.alive)
-        {
-            if (!respawnWorker(app))
-                return false;
-        }
-        auto r = workerSemantic(app.wk, path, text, toks);
+        auto w = poolAcquire(app, path);
+        if (w is null)
+            return false;
+        auto r = workerSemantic(w.wk, path, text, toks);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
         {
-            dropWorker(app);
+            poolDrop(app, path);
             continue;
         }
-        if (!app.wk.alive)
-            continue;
         return false;
     }
     return false;
@@ -1321,6 +1357,15 @@ private void applyConfig(App* app, JsonNode* node)
         app.autoImports = jbool(ai, false);
         app.autoImportsSet = true;
     }
+    if (auto mw = jget(obj, "maxWorkers"))
+    {
+        long v = jint(mw);
+        if (v > 0 && v <= 64)
+        {
+            app.maxWorkers = cast(uint) v;
+            app.maxWorkersSet = true;
+        }
+    }
 }
 
 // Workspace root from initialize params: first workspace folder, else
@@ -1489,6 +1534,18 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         fc.hasAutoImports = true;
         fc.autoImports = jbool(ai, false);
     }
+    if (auto mw = jget(doc, "maxWorkers"))
+    {
+        if ((mw.type & 0xFF) == JsonNumber)
+        {
+            long v = jint(mw);
+            if (v > 0 && v <= 64)
+            {
+                fc.hasMaxWorkers = true;
+                fc.maxWorkers = cast(uint) v;
+            }
+        }
+    }
     // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
     fc.flags = jstrArray(jget(doc, "flags"));
     app.fileCfg = fc;
@@ -1498,6 +1555,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.inlayHints = fc.inlayHints;
     if (!app.autoImportsSet && fc.hasAutoImports)
         app.autoImports = fc.autoImports;
+    if (!app.maxWorkersSet && fc.hasMaxWorkers)
+        app.maxWorkers = fc.maxWorkers;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -1527,6 +1586,8 @@ private void clearFileConfig(App* app)
         app.inlayHints = false;
     if (!app.autoImportsSet)
         app.autoImports = false;
+    if (!app.maxWorkersSet)
+        app.maxWorkers = defaultMaxWorkers;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -1916,9 +1977,9 @@ private void handleMessage(App* app, ref RawMsg m)
             return;
         if (m.method == "exit")
         {
-            // C `exit` skips `scope (exit)`, so kill the worker explicitly;
-            // otherwise an orphaned child keeps the client's pipes open.
-            dropWorker(app);
+            // C `exit` skips `scope (exit)`, so kill the workers explicitly;
+            // otherwise orphaned children keep the client's pipes open.
+            poolDropAll(app);
             import core.stdc.stdlib : exit;
             exit(app.shutdownRequested ? 0 : 1);
         }
@@ -2061,9 +2122,9 @@ private void handleMessage(App* app, ref RawMsg m)
                             continue;
                         if (isDFilePath(path))
                         {
-                            // A workspace source changed: the symbol index is
-                            // stale. Rebuild lazily on the next query.
-                            app.indexBuilt = false;
+                            // A workspace source changed: every worker's
+                            // symbol index is stale. Rebuild lazily.
+                            poolInvalidateIndex(app);
                             continue;
                         }
                         if (!isDlsJson(path))
@@ -2233,7 +2294,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 string atext = analysisText(text, line, col);
                 auto prefix = extractPrefix(text, line, col);
                 if (lineIsImport(text, line))
-                    ensureIndex(app); // module/member completion needs it
+                    ensureIndex(app, path); // module/member completion needs it
                 worker.WItem[] witems;
                 if (workerCompleteRetry(app, path, atext, text, line, col, prefix, witems))
                 {
@@ -2285,7 +2346,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     posInCode(text, line, col) &&
                     !prefixAfterDot(text, line, col, prefix.length))
                 {
-                    ensureIndex(app);
+                    ensureIndex(app, path);
                     worker.WIndexSym[] cands;
                     if (workerImportRetry(app, prefix, path, cands, true))
                     {
@@ -2467,7 +2528,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
                 return;
             }
-            ensureIndex(app); // incoming calls are workspace-wide
+            ensureIndex(app, path); // incoming calls are workspace-wide
             worker.WCallItem[] items;
             worker.WCall[] calls;
             if (workerCallHierarchyRetry(app, path, text, text, line, col, mode,
@@ -2555,7 +2616,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             if (mode == "subtypes")
-                ensureIndex(app); // subtypes are workspace-wide
+                ensureIndex(app, path); // subtypes are workspace-wide
             worker.WTypeItem[] items;
             if (workerTypeHierarchyRetry(app, path, text, text, line, col, mode,
                 items))
@@ -2738,7 +2799,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            ensureIndex(app); // enables workspace-wide implementation search
+            ensureIndex(app, path); // enables workspace-wide implementation search
             worker.WRef[] locs;
             if (workerImplementationRetry(app, path, atext, text, line, col, locs))
             {
@@ -2877,7 +2938,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            ensureIndex(app); // enables workspace-wide references
+            ensureIndex(app, path); // enables workspace-wide references
             worker.WRefs refs;
             if (workerReferencesRetry(app, path, atext, text, line, col,
                 includeDecl, refs))
@@ -2982,7 +3043,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            ensureIndex(app); // completeness needs the import graph
+            ensureIndex(app, path); // completeness needs the import graph
             worker.WRename rn;
             if (!workerRenameRetry(app, path, atext, text, line, col, newName, rn))
             {
@@ -3053,8 +3114,7 @@ private void handleMessage(App* app, ref RawMsg m)
             auto q = jstr(jget(p, "query"));
             if (q is null)
                 q = "";
-            if (!app.indexBuilt)
-                ensureIndex(app);
+            ensureIndex(app, null);
             worker.WIndexSym[] syms;
             if (workerWorkspaceSymbolRetry(app, q, syms))
             {
@@ -3268,7 +3328,7 @@ private void handleMessage(App* app, ref RawMsg m)
                             {
                                 if (!text)
                                     break;
-                                ensureIndex(app);
+                                ensureIndex(app, path);
                                 importInsertPos(text, il, ic);
                                 haveInsert = true;
                             }
@@ -3491,13 +3551,12 @@ private void refreshImports(App* app)
         app.flags = feff;
         app.configGen++;
         // The workspace index is rebuilt from the new import paths' files.
-        app.indexBuilt = false;
-        // Host bakes paths in at init; drop it so the next request
-        // respawns with the new configuration. Tokens may resolve
-        // differently under the new paths, so drop the cache too.
+        // Host bakes paths in at init; drop every worker so the next request
+        // spawns with the new configuration. Tokens may resolve differently
+        // under the new paths, so drop the cache too.
         app.tokCache = null;
         app.tokHash = null;
-        dropWorker(app);
+        poolDropAll(app);
     }
 }
 
@@ -3851,7 +3910,7 @@ int main(string[] args)
     version (Posix)
         signal(SIGPIPE, SIG_IGN); // client may close stdout
     scope (exit)
-        dropWorker(&app);
+        poolDropAll(&app);
     app.lastMsgMs = nowMs();
     version (Posix)
     {
