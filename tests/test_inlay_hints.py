@@ -136,6 +136,20 @@ check('inlay-hints-named-args',
 check('inlay-hints-unordered-named-args',
       not any(h[0] == 24 for h in on_hints), str(on_hints))
 
+# A UTF-16 dls.json must still load: the server decodes it to UTF-8 first.
+u16 = tempfile.mkdtemp(prefix='dmd-lsp-hints-u16-')
+open(os.path.join(u16, 'dls.json'), 'wb').write(
+    '{"inlayHints": true}'.encode('utf-16'))  # BOM + UTF-16LE
+d = Daemon(['--stdio', '--import=' + u16])
+d.send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"rootUri": 'file://' + u16,
+                   "capabilities": {"textDocument": {"inlayHint": {}}}}})
+caps = d.read()['result'].get('capabilities', {})
+check('inlay-hints-utf16-config',
+      caps.get('inlayHintProvider') is not None, str(caps.get('inlayHintProvider')))
+d.proc.kill()
+shutil.rmtree(u16, ignore_errors=True)
+
 shutil.rmtree(SRC, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

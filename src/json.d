@@ -220,6 +220,84 @@ private ParseBuffer* skip_utf8_bom(ParseBuffer* buf)
     return buf;
 }
 
+// Decode a config file's bytes to UTF-8: UTF-16 with or without a BOM is
+// transcoded; a UTF-8 BOM is left to the parser.
+string decodeJsonText(const(char)[] s)
+{
+    if (s.length >= 2 && cast(ubyte)s[0] == 0xFF && cast(ubyte)s[1] == 0xFE)
+        return utf16ToUtf8(s, false);
+    if (s.length >= 2 && cast(ubyte)s[0] == 0xFE && cast(ubyte)s[1] == 0xFF)
+        return utf16ToUtf8(s, true);
+    if (s.length >= 6 && s[1] == 0 && s[3] == 0 &&
+        (s[0] == '{' || s[0] == '[' || s[0] == ' ' || s[0] == '\r' || s[0] == '\n'))
+        return utf16ToUtf8(s, false); // BOM-less UTF-16LE
+    if (s.length >= 6 && s[0] == 0 && s[2] == 0 &&
+        (s[1] == '{' || s[1] == '[' || s[1] == ' ' || s[1] == '\r' || s[1] == '\n'))
+        return utf16ToUtf8(s, true); // BOM-less UTF-16BE
+    return s.idup;
+}
+
+private string utf16ToUtf8(const(char)[] s, bool bigEndian)
+{
+    string out_;
+    size_t i = (s.length >= 2 &&
+        ((cast(ubyte)s[0] == 0xFF && cast(ubyte)s[1] == 0xFE) ||
+         (cast(ubyte)s[0] == 0xFE && cast(ubyte)s[1] == 0xFF))) ? 2 : 0;
+    while (i + 1 < s.length)
+    {
+        uint u = bigEndian
+            ? (cast(uint)cast(ubyte)s[i] << 8) | cast(ubyte)s[i + 1]
+            : (cast(uint)cast(ubyte)s[i + 1] << 8) | cast(ubyte)s[i];
+        i += 2;
+        if (u >= 0xD800 && u <= 0xDBFF && i + 1 < s.length)
+        {
+            uint lo = bigEndian
+                ? (cast(uint)cast(ubyte)s[i] << 8) | cast(ubyte)s[i + 1]
+                : (cast(uint)cast(ubyte)s[i + 1] << 8) | cast(ubyte)s[i];
+            if (lo >= 0xDC00 && lo <= 0xDFFF)
+            {
+                i += 2;
+                u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+            }
+        }
+        if (u < 0x80)
+            out_ ~= cast(char) u;
+        else if (u < 0x800)
+        {
+            out_ ~= cast(char)(0xC0 | (u >> 6));
+            out_ ~= cast(char)(0x80 | (u & 0x3F));
+        }
+        else if (u < 0x10000)
+        {
+            out_ ~= cast(char)(0xE0 | (u >> 12));
+            out_ ~= cast(char)(0x80 | ((u >> 6) & 0x3F));
+            out_ ~= cast(char)(0x80 | (u & 0x3F));
+        }
+        else
+        {
+            out_ ~= cast(char)(0xF0 | (u >> 18));
+            out_ ~= cast(char)(0x80 | ((u >> 12) & 0x3F));
+            out_ ~= cast(char)(0x80 | ((u >> 6) & 0x3F));
+            out_ ~= cast(char)(0x80 | (u & 0x3F));
+        }
+    }
+    return out_;
+}
+
+unittest
+{
+    assert(decodeJsonText(`{"a":1}`) == `{"a":1}`);
+    assert(decodeJsonText("\xEF\xBB\xBF{\"a\":1}") == "\xEF\xBB\xBF{\"a\":1}");
+    assert(decodeJsonText("\xFF\xFE{\x00\"\x00a\x00\"\x00:\x001\x00}\x00")
+        == `{"a":1}`); // UTF-16LE + BOM
+    assert(decodeJsonText("{\x00\"\x00a\x00\"\x00:\x001\x00}\x00")
+        == `{"a":1}`); // BOM-less UTF-16LE
+    assert(decodeJsonText("\xFE\xFF\x00{\x00\"\x00a\x00\"\x00:\x001\x00}")
+        == `{"a":1}`); // UTF-16BE + BOM
+    assert(decodeJsonText("\x00{\x00\"\x00a\x00\"\x00:\x001\x00}")
+        == `{"a":1}`); // BOM-less UTF-16BE
+}
+
 private uint parse_hex4(const(char)* input)
 {
     uint h = 0;

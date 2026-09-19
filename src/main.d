@@ -1116,7 +1116,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
     string cfg = r ~ "/dls.json";
     if (!fileExists(cfg))
         return n; // no project file: stay quiet
-    string text = sessionReadDisk(cfg);
+    string raw = sessionReadDisk(cfg);
+    string text = raw ? decodeJsonText(raw) : null; // UTF-16 -> UTF-8 (Windows)
     auto doc = text ? jparse(text) : null;
     if (!doc || (doc.type & 0xFF) != JsonObject)
     {

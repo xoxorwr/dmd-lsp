@@ -143,8 +143,8 @@ check: $(BIN) check-no-oop unittest
 
 # D unittests for the pure path helpers (no dmd, so the vendored frontend's
 # unittests don't run). `-main` generates a runner that executes them.
-unittest: src/pathutil.d
-	$(DC) -unittest -main src/pathutil.d -of$(BIN)-ut
+unittest: src/pathutil.d src/json.d src/arena.d
+	$(DC) -unittest -main src/pathutil.d src/json.d src/arena.d -of$(BIN)-ut
 	./$(BIN)-ut
 
 clean:
