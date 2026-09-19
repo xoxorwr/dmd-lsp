@@ -26,6 +26,14 @@ def send(obj):
     proc.stdin.flush()
 
 
+def wpid():
+    # The worker is a direct child of the server (fork/spawn). A respawn
+    # replaces it, so the pid changing is the signal.
+    out = subprocess.run(['pgrep', '-P', str(proc.pid)],
+                         capture_output=True, text=True).stdout.split()
+    return out[0] if out else '-'
+
+
 def read_msg():
     headers = {}
     while True:
@@ -50,6 +58,23 @@ v0 = 'module spawntest;\nstruct S { int x; int y; }\nvoid main()\n{\n    S s;\n 
 send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
       "params": {"textDocument": {"uri": URI, "languageId": "d", "version": 1, "text": v0}}})
 read_msg()
+
+# A trivia-only save while the universe is exactly the opened text: the
+# universe must stay usable (no invalidate -> respawn). Windows runs the
+# incremental re-analysis inline, so its universe advances and this branch is
+# reached while typing newlines; POSIX forks, so the test drives it via a save.
+v0b = v0.replace('void main()', '\nvoid main()')
+send({"jsonrpc": "2.0", "method": "textDocument/didSave",
+      "params": {"textDocument": {"uri": URI}, "text": v0b}})
+time.sleep(0.4)
+w0 = wpid()
+send({"jsonrpc": "2.0", "id": 90, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": URI}, "position": {"line": 6, "character": 5}}})
+while True:
+    msg = read_msg()
+    if msg.get('id') == 90:
+        break
+check('trivia-save-no-respawn', wpid() == w0, 'pid %s -> %s' % (w0, wpid()))
 
 # Version 1 (trailing dot): didChange only marks pending.
 v1 = 'module spawntest;\nstruct S { int x; int y; }\nvoid main()\n{\n    S s;\n    s.\n}\n'

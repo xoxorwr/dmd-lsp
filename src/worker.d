@@ -1685,14 +1685,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 // holding stale symbols (false "not callable" in cyclic
                 // projects). Reuse only an exact-text universe, else rebuild.
                 auto st = built ? serverUniState(s, path, null, text) : UniState.miss;
-                // Trivia-only edit (same significant tokens): no re-analysis.
-                // The program is unchanged, so keep the previous diagnostics
-                // and just invalidate the universe (positions moved) so the
-                // next semantic request rebuilds cleanly.
+                // Trivia-only edit (same significant tokens): diagnostics are
+                // unchanged, so report them as-is. Leave the universe valid
+                // with its old text hashes: the next semantic request then
+                // re-analyses in place (incremental) instead of being forced
+                // into a respawn. The cached analysis has stale positions, but
+                // the edited text never matches its hashes, so it is never
+                // reused.
                 if (built && st == UniState.incremental &&
                     dmdTokenHash(text) == s.uni.tokenHash)
                 {
-                    s.uni.valid = false;
                     Analysis none;
                     sendAnalyze(none, true);
                     continue;
