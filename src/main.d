@@ -514,6 +514,32 @@ private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[]
     return false;
 }
 
+// `textDocument/documentLink` (text-only).
+private bool workerDocumentLinksRetry(App* app, const(char)[] text,
+    const(string)[] dirs, ref worker.WLink[] links)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!respawnWorker(app))
+                return false;
+        }
+        auto r = workerDocumentLinks(app.wk, text, dirs, links);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
 // Same, for `textDocument/documentHighlight`.
 private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
@@ -2096,6 +2122,9 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "callHierarchyProvider", true);
         js.add_bool_to_object(caps, "typeHierarchyProvider", true);
         js.add_bool_to_object(caps, "foldingRangeProvider", true);
+        auto dl = js.create_object();
+        js.add_bool_to_object(dl, "resolveProvider", false);
+        js.add_item_to_object(caps, "documentLinkProvider", dl);
         // Advertised whenever the client can use it; the result is empty until
         // `inlayHints` is enabled (so a dls.json edit takes effect without a
         // server restart). Off by default.
@@ -2526,6 +2555,58 @@ private void handleMessage(App* app, ref RawMsg m)
                     js.add_number_to_object(o, "startLine", f.start);
                     js.add_number_to_object(o, "endLine", f.end);
                     jaddStrOpt(js, o, "kind", f.kind);
+                    js.add_item_to_array(arr, o);
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
+            return;
+        }
+        if (m.method == "textDocument/documentLink")
+        {
+            const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+            if (uri is null)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            string path = uriToPath(uri);
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            // `import("...")` is searched in the string-import paths, plus the
+            // file's own directory as a convenience.
+            string[] dirs = app.stringPaths.dup;
+            if (auto pd = dirOf(path))
+                dirs ~= pd;
+            worker.WLink[] links;
+            if (workerDocumentLinksRetry(app, text, dirs, links))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                foreach (l; links)
+                {
+                    auto o = js.create_object();
+                    auto range = js.create_object();
+                    auto st = js.create_object();
+                    js.add_number_to_object(st, "line", l.sl);
+                    js.add_number_to_object(st, "character", l.sc);
+                    auto en = js.create_object();
+                    js.add_number_to_object(en, "line", l.el);
+                    js.add_number_to_object(en, "character", l.ec);
+                    js.add_item_to_object(range, "start", st);
+                    js.add_item_to_object(range, "end", en);
+                    js.add_item_to_object(o, "range", range);
+                    js.add_string_to_object(o, "target", zstr(pathToUri(l.file)));
                     js.add_item_to_array(arr, o);
                 }
                 lspRespond(m.idJson, printJsonStr(arr));

@@ -1513,6 +1513,92 @@ private void typeHierarchyAndSend(ref ServerState s, const ref Analysis a,
     sendTypeItems(uniq);
 }
 
+// ---------- document links ----------
+
+struct WLink
+{
+    uint sl, sc, el, ec; // 0-based LSP range (the string contents)
+    string file; // resolved target
+}
+
+// `import("...")` string imports, resolved against `dirs`. Lexer-based, so
+// comments/strings cannot confuse it.
+private WLink[] documentLinks(const(char)[] text, const(string)[] dirs)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    WLink[] out_;
+    if (!text.length)
+        return out_;
+    auto buf = text.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    int state = 0; // 0 none, 1 after `import`, 2 after its `(`
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        if (t.value == TOK.import_)
+        {
+            state = 1;
+            continue;
+        }
+        if (t.value == TOK.leftParenthesis && state == 1)
+        {
+            state = 2;
+            continue;
+        }
+        if (t.value == TOK.string_ && state == 2)
+        {
+            const(char)[] rel = t.ustring ? t.ustring[0 .. t.len] : null;
+            state = 0;
+            if (!rel.length)
+                continue;
+            foreach (d; dirs)
+            {
+                const(char)[] cand = d ~ "/" ~ rel;
+                if (!fileExists(cand))
+                    continue;
+                WLink l;
+                l.sl = t.loc.linnum() > 0 ? t.loc.linnum() - 1 : 0;
+                l.sc = t.loc.charnum(); // 0-based start of the contents
+                l.el = l.sl;
+                l.ec = l.sc + cast(uint) rel.length;
+                l.file = cand.idup;
+                out_ ~= l;
+                break;
+            }
+            continue;
+        }
+        state = 0;
+    }
+    return out_;
+}
+
+private void sendDocumentLinks(const(WLink)[] links)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    auto arr = js.create_array();
+    foreach (l; links)
+    {
+        auto o = js.create_object();
+        js.add_number_to_object(o, "sl", l.sl);
+        js.add_number_to_object(o, "sc", l.sc);
+        js.add_number_to_object(o, "el", l.el);
+        js.add_number_to_object(o, "ec", l.ec);
+        js.add_string_to_object(o, "file", zstr(l.file));
+        js.add_item_to_array(arr, o);
+    }
+    js.add_item_to_object(root, "links", arr);
+    js.add_bool_to_object(root, "needRespawn", false);
+    writeFrame(outChan, printJsonStr(root));
+}
+
 private void referencesAndSend(ref ServerState s, const ref Analysis a,
     const(char)[] path, const(char)[] orig, uint line, uint col,
     bool includeDecl)
@@ -2156,6 +2242,23 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 if (text is null)
                     text = "";
                 sendFolds(foldingRanges(text));
+                continue;
+            }
+            if (ops == "documentLink")
+            {
+                auto text = jstr(jget(p, "text"));
+                if (text is null)
+                    text = "";
+                string[] dirs;
+                if (auto da = jget(p, "dirs"))
+                    if ((da.type & 0xFF) == JsonArray)
+                        for (auto c = da.child; c; c = c.next)
+                        {
+                            auto v = jstr(c);
+                            if (v.length)
+                                dirs ~= v.idup;
+                        }
+                sendDocumentLinks(documentLinks(text, dirs));
                 continue;
             }
             if (ops == "documentHighlight")
@@ -3287,6 +3390,40 @@ ExchangeResult workerFolding(ref Worker w, const(char)[] text, ref WFold[] out_)
                 f.end = cast(uint)jint(jget(c, "end"));
                 f.kind = dupOrEmpty(jstr(jget(c, "kind")));
                 out_ ~= f;
+            }
+    return ExchangeResult.ok;
+}
+
+ExchangeResult workerDocumentLinks(ref Worker w, const(char)[] text,
+    const(string)[] dirs, ref WLink[] out_)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("documentLink"));
+    js.add_string_to_object(root, "text", zstr(text));
+    auto da = js.create_array();
+    foreach (d; dirs)
+        js.add_item_to_array(da, js.create_string(zstr(d)));
+    js.add_item_to_object(root, "dirs", da);
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto la = jget(r, "links"))
+        if ((la.type & 0xFF) == JsonArray)
+            for (auto c = la.child; c; c = c.next)
+            {
+                WLink l;
+                l.sl = cast(uint)jint(jget(c, "sl"));
+                l.sc = cast(uint)jint(jget(c, "sc"));
+                l.el = cast(uint)jint(jget(c, "el"));
+                l.ec = cast(uint)jint(jget(c, "ec"));
+                l.file = dupOrEmpty(jstr(jget(c, "file")));
+                out_ ~= l;
             }
     return ExchangeResult.ok;
 }
