@@ -121,7 +121,6 @@ loads at `initialize` and on save.
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 | `sharedRegistry` | `true` | One worker serves **every** file, keeping all loaded modules resident, so switching between files re-analyses only the file you're in — no per-file workers, no respawns. Diagnostics stay exact: a file already loaded as a dependency is re-diagnosed by a full analysis in a forked child (POSIX) or by restarting the worker (Windows). Set `false` to use the older per-file worker pool. |
 | `maxModules` | `2048` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. Lower it to bound memory on huge projects. |
-| `maxWorkers` | `4` | Only used when `sharedRegistry` is `false`: size of the per-file worker pool, LRU-evicted. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is
@@ -137,8 +136,8 @@ the worker caches each file's last analysis and completion answers from that
 warm cache, so an open suggest widget costs no process and no re-parse. When a
 dependency or the configuration changes, or the `maxModules` cap is exceeded,
 the worker is rebuilt (the OS reclaims the old state). With
-`sharedRegistry: false` it instead runs a pool of up to `maxWorkers` per-file
-workers, least-recently-used evicted.
+`sharedRegistry: false` it instead runs a small pool of per-file workers,
+least-recently-used evicted.
 
 Details: [docs/design.md](docs/design.md).
 
