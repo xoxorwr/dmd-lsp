@@ -194,6 +194,7 @@ struct Universe
 // the warm universe or requires a rebuild.
 bool serverWouldHit(ref ServerState s, const(char)[] path, const(char)[] text)
 {
+    import core.stdc.string : memcmp;
     import session : fnv1a64;
 
     ulong h = fnv1a64(cast(const(ubyte)[])text);
@@ -212,6 +213,7 @@ bool serverWouldHit(ref ServerState s, const(char)[] path, const(char)[] text)
 bool serverWouldHitAnalysis(ref ServerState s, const(char)[] path,
     const(char)[] analysis)
 {
+    import core.stdc.string : memcmp;
     import session : fnv1a64;
 
     return s.uni.valid && s.uni.configGen == s.dmd.configGen &&
@@ -236,6 +238,7 @@ enum UniState : ubyte
 UniState serverUniState(ref ServerState s, const(char)[] path,
     const(char)[] identity, const(char)[] analysis)
 {
+    import core.stdc.string : memcmp;
     import session : fnv1a64;
 
     if (!s.uni.valid || s.uni.configGen != s.dmd.configGen ||
@@ -294,23 +297,23 @@ Analysis serverLint(ref ServerState s, const(char)[] path, const(char)[] text)
 // module registry, without a full reset, so a second root whose closure is
 // already loaded reuses those modules (`importAll` skips modules already at
 // `semanticDone`). No universe cache: dep tracking is one-root today, so this
-// deliberately invalidates the cache and re-analyzes each request.
+// deliberately invalidates the cache and re-analyzes each request. Leaves the
+// result in `s.uni.analysis` for the caller's op tail to send.
 Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
-    const(char)[] text)
+    const(char)[] text, const(char)[] identity = null)
 {
-    import core.stdc.string : memcmp;
+    import session : fnv1a64;
 
+    auto id = identity is null ? text : identity;
     s.scratch.reset();
     s.sink.reset();
     dmdResetCounters();
     Analysis a;
     StdoutGuard og;
     stdoutToStderr(og);
-    // If this file is already a registered module (it was loaded as a
-    // dependency of an earlier root), do NOT parse a fresh `Module`: its
-    // declarations would collide with the existing ones ("<symbol> already
-    // exists"). Reuse it when the text matches, else re-parse it in place so
-    // object identity (and every importer's `imp.mod`) is preserved.
+    // If this file is already a registered module (loaded as a dependency of
+    // an earlier root), reuse the resident object: parsing a fresh `Module`
+    // would collide with its declarations ("<symbol> already exists").
     Module existing = null;
     foreach (m; Module.amodules)
         if (m && m.srcfile.toString() == path)
@@ -321,21 +324,26 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
     void* modp;
     if (existing)
     {
-        if (existing.src.length == text.length &&
-            memcmp(existing.src.ptr, text.ptr, text.length) == 0)
+        // A resident module is already semanticised, so it has no pre-semantic
+        // AST to snapshot, and re-parsing it in place crashes
+        // (`dmdReparseModule` is only safe for the root the universe was built
+        // on). Get the snapshot from a registration-free parse instead (H3).
+        auto snap = dmdParseNoRegister(path, text);
+        if (snap.ok && snap.module_)
+        {
+            a.syn = snapshotModule(cast(Module) snap.module_, text);
             modp = cast(void*) existing;
+        }
         else
-            modp = dmdReparseModule(cast(void*) existing, text);
+            modp = null;
     }
     else
     {
-        auto pr = dmdParseOnly(path, text); // registers into the live registry
-        modp = pr.module_;
-        if (!pr.ok)
-            modp = null;
+        auto pr = dmdParseOnly(path, text);
+        if (pr.ok && pr.module_)
+            a.syn = snapshotModule(cast(Module)pr.module_, text);
+        modp = pr.ok ? pr.module_ : null;
     }
-    if (modp)
-        a.syn = snapshotModule(cast(Module)modp, text);
     auto errs = modp ? dmdSemantic(modp) : 1;
     stdoutRestore(og);
     a.module_ = modp;
@@ -350,6 +358,14 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
         pinLint(s.session, a.lintImports);
         pinLint(s.session, a.lintParams);
     }
+    if (id !is text)
+        mapFixDiags(a.diags, id, text);
+    s.uni.analysis = a;
+    s.uni.rootPath = path.idup;
+    s.uni.rootHash = fnv1a64(cast(const(ubyte)[])id);
+    s.uni.analysisHash = fnv1a64(cast(const(ubyte)[])text);
+    s.uni.tokenHash = dmdTokenHash(text);
+    s.uni.mark = s.scratch.mark();
     s.uni.valid = false; // no reuse until per-root closure tracking lands
     return a;
 }
@@ -357,6 +373,7 @@ Analysis serverAnalyzeShared(ref ServerState s, const(char)[] path,
 Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
     const(char)[] text, const(char)[] identity)
 {
+    import core.stdc.string : memcmp;
     import session : fnv1a64;
 
     auto id = identity is null ? text : identity;
@@ -417,6 +434,7 @@ Analysis serverAnalyzeIncremental(ref ServerState s, const(char)[] path,
 Analysis serverAnalyze(ref ServerState s, const(char)[] path, const(char)[] text,
     const(char)[] identity = null)
 {
+    import core.stdc.string : memcmp;
     import session : fnv1a64;
 
     auto id = identity is null ? text : identity;

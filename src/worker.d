@@ -2486,8 +2486,12 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
                 }
                 Analysis a;
                 if (built)
@@ -2525,12 +2529,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     signatureAndSend(s, a, orig, line, col);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 signatureAndSend(s, a, orig, line, col);
@@ -2555,12 +2563,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     definitionAndSend(s, a, orig, line, col, typeDef);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 definitionAndSend(s, a, orig, line, col, typeDef);
@@ -2584,12 +2596,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     implementStubsAndSend(s, a, orig, line, col);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 implementStubsAndSend(s, a, orig, line, col);
@@ -2611,12 +2627,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     inlayHintsAndSend(s, a, orig);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 inlayHintsAndSend(s, a, orig);
@@ -2665,12 +2685,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     documentHighlightAndSend(s, a, path, orig, line, col);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 documentHighlightAndSend(s, a, path, orig, line, col);
@@ -2695,12 +2719,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     callAndSend(s, a, path, orig, line, col, mode);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 if (forkRun(() {
@@ -2729,12 +2757,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     typeHierarchyAndSend(s, a, path, orig, line, col, mode);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 if (forkRun(() {
@@ -2763,12 +2795,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     implementationAndSend(s, a, path, orig, line, col);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 if (forkRun(() {
@@ -2819,12 +2855,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     referencesAndSend(s, a, path, orig, line, col, includeDecl);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 referencesAndSend(s, a, path, orig, line, col, includeDecl);
@@ -2909,12 +2949,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     hoverAndSend(s, a, orig, line, col);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, atext, orig);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 hoverAndSend(s, a, orig, line, col);
@@ -2933,12 +2977,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     sendDocumentSymbol(a, text);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, text);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 sendDocumentSymbol(a, text);
@@ -3035,12 +3083,16 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     sendSemantic(toks);
                 }))
                     continue;
-                if (built && st != UniState.reuse)
+if (built && st != UniState.reuse)
                 {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
+                    if (!sharedMode())
+                    {
+                        sendNeedRespawn();
+                        continue;
+                    }
+                    serverAnalyzeShared(s, path, text);
+                    }
+                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
                 SemTok[] toks;
