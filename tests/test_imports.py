@@ -1,7 +1,7 @@
 import json, os, select, shutil, subprocess, sys, tempfile, time
 
-# Import-statement completion: module names after `import` (project index +
-# stdlib), and a module's exported names after `import m : `.
+# Contextual (textual) completion: module names after `import`, a module's
+# members after `import m : `, and `version(`/`debug(` condition identifiers.
 
 BIN = './dmd-lsp'
 
@@ -83,6 +83,26 @@ check('import-selective-completion',
 # After the partial name: only `beta`.
 part = complete(auri, 1, len('import lib : be'))
 check('import-selective-prefix', part == ['beta'], str(part))
+
+# `version(`/`debug(` conditions: predefined identifiers + project declarations.
+ver = ('module ver;\n'
+       'version = Custom;\n'
+       'version(li\n'
+       'version(Cu\n'
+       'void f() {}\n')
+vpath = os.path.join(src, 'ver.d')
+open(vpath, 'w').write(ver)
+vuri = 'file://' + vpath
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": vuri, "languageId": "d",
+                                  "version": 1, "text": ver}}})
+time.sleep(0.5)
+while read_msg(0.3):
+    pass
+check('version-predefined',
+      complete(vuri, 2, len('version(li')) == ['linux'], '')
+check('version-user-declared',
+      complete(vuri, 3, len('version(Cu')) == ['Custom'], '')
 
 proc.stdin.close()
 proc.wait(timeout=5)

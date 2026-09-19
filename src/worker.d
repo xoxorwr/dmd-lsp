@@ -1663,6 +1663,133 @@ private bool completeImportAndSend(ref ServerState s, const(char)[] text,
     return true;
 }
 
+// ---------- version/debug completion ----------
+
+private immutable string[] versionPredefined =
+[
+    "Posix", "Windows", "linux", "OSX", "FreeBSD", "OpenBSD", "NetBSD",
+    "DragonFlyBSD", "Solaris", "Haiku", "Android", "iOS", "tvOS", "watchOS",
+    "DigitalMars", "GNU", "LDC", "SDC", "LittleEndian", "BigEndian", "D_LP64",
+    "D_X32", "D_Version2", "D_InlineAsm_X86", "D_InlineAsm_X86_64", "D_SIMD",
+    "D_AVX", "D_AVX2", "D_HardFloat", "D_SoftFloat", "D_BetterC", "D_Coverage",
+    "D_Ddoc", "D_GC", "D_ProfileGC", "D_Exceptions", "D_ModuleInfo",
+    "D_TypeInfo", "D_PIC", "D_NoBoundsChecks", "CRuntime_Bionic",
+    "CRuntime_DigitalMars", "CRuntime_Glibc", "CRuntime_Microsoft",
+    "CRuntime_Musl", "CRuntime_Newlib", "CRuntime_UClibc", "CRuntime_WASI",
+    "CppRuntime_Clang", "CppRuntime_DigitalMars", "CppRuntime_Gcc",
+    "CppRuntime_Microsoft", "X86", "X86_64", "ARM", "AArch64", "MIPS32",
+    "MIPS64", "PPC", "PPC64", "RISCV32", "RISCV64", "S390X", "SPARC",
+    "SPARC64", "SystemZ", "assert", "unittest", "all", "none", "Win32",
+    "Win64",
+];
+
+// `version(Pos` / `debug(foo` — the partial condition inside the parens.
+private bool versionContext(const(char)[] text, uint line, uint col,
+    out const(char)[] prefix)
+{
+    prefix = null;
+    size_t i = 0;
+    uint l = 1;
+    while (i < text.length && l < line)
+    {
+        if (text[i] == '\n')
+            l++;
+        i++;
+    }
+    size_t ls = i;
+    size_t cursor = ls;
+    size_t want = col > 0 ? col - 1 : 0;
+    while (cursor < text.length && text[cursor] != '\n' && cursor - ls < want)
+        cursor++;
+    auto lt = text[ls .. cursor];
+    size_t s = lt.length;
+    while (s > 0 && (isIdChar(lt[s - 1]) || lt[s - 1] == '.'))
+        s--;
+    prefix = lt[s .. $];
+    size_t p = s;
+    while (p > 0 && (lt[p - 1] == ' ' || lt[p - 1] == '\t'))
+        p--;
+    if (p == 0 || lt[p - 1] != '(')
+        return false;
+    p--;
+    while (p > 0 && (lt[p - 1] == ' ' || lt[p - 1] == '\t'))
+        p--;
+    size_t we = p;
+    while (p > 0 && isIdChar(lt[p - 1]))
+        p--;
+    auto word = lt[p .. we];
+    return word == "version" || word == "debug";
+}
+
+// `version = X;` / `debug = X;` identifiers declared in `text`.
+private string[] userVersionNames(const(char)[] text)
+{
+    import dmd.lexer : Lexer;
+    import dmd.tokens : Token, TOK;
+    import dmd.globals : global;
+
+    string[] out_;
+    if (!text.length)
+        return out_;
+    auto buf = text.dup ~ '\0';
+    scope lex = new Lexer(null, cast(char*) buf.ptr, 0, buf.length - 1,
+        false, false, global.errorSinkNull, &global.compileEnv);
+    int state = 0; // 1 after version/debug, 2 after `=`
+    while (true)
+    {
+        Token t;
+        lex.scan(&t);
+        if (t.value == TOK.endOfFile)
+            break;
+        if (t.value == TOK.version_ || t.value == TOK.debug_)
+        {
+            state = 1;
+            continue;
+        }
+        if (state == 1 && t.value == TOK.assign)
+        {
+            state = 2;
+            continue;
+        }
+        if (state == 2 && t.value == TOK.identifier)
+        {
+            auto nm = t.ident ? t.ident.toString() : null;
+            if (nm.length)
+                out_ ~= nm.idup;
+        }
+        state = 0;
+    }
+    return out_;
+}
+
+private bool completeVersionAndSend(ref ServerState s, const(char)[] text,
+    uint line, uint col)
+{
+    const(char)[] prefix;
+    if (!versionContext(text, line, col, prefix))
+        return false;
+    string[] names;
+    ubyte[] kinds;
+    void add(const(char)[] n)
+    {
+        if (!startsWith(n, prefix))
+            return;
+        foreach (e; names)
+            if (e == n)
+                return;
+        names ~= n.idup;
+        kinds ~= cast(ubyte) 21; // CompletionItemKind.Constant
+    }
+    foreach (n; versionPredefined)
+        add(n);
+    foreach (n; userVersionNames(text))
+        add(n);
+    CompleteOut out_;
+    addImportItems(&s.scratch, out_, names, kinds, "version");
+    sendComplete(out_);
+    return true;
+}
+
 // ---------- document links ----------
 
 struct WLink
@@ -2239,6 +2366,8 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 // Import-statement completion is textual: module names, or a
                 // module's members after `import m : `.
                 if (completeImportAndSend(s, orig, line, col))
+                    continue;
+                if (completeVersionAndSend(s, orig, line, col))
                     continue;
                 // Keyed on the analysis text only, never the document
                 // identity: while a member name grows, the neutralised buffer
