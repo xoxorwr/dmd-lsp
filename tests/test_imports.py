@@ -142,6 +142,29 @@ outscope = complete(luri, 8, len('    al'))
 check('local-import-sibling-out-of-scope', 'alpha' not in outscope,
       str(outscope))
 
+# A local import inside a `version`/`static if` block in a body is in scope
+# after the block.
+vi = ('module vicomp;\n'
+      'void cond()\n'
+      '{\n'
+      '    version (linux)\n'
+      '    {\n'
+      '        import lib;\n'
+      '    }\n'
+      '    al\n'
+      '}\n')
+vpath2 = os.path.join(src, 'vicomp.d')
+open(vpath2, 'w').write(vi)
+vuri2 = 'file://' + vpath2
+send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+      "params": {"textDocument": {"uri": vuri2, "languageId": "d",
+                                  "version": 1, "text": vi}}})
+time.sleep(0.5)
+while read_msg(0.3):
+    pass
+vinscope = complete(vuri2, 7, len('    al'))
+check('local-import-in-version-block', 'alpha' in vinscope, str(vinscope))
+
 proc.stdin.close()
 proc.wait(timeout=5)
 shutil.rmtree(root, ignore_errors=True)

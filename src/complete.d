@@ -918,6 +918,15 @@ private void synWalkBody(Statement s, uint funcEnd, ref SynFunc fn)
             }
         return;
     }
+    // `version(...)`/`debug`/`static if` block in a body: walk both branches
+    // (conditions aren't evaluated; offering names from either is the usual
+    // editor behaviour). Covers imports/locals declared inside them.
+    if (auto c = s.isConditionalStatement())
+    {
+        synWalkBody(c.ifbody, funcEnd, fn);
+        synWalkBody(c.elsebody, funcEnd, fn);
+        return;
+    }
     if (auto es = s.isExpStatement())
     {
         if (es.exp)
