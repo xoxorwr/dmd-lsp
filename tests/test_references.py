@@ -693,6 +693,46 @@ d.close()
 os.remove(ibp)
 os.remove(imp)
 
+# Call hierarchy: outgoing (callees) and incoming (callers), across modules.
+cb = 'module cbase;\nvoid ccallee() {}\n'
+cm = ('module cmain;\nimport cbase;\nvoid ccaller()\n{\n    ccallee();\n'
+      '    ccallee();\n}\n')
+cbp = os.path.join(root, 'cbase.d')
+cmp_ = os.path.join(root, 'cmain.d')
+open(cbp, 'w').write(cb)
+open(cmp_, 'w').write(cm)
+d = Daemon(['--debounce-ms=0', '--import=' + root])
+d.init(root)
+d.drain(0.5)
+d.open_doc(cbp, cb)
+d.drain(1.5)
+
+def call_rpc(rid, method, params):
+    d.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    return d.read_msg().get('result')
+
+ci = call_rpc(200, 'textDocument/prepareCallHierarchy',
+              {"textDocument": {"uri": 'file://' + cbp},
+               "position": {"line": 1, "character": 5}})  # `ccallee`
+check('callhierarchy-prepare',
+      bool(ci) and ci[0]['name'] == 'ccallee' and ci[0]['kind'] == 12, str(ci))
+inc = call_rpc(201, 'callHierarchy/incomingCalls', {"item": ci[0]}) if ci else None
+check('callhierarchy-incoming',
+      bool(inc) and any(os.path.basename(c['from']['uri']) == 'cmain.d'
+                        and c['from']['name'] == 'ccaller'
+                        and len(c['fromRanges']) == 2 for c in inc), str(inc))
+ci2 = call_rpc(202, 'textDocument/prepareCallHierarchy',
+               {"textDocument": {"uri": 'file://' + cmp_},
+                "position": {"line": 2, "character": 5}})  # `ccaller`
+out = call_rpc(203, 'callHierarchy/outgoingCalls', {"item": ci2[0]}) if ci2 else None
+check('callhierarchy-outgoing',
+      bool(out) and any(os.path.basename(c['to']['uri']) == 'cbase.d'
+                        and c['to']['name'] == 'ccallee'
+                        and len(c['fromRanges']) == 2 for c in out), str(out))
+d.close()
+os.remove(cbp)
+os.remove(cmp_)
+
 shutil.rmtree(root, ignore_errors=True)
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

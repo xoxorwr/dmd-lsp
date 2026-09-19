@@ -1265,6 +1265,93 @@ private void emitEnumAccess(Loc qual, TypeEnum te, Dsymbol target,
     }
 }
 
+// ---------- call hierarchy ----------
+
+// One resolved call site. `line`/`col` are 1-based and point at the callee
+// expression (`e.e1`), enough for `fromRanges`.
+struct CallSite
+{
+    Dsymbol callee;
+    uint line;
+    uint col;
+    Dsymbol enclosing; // the function the call is in (null at module scope)
+}
+
+extern (C++) final class CallWalker : SemanticTimeTransitiveVisitor
+{
+    alias visit = SemanticTimeTransitiveVisitor.visit;
+
+    CallSite[] hits;
+    Dsymbol enclosing;
+
+    override void visit(CallExp e)
+    {
+        if (e.f && e.e1)
+            hits ~= CallSite(e.f, e.e1.loc.linnum(),
+                cast(uint) e.e1.loc.charnum(), enclosing);
+        super.visit(e);
+    }
+
+    override void visit(FuncDeclaration d)
+    {
+        auto prev = enclosing;
+        enclosing = d;
+        super.visit(d);
+        enclosing = prev;
+    }
+}
+
+void collectCalls(Module mod, ref CallSite[] out_)
+{
+    if (!mod || !mod.members)
+        return;
+    scope CallWalker w = new CallWalker();
+    foreach (i; 0 .. (*mod.members).length)
+        (*mod.members)[i].accept(w);
+    out_ = w.hits;
+}
+
+void collectCallsIn(Dsymbol scopeSym, ref CallSite[] out_)
+{
+    if (!scopeSym)
+        return;
+    scope CallWalker w = new CallWalker();
+    scopeSym.accept(w);
+    out_ = w.hits;
+}
+
+// A function's item positions for call hierarchy (1-based; 0-based in the LSP).
+struct FuncInfo
+{
+    bool found;
+    string name;
+    ubyte kind; // 12 function, 6 method
+    string file;
+    uint line, col;       // name position
+    uint endLine, endCol; // function end
+}
+
+FuncInfo funcInfo(Dsymbol d)
+{
+    FuncInfo f;
+    auto fd = d ? d.isFuncDeclaration() : null;
+    if (!fd || !fd.ident)
+        return f;
+    auto mod = moduleOf(fd);
+    auto file = mod ? modulePath(mod) : null;
+    if (!file.length)
+        return f;
+    f.found = true;
+    f.name = fd.ident.toString().idup;
+    f.kind = fd.parent && fd.parent.isAggregateDeclaration() ? 6 : 12;
+    f.file = file.idup;
+    f.line = fd.loc.linnum();
+    f.col = cast(uint) fd.loc.charnum();
+    f.endLine = fd.endloc.linnum();
+    f.endCol = cast(uint) fd.endloc.charnum();
+    return f;
+}
+
 private void recordPos(uint line, uint col, Identifier ident, ref RefLoc[] out_)
 {
     if (line < 1 || col < 1)

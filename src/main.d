@@ -353,6 +353,66 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
     return false;
 }
 
+// Same, for call hierarchy.
+private bool workerCallHierarchyRetry(App* app, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] mode, ref worker.WCallItem[] items, ref worker.WCall[] calls)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        if (!app.wk.alive)
+        {
+            if (!workerSpawn(app.wk, app.importPaths, app.stringPaths, app.flags))
+                return false;
+        }
+        auto r = workerCallHierarchy(app.wk, path, atext, origText, line, col,
+            mode, items, calls);
+        if (r == worker.ExchangeResult.ok)
+            return true;
+        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        {
+            dropWorker(app);
+            continue;
+        }
+        if (!app.wk.alive)
+            continue;
+        return false;
+    }
+    return false;
+}
+
+// A JSON range from 0-based positions.
+private JsonNode* makeRange(Json js, uint sl, uint sc, uint el, uint ec)
+{
+    auto range = js.create_object();
+    auto st = js.create_object();
+    js.add_number_to_object(st, "line", sl);
+    js.add_number_to_object(st, "character", sc);
+    auto en = js.create_object();
+    js.add_number_to_object(en, "line", el);
+    js.add_number_to_object(en, "character", ec);
+    js.add_item_to_object(range, "start", st);
+    js.add_item_to_object(range, "end", en);
+    return range;
+}
+
+// A `CallHierarchyItem` from a worker item.
+private JsonNode* callItemJson(Json js, const ref worker.WCallItem it)
+{
+    auto o = js.create_object();
+    js.add_string_to_object(o, "name", zstr(it.name));
+    js.add_number_to_object(o, "kind", it.kind);
+    js.add_string_to_object(o, "uri", zstr(pathToUri(it.file)));
+    uint sl = it.line > 0 ? it.line - 1 : 0;
+    uint sc = it.col > 0 ? it.col - 1 : 0;
+    uint el = it.endLine > 0 ? it.endLine - 1 : sl;
+    uint ec = it.endCol > 0 ? it.endCol - 1 : sc;
+    js.add_item_to_object(o, "range", makeRange(js, sl, sc, el, ec));
+    js.add_item_to_object(o, "selectionRange",
+        makeRange(js, sl, sc, sl, sc + cast(uint) it.name.length));
+    return o;
+}
+
 // Same, for `textDocument/inlayHint`.
 private bool workerInlayHintsRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, ref worker.WHint[] hints)
@@ -1750,6 +1810,7 @@ private void handleMessage(App* app, ref RawMsg m)
         js.add_bool_to_object(caps, "typeDefinitionProvider", true);
         js.add_bool_to_object(caps, "implementationProvider", true);
         js.add_bool_to_object(caps, "documentHighlightProvider", true);
+        js.add_bool_to_object(caps, "callHierarchyProvider", true);
         js.add_bool_to_object(caps, "foldingRangeProvider", true);
         // Advertised whenever the client can use it; the result is empty until
         // `inlayHints` is enabled (so a dls.json edit takes effect without a
@@ -1960,6 +2021,92 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             else
                 lspRespond(m.idJson, "[]");
+            return;
+        }
+        if (m.method == "textDocument/prepareCallHierarchy" ||
+            m.method == "callHierarchy/incomingCalls" ||
+            m.method == "callHierarchy/outgoingCalls")
+        {
+            string path;
+            uint line = 0;
+            uint col = 0;
+            string mode;
+            if (m.method == "textDocument/prepareCallHierarchy")
+            {
+                const(char)[] uri = jstr(jget(jget(p, "textDocument"), "uri"));
+                if (uri is null)
+                {
+                    lspRespond(m.idJson, "null");
+                    return;
+                }
+                path = uriToPath(uri);
+                auto pos = jget(p, "position");
+                line = cast(uint)jint(jget(pos, "line")) + 1;
+                col = cast(uint)jint(jget(pos, "character")) + 1;
+                mode = "prepare";
+            }
+            else
+            {
+                auto item = jget(p, "item");
+                const(char)[] uri = jstr(jget(item, "uri"));
+                if (uri is null)
+                {
+                    lspRespond(m.idJson, "null");
+                    return;
+                }
+                path = uriToPath(uri);
+                auto st = jget(jget(item, "selectionRange"), "start");
+                line = cast(uint)jint(jget(st, "line")) + 1;
+                col = cast(uint)jint(jget(st, "character")) + 1;
+                mode = m.method == "callHierarchy/incomingCalls" ? "incoming" : "outgoing";
+            }
+            string text;
+            auto d = sessionFind(app.session, path);
+            if (d)
+                text = d.text.idup;
+            else
+                text = sessionReadDisk(path);
+            if (!text)
+            {
+                lspRespond(m.idJson, "null");
+                return;
+            }
+            ensureIndex(app); // incoming calls are workspace-wide
+            worker.WCallItem[] items;
+            worker.WCall[] calls;
+            if (workerCallHierarchyRetry(app, path, text, text, line, col, mode,
+                items, calls))
+            {
+                auto js = jmake();
+                auto arr = js.create_array();
+                if (mode == "prepare")
+                {
+                    foreach (it; items)
+                        js.add_item_to_array(arr, callItemJson(js, it));
+                }
+                else
+                {
+                    bool incoming = mode == "incoming";
+                    foreach (c; calls)
+                    {
+                        auto o = js.create_object();
+                        js.add_item_to_object(o, incoming ? "from" : "to",
+                            callItemJson(js, c.item));
+                        auto rs = js.create_array();
+                        foreach (r; c.ranges)
+                        {
+                            uint sl = r.line > 0 ? r.line - 1 : 0;
+                            uint sc = r.col > 0 ? r.col - 1 : 0;
+                            js.add_item_to_array(rs, makeRange(js, sl, sc, sl, sc + r.len));
+                        }
+                        js.add_item_to_object(o, "fromRanges", rs);
+                        js.add_item_to_array(arr, o);
+                    }
+                }
+                lspRespond(m.idJson, printJsonStr(arr));
+            }
+            else
+                lspRespond(m.idJson, "null");
             return;
         }
         if (m.method == "textDocument/foldingRange")

@@ -27,7 +27,8 @@ import symbols : DocSymbol, documentSymbols, FoldRange, foldingRanges,
 import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
     referencesForKey, declKey,
     mergeRefs, resolvedSymbolAt, occurrenceAt, textSpells, isRenameable,
-    isAggregateMember, implementationLocs;
+    isAggregateMember, implementationLocs, CallSite, collectCalls,
+    collectCallsIn, FuncInfo, funcInfo, keyMatches;
 
 import lint;
 import semantic : SemTok, semanticTokens;
@@ -560,6 +561,180 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         const(char)[] text)
     {
         sendHints(inlayHints(cast(Module)a.module_, text));
+    }
+
+    // ---------- call hierarchy ----------
+
+    private void addCallItemFields(Json js, JsonNode* o, const ref WCallItem it)
+    {
+        js.add_string_to_object(o, "name", zstr(it.name));
+        js.add_number_to_object(o, "kind", it.kind);
+        js.add_string_to_object(o, "file", zstr(it.file));
+        js.add_number_to_object(o, "line", it.line);
+        js.add_number_to_object(o, "col", it.col);
+        js.add_number_to_object(o, "endLine", it.endLine);
+        js.add_number_to_object(o, "endCol", it.endCol);
+    }
+
+    private void sendCalls(string mode, WCallItem[] items, WCall[] calls)
+    {
+        auto js = jmake();
+        auto root = js.create_object();
+        js.add_string_to_object(root, "mode", zstr(mode));
+        if (items.length)
+        {
+            auto arr = js.create_array();
+            foreach (it; items)
+            {
+                auto o = js.create_object();
+                addCallItemFields(js, o, it);
+                js.add_item_to_array(arr, o);
+            }
+            js.add_item_to_object(root, "items", arr);
+        }
+        if (calls.length)
+        {
+            auto arr = js.create_array();
+            foreach (c; calls)
+            {
+                auto o = js.create_object();
+                auto it = js.create_object();
+                addCallItemFields(js, it, c.item);
+                js.add_item_to_object(o, "item", it);
+                auto rs = js.create_array();
+                foreach (r; c.ranges)
+                {
+                    auto ro = js.create_object();
+                    js.add_number_to_object(ro, "line", r.line);
+                    js.add_number_to_object(ro, "col", r.col);
+                    js.add_number_to_object(ro, "len", r.len);
+                    js.add_item_to_array(rs, ro);
+                }
+                js.add_item_to_object(o, "ranges", rs);
+                js.add_item_to_array(arr, o);
+            }
+            js.add_item_to_object(root, "calls", arr);
+        }
+        js.add_bool_to_object(root, "needRespawn", false);
+        writeFrame(outChan, printJsonStr(root));
+    }
+
+    private bool fillCallItem(ref WCallItem it, Dsymbol d)
+    {
+        auto fi = funcInfo(d);
+        if (!fi.found)
+            return false;
+        it.name = fi.name;
+        it.kind = fi.kind;
+        it.file = fi.file;
+        it.line = fi.line;
+        it.col = fi.col;
+        it.endLine = fi.endLine;
+        it.endCol = fi.endCol;
+        return true;
+    }
+
+    private void callAndSend(ref ServerState s, const ref Analysis a,
+        const(char)[] path, const(char)[] orig, uint line, uint col, string mode)
+    {
+        import core.stdc.string : strlen;
+        auto target = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
+        auto fd = target ? target.isFuncDeclaration() : null;
+        if (!fd)
+        {
+            sendCalls(mode, null, null);
+            return;
+        }
+        if (mode == "prepare")
+        {
+            WCallItem it;
+            if (fillCallItem(it, fd))
+                sendCalls(mode, [it], null);
+            else
+                sendCalls(mode, null, null);
+            return;
+        }
+        if (mode == "outgoing")
+        {
+            CallSite[] sites;
+            collectCallsIn(fd, sites);
+            size_t[Dsymbol] idx;
+            WCall[] calls;
+            foreach (site; sites)
+            {
+                if (!site.callee || !site.callee.ident)
+                    continue;
+                auto len = cast(uint) site.callee.ident.toString().length;
+                if (auto p = site.callee in idx)
+                {
+                    calls[*p].ranges ~= WCallRange(site.line, site.col, len);
+                    continue;
+                }
+                WCall c;
+                if (!fillCallItem(c.item, site.callee))
+                    continue;
+                c.ranges ~= WCallRange(site.line, site.col, len);
+                idx[site.callee] = calls.length;
+                calls ~= c;
+            }
+            sendCalls(mode, null, calls);
+            return;
+        }
+        // incoming: workspace-wide callers.
+        auto targetKey = declKey(fd);
+        const(char)* df = fd.loc.filename();
+        string declFile = df ? df[0 .. strlen(df)].idup : null;
+        string declName = declFile.length ? indexModuleOfFile(declFile) : null;
+        size_t[Dsymbol] idx;
+        WCall[] calls;
+        void scanCandidate(Module m)
+        {
+            CallSite[] sites;
+            collectCalls(m, sites);
+            foreach (site; sites)
+            {
+                if (!site.callee || !site.enclosing || !site.callee.ident)
+                    continue;
+                if (!keyMatches(declKey(site.callee), targetKey))
+                    continue;
+                auto len = cast(uint) site.callee.ident.toString().length;
+                if (auto p = site.enclosing in idx)
+                {
+                    calls[*p].ranges ~= WCallRange(site.line, site.col, len);
+                    continue;
+                }
+                WCall c;
+                if (!fillCallItem(c.item, site.enclosing))
+                    continue;
+                c.ranges ~= WCallRange(site.line, site.col, len);
+                idx[site.enclosing] = calls.length;
+                calls ~= c;
+            }
+        }
+        scanCandidate(cast(Module)a.module_);
+        if (declName.length)
+        {
+            bool[string] want;
+            want[declName] = true;
+            string reqName = indexModuleOfFile(path);
+            if (reqName.length)
+                want[reqName] = true;
+            foreach (mn; importerModules(declName))
+                want[mn] = true;
+            foreach (mn, _; want)
+            {
+                auto f = indexFileOf(mn);
+                if (!f.length || f == path)
+                    continue; // request module already scanned
+                const(char)[] text = sessionReadDisk(f);
+                if (!text.length)
+                    continue;
+                auto ca = serverAnalyze(s, f, text);
+                if (ca.ok && ca.module_)
+                    scanCandidate(cast(Module)ca.module_);
+            }
+        }
+        sendCalls(mode, null, calls);
     }
 
     // Best-effort `textDocument/implementation`: derived classes for a class/
@@ -1474,6 +1649,40 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 built = true;
                 continue;
             }
+            if (ops == "callHierarchy")
+            {
+                auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
+                auto orig = jstr(jget(p, "origText"));
+                if (orig is null)
+                    orig = "";
+                uint line = cast(uint)jint(jget(p, "line"));
+                uint col = cast(uint)jint(jget(p, "col"));
+                auto mode = dupOrEmpty(jstr(jget(p, "mode")));
+                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+                if (built && st == UniState.incremental && forkRun(() {
+                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
+                    callAndSend(s, a, path, orig, line, col, mode);
+                }))
+                    continue;
+                if (built && st != UniState.reuse)
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
+                auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
+                if (built)
+                    s.scratch.rewind(s.uni.mark);
+                if (forkRun(() {
+                    callAndSend(s, a, path, orig, line, col, mode);
+                }))
+                    continue;
+                sendCalls(mode, null, null);
+                built = true;
+                continue;
+            }
             if (ops == "implementation")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
@@ -2004,6 +2213,26 @@ struct WHint
     bool padR = false;
 }
 
+struct WCallItem
+{
+    string name;
+    ubyte kind;
+    string file;
+    uint line = 0, col = 0;       // 1-based name
+    uint endLine = 0, endCol = 0; // 1-based function end
+}
+
+struct WCallRange
+{
+    uint line = 0, col = 0, len = 0; // 1-based
+}
+
+struct WCall
+{
+    WCallItem item;
+    WCallRange[] ranges;
+}
+
 // References result plus whether the search is believed exhaustive. `complete`
 // gates rename (all-or-nothing); references themselves are best-effort.
 struct WRefs
@@ -2291,6 +2520,66 @@ ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
                 l.col = cast(uint)jint(jget(c, "col"));
                 l.len = cast(uint)jint(jget(c, "len"));
                 out_ ~= l;
+            }
+    return ExchangeResult.ok;
+}
+
+private WCallItem parseCallItem(JsonNode* c)
+{
+    WCallItem it;
+    it.name = dupOrEmpty(jstr(jget(c, "name")));
+    it.kind = cast(ubyte) jint(jget(c, "kind"));
+    it.file = dupOrEmpty(jstr(jget(c, "file")));
+    it.line = cast(uint)jint(jget(c, "line"));
+    it.col = cast(uint)jint(jget(c, "col"));
+    it.endLine = cast(uint)jint(jget(c, "endLine"));
+    it.endCol = cast(uint)jint(jget(c, "endCol"));
+    return it;
+}
+
+ExchangeResult workerCallHierarchy(ref Worker w, const(char)[] path,
+    const(char)[] atext, const(char)[] origText, uint line, uint col,
+    const(char)[] mode, ref WCallItem[] items, ref WCall[] calls)
+{
+    auto js = jmake();
+    auto root = js.create_object();
+    js.add_string_to_object(root, "op", zstr("callHierarchy"));
+    js.add_string_to_object(root, "path", zstr(path));
+    js.add_string_to_object(root, "atext", zstr(atext));
+    js.add_string_to_object(root, "origText", zstr(origText));
+    js.add_number_to_object(root, "line", line);
+    js.add_number_to_object(root, "col", col);
+    js.add_string_to_object(root, "mode", zstr(mode));
+    char[] resp;
+    if (!workerExchange(w, printJsonStr(root), resp))
+        return ExchangeResult.failed;
+    auto r = jparse(resp);
+    if (!r)
+        return ExchangeResult.failed;
+    if (jbool(jget(r, "needRespawn"), false))
+        return ExchangeResult.respawn;
+    if (auto ia = jget(r, "items"))
+        if ((ia.type & 0xFF) == JsonArray)
+            for (auto c = ia.child; c; c = c.next)
+                items ~= parseCallItem(c);
+    if (auto ca = jget(r, "calls"))
+        if ((ca.type & 0xFF) == JsonArray)
+            for (auto c = ca.child; c; c = c.next)
+            {
+                WCall call;
+                if (auto io = jget(c, "item"))
+                    call.item = parseCallItem(io);
+                if (auto ra = jget(c, "ranges"))
+                    if ((ra.type & 0xFF) == JsonArray)
+                        for (auto rc = ra.child; rc; rc = rc.next)
+                        {
+                            WCallRange range;
+                            range.line = cast(uint)jint(jget(rc, "line"));
+                            range.col = cast(uint)jint(jget(rc, "col"));
+                            range.len = cast(uint)jint(jget(rc, "len"));
+                            call.ranges ~= range;
+                        }
+                calls ~= call;
             }
     return ExchangeResult.ok;
 }
