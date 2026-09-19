@@ -1,6 +1,6 @@
 module references;
 
-// textDocument/references + target resolution, semantic-only (PLAN.md Phase A).
+// textDocument/references + target resolution, semantic-only.
 //
 // Identity comes exclusively from dmd's resolved AST. A use is a node that
 // carries a resolved Dsymbol; a declaration is an AST declaration. Matching is

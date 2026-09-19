@@ -5,8 +5,9 @@ superseded dmd universe in a long-lived process and assume it will be freed.
 
 This is the operational counterpart to [findings.md](findings.md) (the
 evidence) and [upstream.md](upstream.md) (the patches). Read it before any work
-that entertains a persistent in-process universe — e.g. the shared
-module store in `PLAN2.md` — and re-run its checklist on every `make vendor`.
+that entertains a persistent in-process universe — e.g. a shared module store
+(a planned, not-yet-started change) — and re-run its checklist on every
+`make vendor`.
 
 ## The decision
 
@@ -93,7 +94,7 @@ do X".
 - [ ] **Upstream landed a trigger?** Check release notes / PRs for region GC,
       precise root maps, `dmd.frontend`-as-library, reentrant globals, or a
       `Module` reparse/replace API. If so, open the corresponding trigger above
-      and re-measure the shared-store plan (`PLAN2.md` Task 0).
+      and re-measure the shared-store plan before committing to it.
 - [ ] **Region GC prototype.** If `src/regiongc.d` is present/revived, confirm
       it still compiles against the vendored tree and still satisfies the
       druntime array **and** AA contract (`findings.md` §5.2); keep it behind
@@ -109,4 +110,4 @@ Upstream signals worth a look when they appear (log the outcome here):
 incremental/reparsing APIs, `Module` lifecycle/replacement, dmd-as-library
 efforts, GC/region work, and anything touching `TemplateInstance` caching or
 `Identifier`/`Loc`/`StringTable` state. When one lands, update the triggers and
-re-run Task 0 of `PLAN2.md` before changing any boundary.
+re-measure the shared-store plan before changing any boundary.
