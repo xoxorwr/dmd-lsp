@@ -47,6 +47,14 @@ all: $(BIN)
 $(BIN): $(SRC) Makefile stringimp/SYSCONFDIR.imp
 	$(DC) $(DFLAGS) $(SRC) -of$(BIN)
 
+# Windows exe built under Wine, using a Windows dmd inside the default prefix.
+# `make windows` (override WINE_DMD, or WINEPREFIX, if yours lives elsewhere).
+WINE ?= wine
+WINE_DMD ?= $(WINE) C:/D/dmd2/windows/bin64/dmd.exe
+
+windows: $(SRC) Makefile stringimp/SYSCONFDIR.imp
+	$(WINE_DMD) $(DFLAGS) $(SRC) -ofdmd-lsp.exe
+
 # Compile the extension (tsc --noEmit + esbuild bundle -> dist/extension.js).
 vscode: $(VSCODE_DIR)/node_modules
 	cd $(VSCODE_DIR) && npm run compile
