@@ -3367,7 +3367,7 @@ int main(string[] args)
     else version (Windows)
     {
         import core.sys.windows.winbase : WaitForSingleObject, GetStdHandle,
-            STD_INPUT_HANDLE, WAIT_OBJECT_0, INFINITE;
+            PeekNamedPipe, STD_INPUT_HANDLE, WAIT_OBJECT_0, INFINITE;
         import core.sys.windows.winerror : WAIT_TIMEOUT;
         import core.stdc.stdio : setvbuf, _IONBF, stdin, stdout, FILE;
 
@@ -3403,6 +3403,16 @@ int main(string[] args)
             }
             if (r != WAIT_OBJECT_0)
                 break;
+            // A pipe can report signaled with nothing to read; proceeding
+            // would block in lspRead and starve the debounce, so treat an
+            // empty peek as idle.
+            uint avail = 0;
+            if (PeekNamedPipe(hIn, null, 0, null, &avail, null) && avail == 0)
+            {
+                if (app.pending.length)
+                    flushPending(&app);
+                continue;
+            }
             if (!lspRead(&m, body_))
                 break;
             handleMessage(&app, m);
