@@ -582,36 +582,34 @@ check('hover-index-identifier', hv is not None and 'int k' in hv, str(hv))
 hv = hover_uri(hidxuri, 2, htext.split('\n')[2].index('tbl[') + 1)
 check('hover-index-array', hv is not None and 'E[4] tbl' in hv, str(hv))
 
-# hover on a type/enum is a short, fully-qualified declaration, not the body
-# (the body reads as source and dumps enum members as `cast` expressions).
+# Type/enum hover defaults to the full declaration body, with the name
+# qualified (`struct chain.S { int x; }`).
 hv = hover_uri(cuna, 1, 7)
 check('hover-type-def', hv is not None and 'struct chain.S' in hv and
-      'int x' not in hv, str(hv))
+      'int x' in hv, str(hv))
 hk = ('module hk;\n'
       'class C { int y; }\n'
       'enum E { a, b }\n'
       'void f() { C c; E e; }\n')
 hkuri = open_doctype('hk.d', hk)
 hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
+check('hover-class-full', hv is not None and 'class hk.C' in hv and
+      'int y' in hv, str(hv))
+hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('E e'))
+check('hover-enum-full', hv is not None and 'enum hk.E' in hv and
+      'cast' in hv, str(hv))
+
+# `fullTypeHover: false` gives the short, fully-qualified declaration instead.
+send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
+      "params": {"settings": {"fullTypeHover": False}}})
+hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
 check('hover-class-short', hv is not None and 'class hk.C' in hv and
       'int y' not in hv, str(hv))
 hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('E e'))
 check('hover-enum-short', hv is not None and 'enum hk.E' in hv and
       'cast' not in hv, str(hv))
-
-# `fullTypeHover` opt-in restores the full declaration body in type hover.
 send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
       "params": {"settings": {"fullTypeHover": True}}})
-hvfull = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
-check('hover-full-type-optin',
-      hvfull is not None and 'class hk.C' in hvfull and 'int y' in hvfull,
-      str(hvfull))
-send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
-      "params": {"settings": {"fullTypeHover": False}}})
-hvshort = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
-check('hover-short-type-default',
-      hvshort is not None and 'class hk.C' in hvshort and 'int y' not in hvshort,
-      str(hvshort))
 
 # Selective import: complete the imported module's members after ':'.
 seluri = open_doctype('selimp.d',

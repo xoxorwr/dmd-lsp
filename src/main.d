@@ -103,7 +103,7 @@ struct App
     bool inlayHintsSet = false; // editor/CLI explicitly set it
     bool autoImports = false; // opt-in: offer not-yet-imported symbols
     bool autoImportsSet = false; // editor/CLI explicitly set it
-    bool fullTypeHover = false; // opt-in: full struct/class/enum body in hover
+    bool fullTypeHover = true; // full struct/class/enum body in hover (default)
     bool fullTypeHoverSet = false; // editor/CLI explicitly set it
     bool clientInlayHint = false; // client supports textDocument/inlayHint
     bool inlayHintRefresh = false; // client supports workspace/inlayHint/refresh
@@ -132,7 +132,7 @@ struct FileConfig
     bool hasSharedMaxModules = false;
     bool autoImports = false;
     bool hasAutoImports = false;
-    bool fullTypeHover = false;
+    bool fullTypeHover = true;
     bool hasFullTypeHover = false;
 }
 
@@ -1417,7 +1417,7 @@ private void applyConfig(App* app, JsonNode* node)
     }
     if (auto fh = jget(obj, "fullTypeHover"))
     {
-        app.fullTypeHover = jbool(fh, false);
+        app.fullTypeHover = jbool(fh, true);
         app.fullTypeHoverSet = true;
     }
     if (auto mw = jget(obj, "maxWorkers"))
@@ -1614,7 +1614,7 @@ private Notice loadFileConfig(App* app, const(char)[] root)
     if (auto fh = jget(doc, "fullTypeHover"))
     {
         fc.hasFullTypeHover = true;
-        fc.fullTypeHover = jbool(fh, false);
+        fc.fullTypeHover = jbool(fh, true);
     }
     if (auto mw = jget(doc, "maxWorkers"))
     {
@@ -1692,7 +1692,7 @@ private void clearFileConfig(App* app)
     if (!app.autoImportsSet)
         app.autoImports = false;
     if (!app.fullTypeHoverSet)
-        app.fullTypeHover = false;
+        app.fullTypeHover = true;
     if (!app.maxWorkersSet)
         app.maxWorkers = defaultMaxWorkers;
     if (!app.sharedRegistrySet)

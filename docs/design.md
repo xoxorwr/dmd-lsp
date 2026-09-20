@@ -220,12 +220,11 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   declaration sites. Cross-file locations are turned into
   absolute `file://` URIs (`absolutePath`/`pathToUri`), Windows-aware (drive
   letters, backslash normalisation).
-- `textDocument/hover`: aggregates and enums show a short, fully-qualified
-  declaration (`struct mod.Name`), never their body — hdrgen renders the whole
-  member list (and enum values as `cast(T)0`), which reads as source. The
-  `fullTypeHover` opt-in restores hdrgen's full body instead, with the
-  declaration name spliced to its fully-qualified form (`struct mod.Name { … }`).
-  Functions
+- `textDocument/hover`: aggregates and enums show the full declaration body
+  (hdrgen) with the name spliced to its fully-qualified form
+  (`struct mod.Name { … }`) — this is the default. Setting `fullTypeHover:
+  false` gives just the short qualified declaration (`struct mod.Name`), which
+  is less noisy and disambiguates a same-named symbol elsewhere. Functions
   and aliases are rendered by dmd's own `hdrgen` (`toCBuffer` with
   `hdrgen=true, doFuncBodies=false`, indented), so no source reading or
   brace-matching is needed. Variables/fields/locals use a synthesized
