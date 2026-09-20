@@ -116,6 +116,26 @@ private void itemParts(Arena* a, Dsymbol s, ref const(char)[] labelDetail,
     }
 }
 
+// Compiler-generated unittest thunks (`__unittest_L<line>_C<col>`). No user
+// writes this spelling, so it is always safe to hide.
+private bool isUnittestThunk(const(char)[] nm) pure nothrow @nogc @safe
+{
+    return nm.length >= 11 && nm[0 .. 11] == "__unittest_";
+}
+
+// Reserved implementation names (`__*`, `_d_*`). Hidden only when enumerating
+// an *imported* module's interface (phobos/druntime/`object` flood completion
+// with them); the root module's own symbols are kept, so a user's `__`-prefixed
+// code still completes.
+private bool isReservedImpl(const(char)[] nm) pure nothrow @nogc @safe
+{
+    if (nm.length >= 2 && nm[0] == '_' && nm[1] == '_')
+        return true;
+    if (nm.length >= 3 && nm[0] == '_' && nm[1] == 'd' && nm[2] == '_')
+        return true;
+    return false;
+}
+
 private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte kind,
     const(char)[] detail, const(char)[] doc, const(char)[] sortPrefix,
     ref bool[const(char)[]] seen,
@@ -123,6 +143,8 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
     const(char)[] labelDetailOverride = null)
 {
     if (label.length == 0 || label in seen)
+        return;
+    if (isUnittestThunk(label))
         return;
     seen[label] = true;
     char* lp = cast(char*)a.alloc(label.length + 1);
@@ -297,7 +319,8 @@ private const(char)[] docOf(Dsymbol s)
 
 // ---------- member enumeration ----------
 private void addMembers(Arena* a, Dsymbol[] members, const(char)[] prefix,
-    const(char)[] sortPrefix, ref CompleteOut o, ref bool[const(char)[]] seen)
+    const(char)[] sortPrefix, ref CompleteOut o, ref bool[const(char)[]] seen,
+    bool skipReserved = false)
 {
     foreach (s; members)
     {
@@ -309,6 +332,8 @@ private void addMembers(Arena* a, Dsymbol[] members, const(char)[] prefix,
         if (s.visible().kind == Visibility.Kind.private_)
             continue;
         const(char)[] nm = s.ident.toString();
+        if (skipReserved && isReservedImpl(nm))
+            continue;
         if (!hasPrefix(nm, prefix))
             continue;
         pushItem(a, o, nm, kindOf(s), typeDetail(symType(s)), docOf(s), sortPrefix, seen, s);
@@ -4116,7 +4141,7 @@ private void addModuleInterface(Module m, int depth, Arena* a, const(char)[] pre
 {
     if (!m || depth > 4 || !m.members)
         return;
-    addMembers(a, scopeMembers(m), prefix, "1", o, seen);
+    addMembers(a, scopeMembers(m), prefix, "1", o, seen, true);
     Dsymbol[] flat;
     flattenMembers(m.members, flat);
     foreach (s; flat)

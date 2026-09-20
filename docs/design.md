@@ -194,7 +194,10 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   symbol lists (`import mod : a, b|` completes `mod`'s members); comment/string
   suppression; trailing-dot completion (including inside an unclosed call
   argument list); CTFE string-mixin declarations; symbols re-exported
-  through `public import` chains.
+  through `public import` chains. Imported module interfaces are enumerated for
+  bare completion, where reserved implementation names (`__*`, `_d_*`) and
+  `__unittest_*` thunks are hidden (the root's own symbols are kept, so a
+  user's `__`-prefixed code still completes).
 - LSP 3.17 `labelDetails` when the client opts in: functions render as
   label + `(params)` + return type (`dist(Point, int) int`); variables and
   fields show their type (`p Point`, `x int`); other declarations their

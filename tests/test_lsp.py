@@ -238,6 +238,24 @@ def open_doctype(name, text):
     read_msg()
     return uri
 
+# Completion must not offer imported compiler/runtime internals (`__unittest_*`
+# thunks, `_d_*` runtime helpers, `__ArrayCast`/`__cmp` object internals): the
+# implicit `object`/druntime closure is full of them. The root's own symbols are
+# kept, so a user's `__`-prefixed code still completes.
+filtdoc = ('module filt;\n'
+           'int __userFlag;\n'
+           'void f()\n{\n'
+           '    \n}\n')
+filturi = open_doctype('filt.d', filtdoc)
+send({"jsonrpc": "2.0", "id": 122, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": filturi},
+                 "position": {"line": 4, "character": 4}}})
+flabels = [i['label'] for i in read_msg()['result']['items']]
+finst = [l for l in flabels if l.startswith('__unittest_') or l.startswith('_d_')]
+check('completion-no-internals', bool(flabels) and not finst, str(finst[:6]))
+check('completion-keeps-user-underscore', '__userFlag' in flabels,
+      str(flabels[:8]))
+
 def sig_at(uri, line, ch):
     _sid[0] += 1
     send({"jsonrpc": "2.0", "id": _sid[0], "method": "textDocument/signatureHelp",
