@@ -2476,31 +2476,34 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                // Parse-only, registration-free (H3): touches neither the live
-                // universe nor any shared state, so it runs inline — no fork,
-                // no respawn, same on Windows. Published diagnostics stay
-                // parse-only (semantic errors are a save/open concern).
-                auto a = serverLint(s, path, text);
-                sendAnalyze(a);
-                // Analysis is debounce-only now: completion never re-analyzes,
-                // so this idle pass is the one place that refreshes the warm
-                // semantic universe behind the per-root cache. Re-parse the
-                // edited root in place when it is the live universe's root
-                // (cheap, exact, keeps the dependency closure); otherwise warm
-                // the shared registry. Its result is never sent.
+                // Idle (debounced) analyse. Completion never re-analyzes, so
+                // this is the one pass that refreshes the warm universe — and
+                // it now publishes that result, so live diagnostics include
+                // semantic errors, not just syntax. Cost is unchanged: one
+                // analysis per idle, none per keystroke.
                 auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
                 if (st == UniState.incremental)
-                    serverAnalyzeIncremental(s, path, text, null);
+                {
+                    auto a = serverAnalyzeIncremental(s, path, text, null);
+                    sendAnalyze(a);
+                }
                 else if (st != UniState.reuse)
                 {
+                    Analysis a;
                     if (s.sharedReg)
-                        serverAnalyzeShared(s, path, text);
+                    {
+                        a = serverAnalyzeShared(s, path, text);
+                        // A root that was already resident reuses its
+                        // semanticised module and does not re-emit errors, so
+                        // keep this warm out of the save/open hit cache.
+                        s.uni.valid = false;
+                    }
                     else
-                        serverAnalyze(s, path, text);
-                    // A resident root skips semantic errors, so this warm is
-                    // not a valid diagnostics source for a later open/save.
-                    s.uni.valid = false;
+                        a = serverAnalyze(s, path, text);
+                    sendAnalyze(a);
                 }
+                else
+                    sendAnalyze(s.uni.analysis);
                 built = true;
                 continue;
             }

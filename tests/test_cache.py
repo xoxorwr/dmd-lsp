@@ -106,11 +106,11 @@ d = change_doc(text, 3)
 open(ROOT, 'w').write(text)
 check('cache-revert-clean', all('unused import' in m for m in d), str(d))
 
-# semantic diagnostics are a save/open concern: the debounced keypress path is
-# parse-only, so they must not appear live, and must appear after save
+# semantic diagnostics land on the debounced idle pass now (the debounce runs
+# the semantic analysis anyway to keep completion warm), and again on save.
 sem = text.replace('it.keep', 'it.keep;\n    nosuch_xyz;')
 d = change_doc(sem, 5)
-check('edit-no-semantic-live', not any('nosuch_xyz' in m for m in d), str(d))
+check('edit-semantic-live', any('nosuch_xyz' in m for m in d), str(d))
 send({"jsonrpc": "2.0", "method": "textDocument/didSave",
       "params": {"textDocument": {"uri": URI}, "text": sem}})
 d = [x['message'] for x in read_msg()['params']['diagnostics']]
