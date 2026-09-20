@@ -222,7 +222,8 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   letters, backslash normalisation).
 - `textDocument/hover`: aggregates and enums show a short, fully-qualified
   declaration (`struct mod.Name`), never their body — hdrgen renders the whole
-  member list (and enum values as `cast(T)0`), which reads as source. Functions
+  member list (and enum values as `cast(T)0`), which reads as source. The
+  `fullTypeHover` opt-in restores hdrgen's full body instead. Functions
   and aliases are rendered by dmd's own `hdrgen` (`toCBuffer` with
   `hdrgen=true, doFuncBodies=false`, indented), so no source reading or
   brace-matching is needed. Variables/fields/locals use a synthesized

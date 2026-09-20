@@ -3538,11 +3538,12 @@ private const(char)[] shortDecl(Arena* a, Dsymbol sym)
     return arenaDupStr(a, buf);
 }
 
-void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_)
+void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_,
+    bool fullDecl = false)
 {
     if (!sym)
         return;
-    if (sym.isAggregateDeclaration() || sym.isEnumDeclaration())
+    if (!fullDecl && (sym.isAggregateDeclaration() || sym.isEnumDeclaration()))
     {
         // Types/enums: short qualified declaration, never the body.
         out_.detail = shortDecl(arena, sym);
@@ -3565,9 +3566,11 @@ void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_)
 }
 
 void hoverAt(Arena* arena, Module mod, const CompleteCtx* ctx,
-    const(char)[] text, const ref SynMod syn, ref HoverInfo out_)
+    const(char)[] text, const ref SynMod syn, ref HoverInfo out_,
+    bool fullDecl = false)
 {
-    hoverSymbol(arena, resolveSymbolAt(mod, syn, ctx.line, ctx.character, text), out_);
+    hoverSymbol(arena, resolveSymbolAt(mod, syn, ctx.line, ctx.character, text),
+        out_, fullDecl);
 }
 
 // ---------- entry ----------

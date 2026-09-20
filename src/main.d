@@ -103,6 +103,8 @@ struct App
     bool inlayHintsSet = false; // editor/CLI explicitly set it
     bool autoImports = false; // opt-in: offer not-yet-imported symbols
     bool autoImportsSet = false; // editor/CLI explicitly set it
+    bool fullTypeHover = false; // opt-in: full struct/class/enum body in hover
+    bool fullTypeHoverSet = false; // editor/CLI explicitly set it
     bool clientInlayHint = false; // client supports textDocument/inlayHint
     bool inlayHintRefresh = false; // client supports workspace/inlayHint/refresh
 }
@@ -130,6 +132,8 @@ struct FileConfig
     bool hasSharedMaxModules = false;
     bool autoImports = false;
     bool hasAutoImports = false;
+    bool fullTypeHover = false;
+    bool hasFullTypeHover = false;
 }
 
 // Monotonic milliseconds (debounce clock; no phobos).
@@ -569,7 +573,8 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
         auto w = poolAcquire(app, path);
         if (w is null)
             return false;
-        auto r = workerHover(w.wk, path, atext, origText, line, col, hov);
+        auto r = workerHover(w.wk, path, atext, origText, line, col, hov,
+            app.fullTypeHover);
         if (r == worker.ExchangeResult.ok)
             return true;
         if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
@@ -1410,6 +1415,11 @@ private void applyConfig(App* app, JsonNode* node)
         app.autoImports = jbool(ai, false);
         app.autoImportsSet = true;
     }
+    if (auto fh = jget(obj, "fullTypeHover"))
+    {
+        app.fullTypeHover = jbool(fh, false);
+        app.fullTypeHoverSet = true;
+    }
     if (auto mw = jget(obj, "maxWorkers"))
     {
         long v = jint(mw);
@@ -1601,6 +1611,11 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         fc.hasAutoImports = true;
         fc.autoImports = jbool(ai, false);
     }
+    if (auto fh = jget(doc, "fullTypeHover"))
+    {
+        fc.hasFullTypeHover = true;
+        fc.fullTypeHover = jbool(fh, false);
+    }
     if (auto mw = jget(doc, "maxWorkers"))
     {
         if ((mw.type & 0xFF) == JsonNumber)
@@ -1639,6 +1654,8 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.inlayHints = fc.inlayHints;
     if (!app.autoImportsSet && fc.hasAutoImports)
         app.autoImports = fc.autoImports;
+    if (!app.fullTypeHoverSet && fc.hasFullTypeHover)
+        app.fullTypeHover = fc.fullTypeHover;
     if (!app.maxWorkersSet && fc.hasMaxWorkers)
         app.maxWorkers = fc.maxWorkers;
     if (!app.sharedRegistrySet && fc.hasSharedRegistry)
@@ -1674,6 +1691,8 @@ private void clearFileConfig(App* app)
         app.inlayHints = false;
     if (!app.autoImportsSet)
         app.autoImports = false;
+    if (!app.fullTypeHoverSet)
+        app.fullTypeHover = false;
     if (!app.maxWorkersSet)
         app.maxWorkers = defaultMaxWorkers;
     if (!app.sharedRegistrySet)
@@ -2078,6 +2097,15 @@ private void handleMessage(App* app, ref RawMsg m)
     try
     {
         auto p = jparse(m.paramsJson);
+        // Editors send a configuration change as a *notification*; handle it
+        // here so it is not dropped (the request-section copy only fires when a
+        // client sends an id, which is non-standard).
+        if (m.method == "workspace/didChangeConfiguration")
+        {
+            if (auto s = jget(p, "settings"))
+                applyConfig(app, s);
+            return;
+        }
             if (m.method == "textDocument/didOpen")
             {
                 auto td = jget(p, "textDocument");

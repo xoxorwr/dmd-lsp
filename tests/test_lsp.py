@@ -599,6 +599,20 @@ hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('E e'))
 check('hover-enum-short', hv is not None and 'enum hk.E' in hv and
       'cast' not in hv, str(hv))
 
+# `fullTypeHover` opt-in restores the full declaration body in type hover.
+send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
+      "params": {"settings": {"fullTypeHover": True}}})
+hvfull = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
+check('hover-full-type-optin',
+      hvfull is not None and 'class C' in hvfull and 'int y' in hvfull,
+      str(hvfull))
+send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
+      "params": {"settings": {"fullTypeHover": False}}})
+hvshort = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
+check('hover-short-type-default',
+      hvshort is not None and 'class hk.C' in hvshort and 'int y' not in hvshort,
+      str(hvshort))
+
 # Selective import: complete the imported module's members after ':'.
 seluri = open_doctype('selimp.d',
     'module selimp;\nimport autolib : gl\nvoid f() {}\n')

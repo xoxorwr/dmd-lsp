@@ -854,7 +854,7 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
     }
 
     private void hoverAndSend(ref ServerState s, const ref Analysis a,
-        const(char)[] orig, uint line, uint col)
+        const(char)[] orig, uint line, uint col, bool fullDecl = false)
     {
         CompleteCtx ctx;
         ctx.line = line;
@@ -863,9 +863,9 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         // Prefer dmd's resolved symbol at the cursor (see definitionAndSend).
         auto sym = resolvedSymbolAt(cast(Module)a.module_, line, col, orig);
         if (sym)
-            hoverSymbol(&s.scratch, sym, h);
+            hoverSymbol(&s.scratch, sym, h, fullDecl);
         else
-            hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h);
+            hoverAt(&s.scratch, cast(Module)a.module_, &ctx, orig, a.syn, h, fullDecl);
         sendHover(h);
     }
 
@@ -2975,10 +2975,11 @@ if (built && st != UniState.reuse)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
+                bool fullDecl = jbool(jget(p, "fullDecl"), false);
                 auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
                 if (built && st == UniState.incremental && forkRun(() {
                     auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    hoverAndSend(s, a, orig, line, col);
+                    hoverAndSend(s, a, orig, line, col, fullDecl);
                 }))
                     continue;
 if (built && st != UniState.reuse)
@@ -2993,7 +2994,7 @@ if (built && st != UniState.reuse)
                     auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
                 if (built)
                     s.scratch.rewind(s.uni.mark);
-                hoverAndSend(s, a, orig, line, col);
+                hoverAndSend(s, a, orig, line, col, fullDecl);
                 built = true;
                 continue;
             }
@@ -4010,7 +4011,8 @@ ExchangeResult workerDocumentHighlight(ref Worker w, const(char)[] path,
 }
 
 ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext,
-    const(char)[] origText, uint line, uint col, ref WHover out_)
+    const(char)[] origText, uint line, uint col, ref WHover out_,
+    bool fullDecl = false)
 {
     auto js = jmake();
     auto root = js.create_object();
@@ -4020,6 +4022,7 @@ ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext
     js.add_string_to_object(root, "origText", zstr(origText));
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
+    js.add_bool_to_object(root, "fullDecl", fullDecl);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;

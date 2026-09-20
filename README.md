@@ -119,6 +119,7 @@ loads at `initialize` and on save.
 |-----|---------|--------|
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
+| `fullTypeHover` | `false` | Show the full declaration body in hover for structs/classes/unions/enums instead of the short qualified name (e.g. `struct pkg.Name`). |
 | `sharedRegistry` | `true` | One worker serves **every** file, keeping all loaded modules resident, so switching between files re-analyses only the file you're in — no per-file workers, no respawns. Diagnostics stay exact: a file already loaded as a dependency is re-diagnosed by a full analysis in a forked child (POSIX) or by restarting the worker (Windows). Set `false` to use the older per-file worker pool. |
 | `maxModules` | `2048` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. Lower it to bound memory on huge projects. |
 
