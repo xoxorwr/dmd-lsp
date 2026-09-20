@@ -197,7 +197,15 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   through `public import` chains. Imported module interfaces are enumerated for
   bare completion, where reserved implementation names (`__*`, `_d_*`) and
   `__unittest_*` thunks are hidden (the root's own symbols are kept, so a
-  user's `__`-prefixed code still completes).
+  user's `__`-prefixed code still completes). D keywords (kind `Keyword`) are
+  context-gated: offered only where a statement can begin (last significant
+  token before the cursor is `;`, `{`, `}`, `:`, or nothing), so `case`/
+  `default`, `catch`/`finally` and `else` appear where valid and never
+  mid-expression or after a dot. The list comes from dmd's identifier pool with
+  the lexer's C/D boundary, so `signed`/`sizeof`/`_Bool` are not offered. After
+  a dot, type-aware built-in properties are offered (`init`, `sizeof`,
+  `alignof`, `mangleof`, `stringof` on everything; `max`/`min` on numerics;
+  arrays' `length`/`dup`/...; aggregates' `tupleof`/`classinfo`).
 - LSP 3.17 `labelDetails` when the client opts in: functions render as
   label + `(params)` + return type (`dist(Point, int) int`); variables and
   fields show their type (`p Point`, `x int`); other declarations their

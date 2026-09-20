@@ -21,6 +21,17 @@ def check(name, cond, extra=''):
     if not cond:
         fails.append(name)
 
+# A `.` completion appends built-in properties (`alignof`, `init`, ...); this
+# test is about filtering the *members* of the chain, so drop them.
+BUILTIN_PROPS = {
+    'init', 'sizeof', 'alignof', 'mangleof', 'stringof', 'max', 'min',
+    'length', 'ptr', 'dup', 'idup', 'capacity', 'reserve', 'reverse', 'sort',
+    'keys', 'values', 'byKey', 'byValue', 'byKeyValue', 'rehash', 'get',
+    'require', 'update', 'min_normal', 'nan', 'infinity', 'epsilon', 'dig',
+    'mant_dig', 'max_10_exp', 'min_10_exp', 'max_exp', 'min_exp', 'tupleof',
+    'classinfo',
+}
+
 def send(obj):
     body = json.dumps(obj).encode()
     proc.stdin.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
@@ -88,7 +99,8 @@ for i, ch in enumerate('alpin'):
             send({"jsonrpc": "2.0", "id": m['id'], "result": None})
             continue
         if m.get('id') == rid:
-            counts.append(len(m.get('result', {}).get('items', [])))
+            labels = [i['label'] for i in m.get('result', {}).get('items', [])]
+            counts.append(len([l for l in labels if l not in BUILTIN_PROPS]))
             break
 
 after = spawns()

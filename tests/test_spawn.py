@@ -14,6 +14,19 @@ def check(name, cond, extra=''):
     if not cond:
         fails.append(name)
 
+# A `.` completion appends built-in properties (`init`, `sizeof`, ...); the
+# checks below are about the struct's members.
+BUILTIN_PROPS = {
+    'init', 'sizeof', 'alignof', 'mangleof', 'stringof', 'max', 'min',
+    'length', 'ptr', 'dup', 'idup', 'capacity', 'reserve', 'reverse', 'sort',
+    'keys', 'values', 'byKey', 'byValue', 'byKeyValue', 'rehash', 'get',
+    'require', 'update', 'min_normal', 'nan', 'infinity', 'epsilon', 'dig',
+    'mant_dig', 'max_10_exp', 'min_10_exp', 'max_exp', 'min_exp', 'tupleof',
+    'classinfo',
+}
+def members_only(labels):
+    return [l for l in labels if l not in BUILTIN_PROPS]
+
 errf = open(TRACE, 'w')
 env = dict(os.environ, DMD_LSP_TRACE_SPAWN='1')
 proc = subprocess.Popen([BIN, '--stdio', '--debounce-ms=150'], stdin=subprocess.PIPE,
@@ -86,7 +99,7 @@ send({"jsonrpc": "2.0", "method": "textDocument/didChange",
 send({"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": URI}, "position": {"line": 5, "character": 6}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('trailing-dot-completion', labels == ['x', 'y'], str(labels))
+check('trailing-dot-completion', members_only(labels) == ['x', 'y'], str(labels))
 
 # Idle flush: the analyze for v1 must reuse the completion's universe.
 time.sleep(0.6)
@@ -123,7 +136,7 @@ while True:
     if msg.get('id') == 6:
         break
 labels = [i['label'] for i in msg['result']['items']]
-check('edit-reflected', labels == ['x', 'y', 'z'], str(labels))
+check('edit-reflected', members_only(labels) == ['x', 'y', 'z'], str(labels))
 
 send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
 read_msg()

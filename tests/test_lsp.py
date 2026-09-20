@@ -32,6 +32,20 @@ def check(name, cond, extra=''):
     if not cond:
         fails.append(name)
 
+# Built-in properties a `.` completion may append on any type; tests that assert
+# the *members* of a dotted chain filter these out first.
+BUILTIN_PROPS = {
+    'init', 'sizeof', 'alignof', 'mangleof', 'stringof', 'max', 'min',
+    'length', 'ptr', 'dup', 'idup', 'capacity', 'reserve', 'reverse', 'sort',
+    'keys', 'values', 'byKey', 'byValue', 'byKeyValue', 'rehash', 'get',
+    'require', 'update', 'min_normal', 'nan', 'infinity', 'epsilon', 'dig',
+    'mant_dig', 'max_10_exp', 'min_10_exp', 'max_exp', 'min_exp', 'tupleof',
+    'classinfo',
+}
+
+def members_only(labels):
+    return [l for l in labels if l not in BUILTIN_PROPS]
+
 text = open(FILE).read()
 lines = text.split('\n')
 
@@ -126,7 +140,7 @@ send({"jsonrpc": "2.0", "id": 102, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": "file:///tmp/b1test.d"},
                  "position": {"line": 5, "character": 6}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('broken-trailing-dot', labels == ['x', 'y'], str(labels))
+check('broken-trailing-dot', members_only(labels) == ['x', 'y'], str(labels))
 
 # trailing dot on an `auto` local from an imported module: the placeholder
 # must survive semantic (else the body collapses and the type is lost)
@@ -139,7 +153,7 @@ send({"jsonrpc": "2.0", "id": 105, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": "file:///tmp/b2test.d"},
                  "position": {"line": 5, "character": 8}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('auto-trailing-dot', labels == ['workers', 'name'], str(labels))
+check('auto-trailing-dot', members_only(labels) == ['workers', 'name'], str(labels))
 
 # Array element access: `xs[0].` completes on the element type.
 atext = 'module arridx;\nstruct Entry { int a; int b; }\nvoid f()\n{\n    Entry[] xs;\n    xs[0].\n}\n'
@@ -151,7 +165,7 @@ send({"jsonrpc": "2.0", "id": 106, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": "file:///tmp/arridx.d"},
                  "position": {"line": 5, "character": 10}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('array-index-dot', labels == ['a', 'b'], str(labels))
+check('array-index-dot', members_only(labels) == ['a', 'b'], str(labels))
 
 # Declarations produced by a CTFE string mixin must be completable even
 # though the buffer being completed has a parse error (incomplete token).
@@ -250,11 +264,53 @@ filturi = open_doctype('filt.d', filtdoc)
 send({"jsonrpc": "2.0", "id": 122, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": filturi},
                  "position": {"line": 4, "character": 4}}})
-flabels = [i['label'] for i in read_msg()['result']['items']]
+fitems = read_msg()['result']['items']
+flabels = [i['label'] for i in fitems]
 finst = [l for l in flabels if l.startswith('__unittest_') or l.startswith('_d_')]
 check('completion-no-internals', bool(flabels) and not finst, str(finst[:6]))
 check('completion-keeps-user-underscore', '__userFlag' in flabels,
       str(flabels[:8]))
+# Keywords are offered (kind 14 = Keyword) in a bare completion...
+kwkinds = [i['label'] for i in fitems if i.get('kind') == 14]
+check('completion-keywords',
+      all(k in kwkinds for k in ('if', 'else', 'return', 'struct', 'foreach')),
+      str(kwkinds[:8]))
+
+# ...but not after a dot.
+dotdoc = 'module dotk;\nstruct S { int x; }\nvoid f() { S s; s. }\n'
+doturi = open_doctype('dotk.d', dotdoc)
+send({"jsonrpc": "2.0", "id": 123, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": doturi},
+                 "position": {"line": 2,
+                              "character": dotdoc.split('\n')[2].index('s.') + 2}}})
+dotitems = read_msg()['result']['items']
+check('completion-no-keywords-after-dot',
+      not any(i.get('kind') == 14 for i in dotitems),
+      str([i['label'] for i in dotitems if i.get('kind') == 14][:6]))
+
+# ...nor mid-expression (keywords are offered only at a statement boundary).
+middoc = 'module midk;\nint g;\nvoid f(int a)\n{\n    int y = g + \n}\n'
+miduri = open_doctype('midk.d', middoc)
+send({"jsonrpc": "2.0", "id": 124, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": miduri},
+                 "position": {"line": 4,
+                              "character": len(middoc.split('\n')[4])}}})
+miditems = read_msg()['result']['items']
+check('completion-no-keywords-mid-expression',
+      not any(i.get('kind') == 14 for i in miditems),
+      str([i['label'] for i in miditems if i.get('kind') == 14][:6]))
+
+# Built-in properties after a dot, by type: `a.` on an int -> init/sizeof/max.
+propdoc = 'module propk;\nvoid f(int a)\n{\n    a.\n}\n'
+propuri = open_doctype('propk.d', propdoc)
+send({"jsonrpc": "2.0", "id": 125, "method": "textDocument/completion",
+      "params": {"textDocument": {"uri": propuri},
+                 "position": {"line": 3,
+                              "character": propdoc.split('\n')[3].index('a.') + 2}}})
+props = [i['label'] for i in read_msg()['result']['items']]
+check('completion-builtin-properties',
+      all(p in props for p in ('init', 'sizeof', 'mangleof', 'max', 'min')),
+      str(props[:12]))
 
 def sig_at(uri, line, ch):
     _sid[0] += 1
@@ -306,7 +362,7 @@ send({"jsonrpc": "2.0", "id": 300, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": curi},
                  "position": {"line": 9, "character": 33}}})
 labels = [i['label'] for i in read_msg()['result']['items']]
-check('dot-in-call-arg', labels == ['owner_handle', 'hp'], str(labels))
+check('dot-in-call-arg', members_only(labels) == ['owner_handle', 'hp'], str(labels))
 
 # Same position without a dot: the local's inferred type must be shown
 # (not the snapshot's "local" fallback).

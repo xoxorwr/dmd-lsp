@@ -1831,6 +1831,64 @@ private void pushArrayProperties(Arena* a, ref CompleteOut o,
     }
 }
 
+// Built-in D properties offered after a dot, chosen by the LHS type. Arrays
+// keep their rich set (`.length`, `.dup`, ...); every type gets `.init`,
+// `.sizeof`, `.alignof`, `.mangleof`, `.stringof`; numerics `.max`/`.min`
+// (floats also `.nan`/`.infinity`/...); aggregates `.tupleof` and, for
+// classes, `.classinfo`.
+private void pushBuiltinProperties(Arena* a, ref CompleteOut o,
+    ref bool[const(char)[]] seen, const(char)[] prefix, Type t)
+{
+    Type tb = t ? t.toBasetype() : null;
+    const(char)[][] names = ["init", "sizeof", "alignof", "mangleof", "stringof"];
+    if (tb)
+        switch (tb.ty)
+        {
+        case TY.Tarray:
+            names ~= ["length", "ptr", "dup", "idup", "capacity", "reserve",
+                "reverse", "sort"];
+            break;
+        case TY.Tsarray:
+            names ~= ["length", "ptr", "dup", "idup", "reverse", "sort"];
+            break;
+        case TY.Taarray:
+            names ~= ["length", "keys", "values", "byKey", "byValue",
+                "byKeyValue", "rehash", "dup", "get", "require", "update"];
+            break;
+        case TY.Tbool, TY.Tchar, TY.Twchar, TY.Tdchar,
+            TY.Tint8, TY.Tuns8, TY.Tint16, TY.Tuns16, TY.Tint32, TY.Tuns32,
+            TY.Tint64, TY.Tuns64, TY.Tint128, TY.Tuns128, TY.Tenum:
+            names ~= ["max", "min"];
+            break;
+        case TY.Tfloat32, TY.Tfloat64, TY.Tfloat80,
+            TY.Timaginary32, TY.Timaginary64, TY.Timaginary80,
+            TY.Tcomplex32, TY.Tcomplex64, TY.Tcomplex80:
+            names ~= ["max", "min", "min_normal", "nan", "infinity",
+                "epsilon", "dig", "mant_dig", "max_10_exp", "min_10_exp",
+                "max_exp", "min_exp"];
+            break;
+        default:
+            break;
+        }
+    if (tb)
+    {
+        if (auto ts = tb.isTypeStruct())
+            names ~= "tupleof";
+        else if (auto tc = tb.isTypeClass())
+        {
+            names ~= "tupleof";
+            if (tc.sym && tc.sym.isClassDeclaration())
+                names ~= "classinfo";
+        }
+    }
+    foreach (nm; names)
+    {
+        if (!hasPrefix(nm, prefix))
+            continue;
+        pushItem(a, o, nm, 10, "property", null, "1", seen);
+    }
+}
+
 // The struct/class declaration a (possibly qualified/aliased) type denotes, or
 // null for pointers/arrays/primitives.
 private Dsymbol aggregateSym(Type t)
@@ -3815,6 +3873,99 @@ void addImportItems(Arena* arena, ref CompleteOut out_, const(string)[] names,
     }
 }
 
+// D keywords/type words, straight from dmd. Every token spelling is checked
+// against the identifier pool (keywords are registered with their TOK value;
+// a plain identifier's value is `TOK.identifier`), and C-only keywords are
+// excluded by the same boundary the lexer uses (`FirstCKeyword`): that drops
+// `signed`/`unsigned`/`sizeof`/`typedef`/`_Bool`/`__attribute__` and other
+// spellings that are not D. Internal token names (`reserved`, `xstring`) never
+// made it into the pool, so they are out too.
+// True when the cursor sits where a statement/declaration may begin: the last
+// significant token before it is `;`, `{`, `}` or `:` (the `:` covers labels
+// and `case`/`default`, `}` covers the `else`/`catch`/`finally`/`do..while`
+// continuations), or nothing precedes it. Keywords are offered only here, so
+// they never appear mid-expression or after a dot.
+private bool atStatementBoundary(const(char)[] text, uint line, uint col)
+{
+    import dmd.tokens : TOK;
+
+    static bool trivia(TOK t)
+    {
+        return t == TOK.comment || t == TOK.whitespace || t == TOK.endOfLine;
+    }
+    if (line < 1)
+        return true;
+    size_t off = lineColToOffset(text, line, col);
+    if (off > text.length)
+        off = text.length;
+    size_t ls = off;
+    while (ls > 0 && text[ls - 1] != '\n')
+        ls--;
+    TOK last = TOK.endOfFile;
+    bool have = false;
+    auto toks = lexLineTokens(text[ls .. off]);
+    foreach_reverse (t; toks)
+        if (!trivia(t.value))
+        {
+            last = t.value;
+            have = true;
+            break;
+        }
+    uint l = line;
+    while (!have && l > 1)
+    {
+        l--;
+        size_t s = lineColToOffset(text, l, 0);
+        size_t e = s;
+        while (e < text.length && text[e] != '\n')
+            e++;
+        auto ptoks = lexLineTokens(text[s .. e]);
+        foreach_reverse (t; ptoks)
+            if (!trivia(t.value))
+            {
+                last = t.value;
+                have = true;
+                break;
+            }
+    }
+    if (!have)
+        return true; // start of the file/visible text
+    switch (last)
+    {
+    case TOK.semicolon:
+    case TOK.leftCurly:
+    case TOK.rightCurly:
+    case TOK.colon:
+        return true;
+    default:
+        return false;
+    }
+}
+
+private void addKeywordItems(Arena* a, ref CompleteOut o, const(char)[] prefix,
+    ref bool[const(char)[]] seen)
+{
+    import dmd.identifier : Identifier;
+    import dmd.tokens : Token, TOK, FirstCKeyword;
+    foreach (i; 0 .. cast(int)TOK.max + 1)
+    {
+        auto nm = Token.toString(cast(TOK) i);
+        if (nm.length == 0)
+            continue;
+        auto id = Identifier.lookup(nm);
+        if (!id)
+            continue;
+        int v = id.getValue();
+        if (v == cast(int) TOK.identifier || v >= cast(int) FirstCKeyword)
+            continue;
+        if (!hasPrefix(nm, prefix))
+            continue;
+        pushItem(a, o, nm, 14, "keyword", null, "2", seen);
+        if (o.nitems >= 500)
+            return;
+    }
+}
+
 void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     const(char)[] text, const ref SynMod syn, ref CompleteOut out_)
 {
@@ -4011,11 +4162,18 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
             baseName(segs[$ - 1]).length != segs[$ - 1].length;
         if (lhsType && !indexedLast && isBuiltinArrayType(lhsType))
         {
-            pushArrayProperties(arena, out_, seen, prefix, lhsType);
+            pushBuiltinProperties(arena, out_, seen, prefix, lhsType);
             return;
         }
         if (!scope_.length && !aggregateSym(lhsType) && !lhsAgg)
         {
+            // No members (e.g. a primitive), but a resolved type still has
+            // built-in properties: `int.` -> init, sizeof, max, min, ...
+            if (lhsType)
+            {
+                pushBuiltinProperties(arena, out_, seen, prefix, lhsType);
+                return;
+            }
             out_.incomplete = true;
             return;
         }
@@ -4060,6 +4218,8 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
         // UFCS: free functions callable as `expr.name(...)`.
         addUfcsMembers(arena, mod, rootMembers, lhsType, lhsAgg, prefix, seen,
             out_);
+        // Built-in properties are valid on any expression.
+        pushBuiltinProperties(arena, out_, seen, prefix, lhsType);
         return;
     }
 
@@ -4071,6 +4231,9 @@ void completeAt(Arena* arena, Module mod, const CompleteCtx* ctx,
     }
     walkImports(mod, 0, arena, prefix, out_, seen);
     addLocalImports(syn, ctx.line, arena, prefix, out_, seen);
+    // Contextual keywords: only where a statement can begin.
+    if (atStatementBoundary(text, ctx.line, ctx.character))
+        addKeywordItems(arena, out_, prefix, seen);
 }
 
 // One import's completions: its local binding (the alias in
