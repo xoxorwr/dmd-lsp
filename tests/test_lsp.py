@@ -266,8 +266,14 @@ send({"jsonrpc": "2.0", "id": 122, "method": "textDocument/completion",
                  "position": {"line": 4, "character": 4}}})
 fitems = read_msg()['result']['items']
 flabels = [i['label'] for i in fitems]
-finst = [l for l in flabels if l.startswith('__unittest_') or l.startswith('_d_')]
-check('completion-no-internals', bool(flabels) and not finst, str(finst[:6]))
+# Imported runtime internals: `__*`, `_d_*`, `_aa*`, `_D*`, `_xop*`, ...
+# (kind 14 is Keyword, which legitimately includes `__FILE__`, `__traits`, ...).
+RESERVED_IMPL = ('__', '_d_', '_aa', '_D', '_xop', '_aApply', '_arrayOp',
+                 '_newEntry', '_refAA', '_toAA')
+finst = [i['label'] for i in fitems
+         if i.get('kind') != 14 and i['label'] != '__userFlag' and
+         any(i['label'].startswith(p) for p in RESERVED_IMPL)]
+check('completion-no-internals', bool(flabels) and not finst, str(finst[:8]))
 check('completion-keeps-user-underscore', '__userFlag' in flabels,
       str(flabels[:8]))
 # Keywords are offered (kind 14 = Keyword) in a bare completion...

@@ -123,16 +123,42 @@ private bool isUnittestThunk(const(char)[] nm) pure nothrow @nogc @safe
     return nm.length >= 11 && nm[0 .. 11] == "__unittest_";
 }
 
-// Reserved implementation names (`__*`, `_d_*`). Hidden only when enumerating
-// an *imported* module's interface (phobos/druntime/`object` flood completion
-// with them); the root module's own symbols are kept, so a user's `__`-prefixed
-// code still completes.
+// True for a symbol the language/runtime implements for you — never something
+// a user calls directly. Prefer dmd's own markers over name guessing:
+//   * `FuncDeclaration.isGenerated` — compiler-generated functions (`opCmp`/
+//     `opEquals` thunks, `__xdtor`, `__xpostblit`, `__unittest_*`, ...);
+//   * `Declaration.mangleOverride` starting with `_` — runtime entry points
+//     declared with `pragma(mangle, "_aa..."/"_d_...")`;
+//   * `isTypeInfoDeclaration` — generated `TypeInfo` objects.
+// The reserved-name check is only a fallback for the few compiler-internal
+// templates/aliases that carry none of those markers (`__ArrayCast`, ...).
+private bool isInternalSymbol(Dsymbol s)
+{
+    if (!s)
+        return false;
+    if (auto fd = s.isFuncDeclaration())
+        if (fd.isGenerated)
+            return true;
+    if (auto d = s.isDeclaration())
+        if (d.mangleOverride.length && d.mangleOverride[0] == '_')
+            return true;
+    if (s.isTypeInfoDeclaration())
+        return true;
+    if (s.ident)
+        return isReservedImpl(s.ident.toString());
+    return false;
+}
+
+// Fallback reserved prefixes for compiler-internal names with no symbol marker.
 private bool isReservedImpl(const(char)[] nm) pure nothrow @nogc @safe
 {
-    if (nm.length >= 2 && nm[0] == '_' && nm[1] == '_')
-        return true;
-    if (nm.length >= 3 && nm[0] == '_' && nm[1] == 'd' && nm[2] == '_')
-        return true;
+    static immutable string[] prefixes = [
+        "__", "_d_", "_aa", "_D", "_xop",
+        "_aApply", "_arrayOp", "_newEntry", "_refAA", "_toAA",
+    ];
+    foreach (p; prefixes)
+        if (nm.length >= p.length && nm[0 .. p.length] == p)
+            return true;
     return false;
 }
 
@@ -353,7 +379,7 @@ private void addMembers(Arena* a, Dsymbol[] members, const(char)[] prefix,
         if (s.visible().kind == Visibility.Kind.private_)
             continue;
         const(char)[] nm = s.ident.toString();
-        if (skipReserved && isReservedImpl(nm))
+        if (skipReserved && isInternalSymbol(s))
             continue;
         if (!hasPrefix(nm, prefix))
             continue;

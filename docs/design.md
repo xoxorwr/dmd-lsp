@@ -198,9 +198,13 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   suppression; trailing-dot completion (including inside an unclosed call
   argument list); CTFE string-mixin declarations; symbols re-exported
   through `public import` chains. Imported module interfaces are enumerated for
-  bare completion, where reserved implementation names (`__*`, `_d_*`) and
-  `__unittest_*` thunks are hidden (the root's own symbols are kept, so a
-  user's `__`-prefixed code still completes). D keywords (kind `Keyword`) are
+  bare completion, where compiler/runtime internals are hidden (the root's own
+  symbols are kept, so a user's `__`-prefixed code still completes). Detection
+  uses dmd's own markers where they exist — generated functions
+  (`FuncDeclaration.isGenerated`: `opCmp`/`opEquals` thunks, `__xdtor`,
+  `__unittest_*`), `pragma(mangle, "_…")` runtime entry points
+  (`Declaration.mangleOverride`), and `TypeInfoDeclaration` — with a reserved
+  name fallback (`__*`, `_d_*`, `_aa*`, `_D*`, ...) for the rest. D keywords (kind `Keyword`) are
   context-gated: offered only where a statement can begin (last significant
   token before the cursor is `;`, `{`, `}`, `:`, or nothing, ignoring the
   partial word at the cursor so `stru` still offers `struct`), so `case`/
