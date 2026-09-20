@@ -275,6 +275,13 @@ kwkinds = [i['label'] for i in fitems if i.get('kind') == 14]
 check('completion-keywords',
       all(k in kwkinds for k in ('if', 'else', 'return', 'struct', 'foreach')),
       str(kwkinds[:8]))
+# Kind-based sortText groups the list; keywords always sort last.
+kwsort = [i['sortText'] for i in fitems if i.get('kind') == 14]
+othsort = [i['sortText'] for i in fitems if i.get('kind') != 14]
+check('completion-keywords-sort-last',
+      bool(kwsort) and bool(othsort) and min(kwsort) > max(othsort),
+      'kw=%s other=%s' % (min(kwsort) if kwsort else None,
+                          max(othsort) if othsort else None))
 
 # ...but not after a dot.
 dotdoc = 'module dotk;\nstruct S { int x; }\nvoid f() { S s; s. }\n'
@@ -311,6 +318,22 @@ props = [i['label'] for i in read_msg()['result']['items']]
 check('completion-builtin-properties',
       all(p in props for p in ('init', 'sizeof', 'mangleof', 'max', 'min')),
       str(props[:12]))
+
+# Typing a keyword prefix must still see the statement boundary before it
+# (the partial word itself is not the "previous token").
+def kw_prefix(name, token):
+    doc = 'module %s;\nvoid f()\n{\n    %s\n}\n' % (name, token)
+    uri = open_doctype('%s.d' % name, doc)
+    send({"jsonrpc": "2.0", "id": 126, "method": "textDocument/completion",
+          "params": {"textDocument": {"uri": uri},
+                     "position": {"line": 3,
+                                  "character": 4 + len(token)}}})
+    return [i['label'] for i in read_msg()['result']['items'] if i.get('kind') == 14]
+
+check('completion-keyword-prefix-struct', 'struct' in kw_prefix('kp1', 'stru'), '')
+check('completion-keyword-prefix-switch', 'switch' in kw_prefix('kp2', 'swit'), '')
+check('completion-keyword-prefix-foreach', 'foreach' in kw_prefix('kp3', 'fore'), '')
+check('completion-keyword-prefix-return', 'return' in kw_prefix('kp4', 'ret'), '')
 
 def sig_at(uri, line, ch):
     _sid[0] += 1

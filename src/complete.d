@@ -136,6 +136,27 @@ private bool isReservedImpl(const(char)[] nm) pure nothrow @nogc @safe
     return false;
 }
 
+// Completion primary sort group (low sorts first), derived from the LSP kind
+// so items arrive grouped by what they are. Keywords sit at the bottom; only
+// anonymous `default` items are lower. The caller's own prefix is appended as a
+// tiebreaker (e.g. locals before module variables within the variable group).
+private const(char)[] sortGroup(ubyte kind)
+{
+    switch (kind)
+    {
+    case 9:  return "1"; // module/package
+    case 6:  return "2"; // variable (locals, params, module vars)
+    case 5:  return "3"; // field/member
+    case 10: return "3"; // property
+    case 2: case 3: case 4: return "4"; // method/function/constructor
+    case 20: return "5"; // enum member
+    case 1: case 7: case 8: case 13: case 22: case 25:
+        return "6"; // type/alias/template/type parameter
+    case 14: return "8"; // keyword
+    default: return "9";
+    }
+}
+
 private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte kind,
     const(char)[] detail, const(char)[] doc, const(char)[] sortPrefix,
     ref bool[const(char)[]] seen,
@@ -174,7 +195,7 @@ private void pushItem(Arena* a, ref CompleteOut o, const(char)[] label, ubyte ki
     ds = arenaDupStr(a, ds);
     ld = arenaDupStr(a, ld);
     lx = arenaDupStr(a, lx);
-    string sort = (cast(string)sortPrefix ~ label.idup);
+    string sort = sortGroup(kind).idup ~ sortPrefix.idup ~ label.idup;
     char* sp = cast(char*)a.alloc(sort.length + 1);
     const(char)[] ss = null;
     if (sp)
@@ -3901,16 +3922,27 @@ private bool atStatementBoundary(const(char)[] text, uint line, uint col)
     size_t ls = off;
     while (ls > 0 && text[ls - 1] != '\n')
         ls--;
+    auto prefix = text[ls .. off];
+    auto toks = lexLineTokens(prefix);
+    // Ignore a trailing identifier that is the word currently being typed (it
+    // ends exactly at the cursor): typing `swit`/`stru` must still see the
+    // boundary before it, or keyword completion never fires.
+    size_t n = toks.length;
+    while (n > 0 && trivia(toks[n - 1].value))
+        n--;
+    if (n > 0 && toks[n - 1].value == TOK.identifier &&
+        cast(size_t) (toks[n - 1].loc.charnum() - 1) +
+            toks[n - 1].ident.toString().length == prefix.length)
+        n--;
+    while (n > 0 && trivia(toks[n - 1].value))
+        n--;
     TOK last = TOK.endOfFile;
     bool have = false;
-    auto toks = lexLineTokens(text[ls .. off]);
-    foreach_reverse (t; toks)
-        if (!trivia(t.value))
-        {
-            last = t.value;
-            have = true;
-            break;
-        }
+    if (n > 0)
+    {
+        last = toks[n - 1].value;
+        have = true;
+    }
     uint l = line;
     while (!have && l > 1)
     {

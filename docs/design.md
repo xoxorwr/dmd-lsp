@@ -199,7 +199,8 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   `__unittest_*` thunks are hidden (the root's own symbols are kept, so a
   user's `__`-prefixed code still completes). D keywords (kind `Keyword`) are
   context-gated: offered only where a statement can begin (last significant
-  token before the cursor is `;`, `{`, `}`, `:`, or nothing), so `case`/
+  token before the cursor is `;`, `{`, `}`, `:`, or nothing, ignoring the
+  partial word at the cursor so `stru` still offers `struct`), so `case`/
   `default`, `catch`/`finally` and `else` appear where valid and never
   mid-expression or after a dot. The list comes from dmd's identifier pool with
   the lexer's C/D boundary, so `signed`/`sizeof`/`_Bool` are not offered. After
