@@ -3416,19 +3416,45 @@ private const(char)[] hdrgenDecl(Arena* a, Dsymbol sym)
 
 // Render hover for an already-resolved symbol (dmd's `resolvedSymbolAt`, or
 // the text-chain resolver's result).
+// Short, fully-qualified declaration for an aggregate/enum: `struct mod.Name`
+// rather than hdrgen's whole body. The body (members, enum `cast` values)
+// reads as source code and is what users reported as noisy; the module
+// qualification is what disambiguates a same-named symbol elsewhere.
+private const(char)[] shortDecl(Arena* a, Dsymbol sym)
+{
+    import core.stdc.string : strlen;
+    char[] buf;
+    if (auto k = sym.kind())
+    {
+        buf ~= k[0 .. strlen(k)];
+        buf ~= " ";
+    }
+    if (auto q = sym.toPrettyChars())
+        buf ~= q[0 .. strlen(q)];
+    return arenaDupStr(a, buf);
+}
+
 void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_)
 {
     if (!sym)
         return;
-    // Prefer dmd's own declaration renderer for functions/types/templates/
-    // aliases. Not for variables (hdrgen is header form: `extern int gval;`,
-    // and locals become `extern S s;`) nor Module (it would dump the file).
-    out_.detail = declLine(arena, sym);
-    if (!sym.isVarDeclaration() && !sym.isModule())
+    if (sym.isAggregateDeclaration() || sym.isEnumDeclaration())
     {
-        if (auto hd = hdrgenDecl(arena, sym))
-            if (hd.length)
-                out_.detail = hd;
+        // Types/enums: short qualified declaration, never the body.
+        out_.detail = shortDecl(arena, sym);
+    }
+    else
+    {
+        // Prefer dmd's own declaration renderer for functions/aliases. Not for
+        // variables (hdrgen is header form: `extern int gval;`, and locals
+        // become `extern S s;`) nor Module (it would dump the file).
+        out_.detail = declLine(arena, sym);
+        if (!sym.isVarDeclaration() && !sym.isModule())
+        {
+            if (auto hd = hdrgenDecl(arena, sym))
+                if (hd.length)
+                    out_.detail = hd;
+        }
     }
     out_.doc = arenaDupStr(arena, docOf(sym));
     out_.found = out_.detail.length > 0 || out_.doc.length > 0;

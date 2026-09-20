@@ -485,10 +485,22 @@ check('hover-index-identifier', hv is not None and 'int k' in hv, str(hv))
 hv = hover_uri(hidxuri, 2, htext.split('\n')[2].index('tbl[') + 1)
 check('hover-index-array', hv is not None and 'E[4] tbl' in hv, str(hv))
 
-# hover on a type shows the declaration source, not just "struct S".
+# hover on a type/enum is a short, fully-qualified declaration, not the body
+# (the body reads as source and dumps enum members as `cast` expressions).
 hv = hover_uri(cuna, 1, 7)
-check('hover-type-def', hv is not None and 'struct S' in hv and 'int x' in hv,
-      str(hv))
+check('hover-type-def', hv is not None and 'struct chain.S' in hv and
+      'int x' not in hv, str(hv))
+hk = ('module hk;\n'
+      'class C { int y; }\n'
+      'enum E { a, b }\n'
+      'void f() { C c; E e; }\n')
+hkuri = open_doctype('hk.d', hk)
+hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
+check('hover-class-short', hv is not None and 'class hk.C' in hv and
+      'int y' not in hv, str(hv))
+hv = hover_uri(hkuri, 3, hk.split('\n')[3].index('E e'))
+check('hover-enum-short', hv is not None and 'enum hk.E' in hv and
+      'cast' not in hv, str(hv))
 
 # Selective import: complete the imported module's members after ':'.
 seluri = open_doctype('selimp.d',

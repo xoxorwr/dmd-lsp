@@ -100,7 +100,7 @@ send({"jsonrpc": "2.0", "id": 4, "method": "textDocument/hover",
       "params": {"textDocument": {"uri": URI}, "position": {"line": 1, "character": 7}}})
 hov = read_msg()['result']
 check('hover-reuses',
-      hov is not None and 'struct S' in hov['contents']['value'], str(hov))
+      hov is not None and 'struct spawntest.S' in hov['contents']['value'], str(hov))
 send({"jsonrpc": "2.0", "id": 5, "method": "textDocument/definition",
       "params": {"textDocument": {"uri": URI}, "position": {"line": 1, "character": 7}}})
 dfn = read_msg()['result']

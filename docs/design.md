@@ -208,13 +208,15 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   declaration sites. Cross-file locations are turned into
   absolute `file://` URIs (`absolutePath`/`pathToUri`), Windows-aware (drive
   letters, backslash normalisation).
-- `textDocument/hover`: functions/types/templates/aliases are rendered by
-  dmd's own `hdrgen` (`toCBuffer` with `hdrgen=true, doFuncBodies=false`,
-  indented), so no source reading or brace-matching is needed. Variables/
-  fields/locals use a synthesized `type name` instead, because hdrgen's
-  header form marks declarations `extern` (locals become `extern S s;`).
-  Modules are excluded (a Module would dump the whole file). Doc comment
-  appended as Markdown.
+- `textDocument/hover`: aggregates and enums show a short, fully-qualified
+  declaration (`struct mod.Name`), never their body — hdrgen renders the whole
+  member list (and enum values as `cast(T)0`), which reads as source. Functions
+  and aliases are rendered by dmd's own `hdrgen` (`toCBuffer` with
+  `hdrgen=true, doFuncBodies=false`, indented), so no source reading or
+  brace-matching is needed. Variables/fields/locals use a synthesized
+  `type name` instead, because hdrgen's header form marks declarations
+  `extern` (locals become `extern S s;`). Modules are excluded (a Module would
+  dump the whole file). Doc comment appended as Markdown.
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
 - Universe cache: repeated requests ~free (13× on the stress file); edits
