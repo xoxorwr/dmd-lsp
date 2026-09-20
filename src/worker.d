@@ -211,7 +211,39 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
 }
 
 // ---------- worker (child) side ----------
-    private void sendNeedRespawn()
+    // The warm per-root analysis for `path` (kept fresh by the idle debounce; see
+// `complete`/`hover`). Read-only ops read this instead of forking a re-parse.
+// Analysis is debounce-only, so these requests never fork or respawn.
+private Analysis cachedAnalysis(ref ServerState s, const(char)[] path)
+{
+    if (auto c = path.idup in s.roots)
+        return *c;
+    return Analysis.init;
+}
+
+// Like `cachedAnalysis`, but falls back to the on-demand analyse path when a
+// root was never opened/debounced — call/type hierarchy items can point at
+// files the user never opened.
+private Analysis warmOrAnalyze(ref ServerState s, ref bool built,
+    const(char)[] path, const(char)[] atext, const(char)[] orig)
+{
+    if (auto c = path.idup in s.roots)
+        return *c;
+    auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
+    Analysis a;
+    if (built && st == UniState.reuse)
+        a = s.uni.analysis;
+    else if (built && st == UniState.incremental)
+        a = serverAnalyzeIncremental(s, path, atext, orig);
+    else if (s.sharedReg)
+        a = serverAnalyzeShared(s, path, atext, orig);
+    else
+        a = serverAnalyze(s, path, atext, orig);
+    built = true;
+    return a;
+}
+
+private void sendNeedRespawn()
     {
         auto js = jmake();
         auto root = js.create_object();
@@ -2555,26 +2587,8 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    signatureAndSend(s, a, orig, line, col);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 signatureAndSend(s, a, orig, line, col);
-                built = true;
                 continue;
             }
             if (ops == "definition")
@@ -2589,26 +2603,8 @@ if (built && st != UniState.reuse)
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 bool typeDef = jbool(jget(p, "type"), false);
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    definitionAndSend(s, a, orig, line, col, typeDef);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 definitionAndSend(s, a, orig, line, col, typeDef);
-                built = true;
                 continue;
             }
             if (ops == "implementStubs")
@@ -2622,26 +2618,8 @@ if (built && st != UniState.reuse)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    implementStubsAndSend(s, a, orig, line, col);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 implementStubsAndSend(s, a, orig, line, col);
-                built = true;
                 continue;
             }
             if (ops == "inlayHint")
@@ -2653,26 +2631,8 @@ if (built && st != UniState.reuse)
                 auto orig = jstr(jget(p, "origText"));
                 if (orig is null)
                     orig = "";
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    inlayHintsAndSend(s, a, orig);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 inlayHintsAndSend(s, a, orig);
-                built = true;
                 continue;
             }
             if (ops == "foldingRange")
@@ -2711,26 +2671,8 @@ if (built && st != UniState.reuse)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    documentHighlightAndSend(s, a, path, orig, line, col);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 documentHighlightAndSend(s, a, path, orig, line, col);
-                built = true;
                 continue;
             }
             if (ops == "callHierarchy")
@@ -2745,24 +2687,7 @@ if (built && st != UniState.reuse)
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 auto mode = dupOrEmpty(jstr(jget(p, "mode")));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    callAndSend(s, a, path, orig, line, col, mode);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = warmOrAnalyze(s, built, path, atext, orig);
                 if (forkRun(() {
                     callAndSend(s, a, path, orig, line, col, mode);
                 }))
@@ -2783,24 +2708,7 @@ if (built && st != UniState.reuse)
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 auto mode = dupOrEmpty(jstr(jget(p, "mode")));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    typeHierarchyAndSend(s, a, path, orig, line, col, mode);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = warmOrAnalyze(s, built, path, atext, orig);
                 if (forkRun(() {
                     typeHierarchyAndSend(s, a, path, orig, line, col, mode);
                 }))
@@ -2821,24 +2729,7 @@ if (built && st != UniState.reuse)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    implementationAndSend(s, a, path, orig, line, col);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = warmOrAnalyze(s, built, path, atext, orig);
                 if (forkRun(() {
                     implementationAndSend(s, a, path, orig, line, col);
                 }))
@@ -2865,15 +2756,7 @@ if (built && st != UniState.reuse)
                     // (the per-candidate re-analysis clobbers the warm
                     // universe). Without a fork, fall back to the
                     // in-universe result rather than risk clobbering.
-                    auto st0 = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                    Analysis a0;
-                    if (built && st0 == UniState.reuse)
-                        a0 = s.uni.analysis;
-                    else
-                    {
-                        a0 = serverAnalyze(s, path, atext, orig);
-                        built = true;
-                    }
+                    auto a0 = cachedAnalysis(s, path);
                     if (forkRun(() {
                         wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
                     }))
@@ -2881,26 +2764,8 @@ if (built && st != UniState.reuse)
                     referencesAndSend(s, a0, path, orig, line, col, includeDecl);
                     continue;
                 }
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    referencesAndSend(s, a, path, orig, line, col, includeDecl);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 referencesAndSend(s, a, path, orig, line, col, includeDecl);
-                built = true;
                 continue;
             }
             if (ops == "prepareRename")
@@ -2914,15 +2779,7 @@ if (built && st != UniState.reuse)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                Analysis a;
-                if (built && st == UniState.reuse)
-                    a = s.uni.analysis;
-                else
-                {
-                    a = serverAnalyze(s, path, atext, orig);
-                    built = true;
-                }
+                auto a = cachedAnalysis(s, path);
                 auto occ = occurrenceAt(cast(Module)a.module_, line, col, orig);
                 if (!occ.sym || !isRenameable(occ.sym))
                     sendPrepareRename(false, 0, 0, 0, null, "not renameable");
@@ -2992,26 +2849,8 @@ if (built && st != UniState.reuse)
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, text, null);
-                    sendDocumentSymbol(a, text);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, text);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                auto a = cachedAnalysis(s, path);
                 sendDocumentSymbol(a, text);
-                built = true;
                 continue;
             }
             if (ops == "buildIndex")
@@ -3091,35 +2930,12 @@ if (built && st != UniState.reuse)
                 auto text = jstr(jget(p, "text"));
                 if (text is null)
                     text = "";
-                // Reuse the live universe by document identity, like
-                // diagnostics: this is what keeps completion/token/analyze
-                // requests on the same buffer instead of evicting each other.
-                // A neutralised universe is fine — the classifier is
-                // position-safe and falls back to the pre-semantic snapshot.
-                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, text, null);
-                    SemTok[] toks;
-                    semanticTokens(cast(Module)a.module_, a.syn, text, toks);
-                    sendSemantic(toks);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
-                {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, text);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
+                // Tokens answer from the warm per-root cache too (see
+                // `complete`/`hover`): analysis is debounce-only.
+                auto a = cachedAnalysis(s, path);
                 SemTok[] toks;
                 semanticTokens(cast(Module)a.module_, a.syn, text, toks);
                 sendSemantic(toks);
-                built = true;
                 continue;
             }
             sendNeedRespawn(); // unknown op
