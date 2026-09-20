@@ -3518,6 +3518,45 @@ private const(char)[] hdrgenDecl(Arena* a, Dsymbol sym)
     return arenaDupStr(a, buf.opSlice());
 }
 
+// hdrgen prints the declaration name unqualified (`struct MyStruct`); splice in
+// the fully-qualified name so `fullTypeHover` still shows which module the type
+// comes from (`struct my.mod.MyStruct { ... }`).
+private const(char)[] hdrgenQualified(Arena* a, Dsymbol sym)
+{
+    auto hd = hdrgenDecl(a, sym);
+    if (!hd.length || !sym.ident)
+        return hd;
+    import core.stdc.string : strlen;
+    const(char)* qp = sym.toPrettyChars();
+    if (!qp)
+        return hd;
+    auto q = qp[0 .. strlen(qp)];
+    auto id = sym.ident.toString();
+    if (!id.length || q == id)
+        return hd;
+    // First whole-word occurrence of the declaration name.
+    size_t at = size_t.max;
+    foreach (i; 0 .. hd.length)
+    {
+        if (i + id.length > hd.length)
+            break;
+        if (hd[i .. i + id.length] == id &&
+            (i == 0 || !isPc(hd[i - 1])) &&
+            (i + id.length == hd.length || !isPc(hd[i + id.length])))
+        {
+            at = i;
+            break;
+        }
+    }
+    if (at == size_t.max)
+        return hd;
+    char[] buf;
+    buf ~= hd[0 .. at];
+    buf ~= q;
+    buf ~= hd[at + id.length .. $];
+    return arenaDupStr(a, buf);
+}
+
 // Render hover for an already-resolved symbol (dmd's `resolvedSymbolAt`, or
 // the text-chain resolver's result).
 // Short, fully-qualified declaration for an aggregate/enum: `struct mod.Name`
@@ -3543,10 +3582,11 @@ void hoverSymbol(Arena* arena, Dsymbol sym, ref HoverInfo out_,
 {
     if (!sym)
         return;
-    if (!fullDecl && (sym.isAggregateDeclaration() || sym.isEnumDeclaration()))
+    if (sym.isAggregateDeclaration() || sym.isEnumDeclaration())
     {
-        // Types/enums: short qualified declaration, never the body.
-        out_.detail = shortDecl(arena, sym);
+        // Types/enums: short qualified declaration by default; hdrgen's full
+        // body (with the name qualified) when `fullTypeHover` is on.
+        out_.detail = fullDecl ? hdrgenQualified(arena, sym) : shortDecl(arena, sym);
     }
     else
     {

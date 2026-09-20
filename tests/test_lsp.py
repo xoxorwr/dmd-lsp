@@ -604,7 +604,7 @@ send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
       "params": {"settings": {"fullTypeHover": True}}})
 hvfull = hover_uri(hkuri, 3, hk.split('\n')[3].index('C c'))
 check('hover-full-type-optin',
-      hvfull is not None and 'class C' in hvfull and 'int y' in hvfull,
+      hvfull is not None and 'class hk.C' in hvfull and 'int y' in hvfull,
       str(hvfull))
 send({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
       "params": {"settings": {"fullTypeHover": False}}})
