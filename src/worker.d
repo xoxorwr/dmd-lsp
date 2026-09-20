@@ -35,7 +35,7 @@ import lint;
 import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
 import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
-    dmdModuleResident,
+    dmdModuleResident, universeDepsChanged,
     dmdParseNoRegister, dmdLocCheckpoint, dmdLocRollback,
     dmdSetDoc, dmdRemoveDoc,
     dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
@@ -221,6 +221,18 @@ private Analysis cachedAnalysis(ref ServerState s, const(char)[] path)
     return Analysis.init;
 }
 
+// The one place that decides whether an in-place re-parse is safe. It is only
+// safe when no resident module imports the root: importers retain symbols from
+// the replaced AST, and dmd's conservative GC cannot reclaim them
+// (`dmdRootHasImporters`). A pool worker's closure can still contain an
+// importer of its root, so "one root per worker" is not sufficient.
+private bool canIncrementalReparse(ref ServerState s, bool built, UniState st)
+{
+    if (!built || st != UniState.incremental)
+        return false;
+    return !dmdRootHasImporters(s.uni.analysis.module_);
+}
+
 // Like `cachedAnalysis`, but falls back to the on-demand analyse path when a
 // root was never opened/debounced — call/type hierarchy items can point at
 // files the user never opened.
@@ -229,11 +241,18 @@ private Analysis warmOrAnalyze(ref ServerState s, ref bool built,
 {
     if (auto c = path.idup in s.roots)
         return *c;
+    if (auto c = path.idup in s.roots)
+    {
+        // A dependency edited unsaved (mirror) or on disk invalidates this
+        // root's cache even though the root text is unchanged.
+        if (!universeDepsChanged(s.uni.deps))
+            return *c;
+    }
     auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
     Analysis a;
     if (built && st == UniState.reuse)
         a = s.uni.analysis;
-    else if (built && st == UniState.incremental)
+    else if (canIncrementalReparse(s, built, st))
         a = serverAnalyzeIncremental(s, path, atext, orig);
     else if (s.sharedReg)
         a = serverAnalyzeShared(s, path, atext, orig);
@@ -2451,7 +2470,7 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 // root that some loaded module imports is unsafe (stale
                 // symbols). Any other root keeps the cheap incremental path.
                 if (st == UniState.incremental && built &&
-                    dmdRootHasImporters(s.uni.analysis.module_))
+                    !canIncrementalReparse(s, built, st))
                     st = UniState.miss;
                 // Only the root text changed: re-analyze it in a fork child on
                 // the warm dependency closure. A root switch, dependency edit
@@ -2514,25 +2533,40 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 // semantic errors, not just syntax. Cost is unchanged: one
                 // analysis per idle, none per keystroke.
                 auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
-                if (st == UniState.incremental)
+                if (canIncrementalReparse(s, built, st))
                 {
                     auto a = serverAnalyzeIncremental(s, path, text, null);
                     sendAnalyze(a);
                 }
                 else if (st != UniState.reuse)
                 {
-                    Analysis a;
+                    // Anything that is not a safe in-place root re-parse must
+                    // be rebuilt. The shared registry rebuilds in place
+                    // (opt-in); the pool reclaims at the process boundary,
+                    // because an in-process full reset does not free the
+                    // previous universe (dmd's conservative GC keeps it
+                    // reachable). A *fresh* pool worker has no previous
+                    // universe to reclaim, so it builds once; only a warm one
+                    // is retired.
                     if (s.sharedReg)
                     {
-                        a = serverAnalyzeShared(s, path, text);
+                        auto a = serverAnalyzeShared(s, path, text);
                         // A root that was already resident reuses its
                         // semanticised module and does not re-emit errors, so
                         // keep this warm out of the save/open hit cache.
                         s.uni.valid = false;
+                        sendAnalyze(a);
+                    }
+                    else if (built)
+                    {
+                        sendNeedRespawn();
+                        continue;
                     }
                     else
-                        a = serverAnalyze(s, path, text);
-                    sendAnalyze(a);
+                    {
+                        auto a = serverAnalyze(s, path, text);
+                        sendAnalyze(a);
+                    }
                 }
                 else
                     sendAnalyze(s.uni.analysis);
@@ -2561,9 +2595,15 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 // Completion answers from the warm per-root cache (the last
                 // debounced/open/save analysis), so typing never re-analyses.
-                // The cache is dropped when a dependency edit forces a full
-                // reset; that one request then re-analyses via the fallback
-                // instead of returning an empty list.
+                // A dependency edit invalidates the cache; the pool rebuilds at
+                // the process boundary (an in-process reset would not
+                // reclaim), the shared registry in place.
+                if (!s.sharedReg && built && path.idup in s.roots &&
+                    universeDepsChanged(s.uni.deps))
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
                 auto a = warmOrAnalyze(s, built, path, atext, orig);
                 completeAndSend(s, a, orig, line, col, prefix);
                 continue;
@@ -2826,8 +2866,14 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                 uint col = cast(uint)jint(jget(p, "col"));
                 bool fullDecl = jbool(jget(p, "fullDecl"), false);
                 // Hover answers from the warm per-root cache (see `complete`),
-                // falling back to an analyse only when a dependency edit
-                // invalidated the cache.
+                // rebuilding at the process boundary (pool) when a dependency
+                // edit invalidated it.
+                if (!s.sharedReg && built && path.idup in s.roots &&
+                    universeDepsChanged(s.uni.deps))
+                {
+                    sendNeedRespawn();
+                    continue;
+                }
                 auto a = warmOrAnalyze(s, built, path, atext, orig);
                 hoverAndSend(s, a, orig, line, col, fullDecl);
                 continue;

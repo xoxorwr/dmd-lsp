@@ -25,33 +25,37 @@ How `dmd-lsp` works and the conventions it is built on.
 The LSP front end holds only session docs, config and the debounce
 bookkeeping. Analysis runs in a worker process (`worker.d`, cross-platform):
 POSIX `fork()`s the server, Windows spawns this executable with `--worker`;
-either way the child speaks length-prefixed frames over pipes. By default there
-is **one** worker, which keeps every loaded module resident and serves every
-root (`sharedRegistry`); switching files re-analyses only the file's own body,
-not the closure. When a dependency/config changes or the `maxModules` cap is
-exceeded the worker is rebuilt. Setting `sharedRegistry: false` restores the
-older pool of up to `maxWorkers` single-root workers, least-recently-used
-evicted. (Pool workers must close the other members' pipe fds in the child, or
-a killed worker never sees EOF and the server blocks in `waitpid`.)
+either way the child speaks length-prefixed frames over pipes. By default a
+small **pool** of per-file workers is used, one root each, up to `maxWorkers`,
+least-recently-used evicted. `sharedRegistry: true` opts into a single worker
+that keeps every loaded module resident and serves every root; it is off by
+default because it cannot be mutated safely (below). (Pool workers must close
+the other members' pipe fds in the child, or a killed worker never sees EOF and
+the server blocks in `waitpid`.)
 
 The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
-~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies), and it is identical
-on every keystroke, so it is kept warm. A **root-text-only** edit does not
-rebuild it: the worker re-parses the root **in place** on the warm closure
-(`dmdReparseModule`), which **evicts the previous root module and its interned
-types** and parses into the same `Module` object so importers' `imp.mod` and
-template-instance links stay valid (~43 ms for the same frontend). The
-per-generation frontend caches are reset by the patches in
+~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies). A **root-text-only**
+edit that is safe to reparent is re-parsed in place on the warm closure
+(`dmdReparseModule`), which evicts the previous root module and its interned
+types and parses into the same `Module` so importers' `imp.mod` stay valid.
+The per-generation frontend caches are reset by the patches in
 [upstream.md](upstream.md).
 
-A dependency or config change replies `needRespawn` (or drops every worker on a
-config change): the parent discards the affected worker and starts a fresh one,
-so the OS reclaims the discarded universe. A root switch is absorbed by the
-pool when the root is warm, and otherwise spawns/binds a worker (evicting the
-LRU when full). Process isolation is the reclamation boundary because the
-conservative GC cannot prove a discarded universe unreachable in-process (see
-[findings.md](findings.md)). The decision, the policy any in-process store must
-supply, and the checklist to re-run on every dmd bump are in
+**The safety condition is `!dmdRootHasImporters(root)`** — it is centralized in
+`canIncrementalReparse`. Re-parsing a root that a *resident* module imports
+leaves that importer holding symbols from the replaced AST; dmd's conservative
+GC then keeps the whole universe reachable, so RSS grows per edit. When the
+condition does not hold, the pool rebuilds at the **process boundary**
+(`needRespawn`): the parent discards the worker and the OS reclaims everything.
+A pool worker's closure can itself contain an importer of its root, so "one root
+per worker" is not sufficient — the predicate is checked, not assumed.
+
+A dependency/config change likewise replies `needRespawn` (or drops every worker
+on a config change), and a root switch is absorbed by the pool when the root is
+warm, otherwise spawning/binding a worker (evicting the LRU when full). Process
+isolation is the reclamation boundary because the conservative GC cannot prove
+a discarded universe unreachable in-process (see [findings.md](findings.md)).
+The decision and the checklist to re-run on every dmd bump are in
 [reclamation.md](reclamation.md).
 
 The universe records which buffer it parsed (`analysisHash`) and which

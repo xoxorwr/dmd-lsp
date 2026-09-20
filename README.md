@@ -107,13 +107,12 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
   "stringImportPaths": ["views/"],   // for import("...") files (-J)
   "flags": ["-preview=rvaluerefparam", "-preview=bitfields", "-betterC"],
   "debounceMs": 500,                 // default: 500
-  "maxModules": 2048,                // registry cap (see below)
 
   // Optional features — all off unless you opt in:
   "inlayHints": false,               // default: false
   "autoImports": false,              // default: false
 
-  "sharedRegistry": true             // default: true
+  "sharedRegistry": false            // default: false (see below)
 }
 ```
 
@@ -129,8 +128,8 @@ loads at `initialize` and on save.
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 | `fullTypeHover` | `true` | Show the full declaration body (with the name qualified, e.g. `struct pkg.Name { … }`) in hover for structs/classes/unions/enums. Set `false` for just the short qualified name (`struct pkg.Name`). |
-| `sharedRegistry` | `true` | One worker serves **every** file, keeping all loaded modules resident, so switching between files re-analyses only the file you're in — no per-file workers, no respawns. Diagnostics stay exact: a file already loaded as a dependency is re-diagnosed by a full analysis in a forked child (POSIX) or by restarting the worker (Windows). Set `false` to use the older per-file worker pool. |
-| `maxModules` | `2048` | Cap on resident modules for `sharedRegistry`. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. Lower it to bound memory on huge projects. |
+| `sharedRegistry` | `false` | **Opt-in / experimental.** `true` keeps one worker serving **every** file (one shared module registry, no per-file workers). It is not the default because mutating that shared universe in place is unsafe: re-parsing a root that another resident file imports leaves the importer holding stale symbols that dmd's conservative GC cannot reclaim, so editing several inter-dependent files grows RSS without bound. The default (`false`) uses the per-file worker pool, where each root is rebuilt at the process boundary when needed. |
+| `maxModules` | `2048` | Only used when `sharedRegistry` is `true`: cap on resident modules. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is
@@ -138,16 +137,17 @@ loads at `initialize` and on save.
 
 ## How it works
 
-`dmd-lsp` runs the real dmd frontend in a worker process. By default a single
-worker keeps every loaded module resident, so an edit re-analyses only the
-changed file on top of the shared closure — switching between files does not
-start anything new. Analysis is **debounce-only**: a keystroke never builds;
-the worker caches each file's last analysis and completion answers from that
-warm cache, so an open suggest widget costs no process and no re-parse. When a
-dependency or the configuration changes, or the `maxModules` cap is exceeded,
-the worker is rebuilt (the OS reclaims the old state). With
-`sharedRegistry: false` it instead runs a small pool of per-file workers,
-least-recently-used evicted.
+`dmd-lsp` runs the real dmd frontend in a worker process. By default it keeps a
+small pool of per-file workers (least-recently-used evicted): each root is
+rebuilt at the process boundary when its text or a dependency changes, so
+memory stays bounded. Analysis is **debounce-only** — a keystroke never builds;
+the worker caches each file's last analysis and completion, hover and the other
+read-only requests answer from that warm cache, so as-you-type completion costs
+no process and no re-parse. A root with no resident importer is re-parsed in
+place; one whose importer is also resident is rebuilt at the process boundary
+(dmd's conservative GC cannot reclaim a replaced AST that importers still
+reference). With `sharedRegistry: true` a single worker keeps every loaded
+module resident instead (opt-in; see the table above).
 
 Details: [docs/design.md](docs/design.md).
 

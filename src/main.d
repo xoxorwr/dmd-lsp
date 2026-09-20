@@ -36,10 +36,13 @@ struct HitCache
 // needed 5-8 roots). Overridable from dls.json / initializationOptions.
 enum uint defaultMaxWorkers = 4;
 
-// One worker serves every root, so switching files spawns nothing. Default on
-// everywhere; the only fork-specific bit (exact diagnostics for a resident
-// root) uses a respawn where there is no fork.
-enum bool defaultSharedRegistry = true;
+// Off by default: one worker per root (the pool). A shared universe that holds
+// several resident roots cannot be mutated in place safely — re-parsing a root
+// that a resident module imports leaves that importer holding stale symbols,
+// which the conservative GC cannot reclaim (see docs/reclamation.md). Setting
+// `sharedRegistry: true` opts back into the one-worker registry for
+// experimentation; it leaks on exactly that pattern.
+enum bool defaultSharedRegistry = false;
 
 // Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): route every root to the MRU
 // worker so one process serves many roots on a shared module registry, and the
