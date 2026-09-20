@@ -131,8 +131,11 @@ Completion answers from the **warm universe**, never by re-parsing the buffer
 mid-typing. The worker keeps a per-root cache (`ServerState.roots`, path → the
 last `Analysis` of that file), written by every open/save/debounce analysis. The
 `complete` op looks the document's path up there and completes against it — it
-touches no semantic state and forks no child. A document with no cached
-analysis highlights/decorates as empty rather than forcing a build.
+touches no semantic state and forks no child. When the cache is cold (the first
+request, or a dependency edit forced a full reset that freed every module
+pointer, dropping all cached roots), that one request falls back to an analysis
+and re-caches it, rather than returning an empty list. Read-only requests
+(hover, definition, signature, tokens, highlights, symbols) share this behaviour.
 
 The one freshness cost is a **debounce**: as-you-type completion can be one idle
 cycle behind the last edit. That is invisible in practice because a member name

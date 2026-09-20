@@ -2559,21 +2559,13 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
                     continue;
                 if (completeVersionAndSend(s, orig, line, col))
                     continue;
-                // Completion NEVER analyses: it answers from the warm universe
-                // (the last debounced analysis). The debounce refreshes it, so
-                // as-you-type completion is best-effort on declarations that may
-                // be one debounce old — invisible in practice and far cheaper
-                // than re-analysing the file on every keystroke. No request here
-                // touches the semantic universe or forks.
-                // Per-root cache: the last analysis of *this* file (from
-                // open/save/the debounce).
-                if (auto c = path.idup in s.roots)
-                    completeAndSend(s, *c, orig, line, col, prefix);
-                else
-                {
-                    Analysis none;
-                    completeAndSend(s, none, orig, line, col, prefix);
-                }
+                // Completion answers from the warm per-root cache (the last
+                // debounced/open/save analysis), so typing never re-analyses.
+                // The cache is dropped when a dependency edit forces a full
+                // reset; that one request then re-analyses via the fallback
+                // instead of returning an empty list.
+                auto a = warmOrAnalyze(s, built, path, atext, orig);
+                completeAndSend(s, a, orig, line, col, prefix);
                 continue;
             }
             if (ops == "signature")
@@ -2824,23 +2816,20 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
             if (ops == "hover")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
+                auto atext = jstr(jget(p, "atext"));
+                if (atext is null)
+                    atext = "";
                 auto orig = jstr(jget(p, "origText"));
                 if (orig is null)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 bool fullDecl = jbool(jget(p, "fullDecl"), false);
-                // Hover answers from the warm per-root cache (see `complete`):
-                // analysis is debounce-only, so this neither forks nor
-                // respawns. Best-effort on text that moved since the last
-                // debounce, same as completion.
-                if (auto c = path.idup in s.roots)
-                    hoverAndSend(s, *c, orig, line, col, fullDecl);
-                else
-                {
-                    Analysis none;
-                    hoverAndSend(s, none, orig, line, col, fullDecl);
-                }
+                // Hover answers from the warm per-root cache (see `complete`),
+                // falling back to an analyse only when a dependency edit
+                // invalidated the cache.
+                auto a = warmOrAnalyze(s, built, path, atext, orig);
+                hoverAndSend(s, a, orig, line, col, fullDecl);
                 continue;
             }
             if (ops == "documentSymbol")

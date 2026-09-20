@@ -1,4 +1,4 @@
-import json, os, select, shutil, subprocess, sys, tempfile
+import json, os, select, shutil, subprocess, sys, tempfile, time
 
 # Open-document mirror (hack H4): a dependency that is open and edited unsaved
 # must be analyzed from the editor buffer, not stale disk bytes. Without the
@@ -91,6 +91,60 @@ send({"jsonrpc": "2.0", "method": "textDocument/didSave",
 after = diags_for(auri)
 check('unsaved-dep-reflected',
       any('libValue' in d and 'undefined' in d for d in after), str(after))
+
+# `public import` forwarding must survive the warm per-root cache, including
+# after the forwarded dependency is edited unsaved. papp -> pmid -> pbase.
+pbase = 'module pbase;\nstruct Base { int x; }\n'
+pbase2 = 'module pbase;\nstruct Base { int x; int y; }\n'
+pmid = 'module pmid;\npublic import pbase;\n'
+papp = ('module papp;\nimport pmid;\nvoid f()\n{\n    Base b;\n    b.\n}\n')
+pbasep = os.path.join(src, 'pbase.d')
+pmidp = os.path.join(src, 'pmid.d')
+pappp = os.path.join(src, 'papp.d')
+open(pbasep, 'w').write(pbase)
+open(pmidp, 'w').write(pmid)
+open(pappp, 'w').write(papp)
+pbaseuri, pmiduri, pappuri = 'file://' + pbasep, 'file://' + pmidp, 'file://' + pappp
+
+def rpc(rid, method, params):
+    send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    while True:
+        m = read_msg()
+        if m is None:
+            return None
+        if m.get('method') == 'workspace/semanticTokens/refresh':
+            send({"jsonrpc": "2.0", "id": m['id'], "result": None})
+            continue
+        if m.get('id') == rid:
+            return m.get('result')
+
+def open_doc(uri, text):
+    send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
+          "params": {"textDocument": {"uri": uri, "languageId": "d",
+                                      "version": 1, "text": text}}})
+    diags_for(uri)
+
+open_doc(pbaseuri, pbase)
+open_doc(pmiduri, pmid)
+open_doc(pappuri, papp)
+rx = rpc(700, 'textDocument/completion',
+         {"textDocument": {"uri": pappuri},
+          "position": {"line": 5, "character": 6}})
+labels = [i['label'] for i in (rx or {}).get('items', [])]
+check('public-import-forwarded', 'x' in labels, str(labels[:8]))
+
+# Edit the forwarded dependency unsaved; no save, no re-open of papp.
+send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+      "params": {"textDocument": {"uri": pbaseuri, "version": 2},
+                 "contentChanges": [{"text": pbase2}]}})
+diags_for(pbaseuri)
+time.sleep(0.3)
+rx = rpc(701, 'textDocument/completion',
+         {"textDocument": {"uri": pappuri},
+          "position": {"line": 5, "character": 6}})
+labels2 = [i['label'] for i in (rx or {}).get('items', [])]
+check('public-import-edit-reflected', 'y' in labels2, str(labels2[:10]))
+
 
 proc.stdin.close()
 try:
