@@ -164,15 +164,21 @@ abort point, so debouncing is the cancellation story. The default is 500 ms
 (`--debounce-ms`, `dls.json`, editor setting): a fixed debounce only coalesces
 keystrokes whose gap is *below* it, and a realistic typing cadence has
 300–500 ms thinking pauses, so 300 ms analysed most characters individually.
-The idle clock is restarted *after* each message is handled. The debounced
-analysis is the only thing that advances the semantic universe; completion
-reads the cache it leaves behind (see *Completion never analyses*). Each
-pending path is always unmarked by the flush, even on failure — a pending path
-that survives makes the idle loop retry it immediately (timeout 0). stdin runs
-unbuffered so kernel pipe state (what `poll` observes) and stdio agree; mixing
-`poll` with buffered stdio silently strands messages in the userspace buffer.
-Semantic pulls during an edit are served from the token cache; the debounced
-build precomputes the new set before its `workspace/semanticTokens/refresh`.
+The idle clock is restarted by `didChange` **only**, so a read-only request
+(hover, completion, inlay hints, token pulls) never postpones a pending
+analysis. The debounced analysis is the only thing that advances the semantic
+universe — and it publishes its result, so live diagnostics include semantic
+errors, not just syntax. Completion reads the cache it leaves behind (see
+*Completion never analyses*). Each pending path is always unmarked by the
+flush, even on failure — a pending path that survives makes the idle loop retry
+it immediately (timeout 0). stdin runs unbuffered so kernel pipe state (what
+`poll` observes) and stdio agree; mixing `poll` with buffered stdio silently
+strands messages in the userspace buffer. On POSIX the loop waits in `poll`;
+on Windows a pipe handle is not a reliable `WaitForSingleObject` target, so it
+polls `PeekNamedPipe` (falling back to the wait when the handle isn't
+peekable). Semantic pulls during an edit are served from the token cache; the
+debounced build precomputes the new set before its
+`workspace/semanticTokens/refresh`.
 
 ## Status
 

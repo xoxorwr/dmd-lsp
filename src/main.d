@@ -2148,6 +2148,11 @@ private void handleMessage(App* app, ref RawMsg m)
                 sessionUpdate(app.session, path, base);
                 pushDocToPool(app, path, base);
                 markPending(app, path);
+                // Restart the debounce clock only on an *edit*. Read-only
+                // requests (hover, completion, inlay hints, token pulls, ...)
+                // must not postpone diagnostics, or a chatty client stacks the
+                // idle window and diagnostics lag far past `debounceMs`.
+                app.lastMsgMs = nowMs();
             }
             else if (m.method == "textDocument/didClose")
             {
@@ -4087,17 +4092,16 @@ int main(string[] args)
             if (!lspRead(&m, body_))
                 break;
             handleMessage(&app, m);
-            // Restart the idle clock after handling so a slow build doesn't
-            // make the debounce look elapsed the moment it returns.
-            app.lastMsgMs = nowMs();
+            // The debounce clock is reset by `didChange` only (see there): a
+            // read-only request must not postpone the pending analysis.
             GC.collect();
         }
     }
     else version (Windows)
     {
-        import core.sys.windows.winbase : WaitForSingleObject, GetStdHandle,
-            STD_INPUT_HANDLE, WAIT_OBJECT_0, INFINITE;
-        import core.sys.windows.winerror : WAIT_TIMEOUT;
+        import core.sys.windows.winbase : GetStdHandle, PeekNamedPipe, Sleep,
+            STD_INPUT_HANDLE, INFINITE;
+        import core.sys.windows.windef : DWORD;
         import core.stdc.stdio : setvbuf, _IONBF, stdin, stdout, FILE;
 
         // Binary mode: the CRT would otherwise translate CRLF in the framing.
@@ -4124,18 +4128,44 @@ int main(string[] args)
                     timeout = wait > uint.max ? uint.max : cast(uint)wait;
                 }
             }
-            auto r = WaitForSingleObject(hIn, timeout);
-            if (r == WAIT_TIMEOUT)
+            // A pipe handle is not a reliable `WaitForSingleObject` target: it
+            // can report signaled with no data, which would block in `lspRead`
+            // and never run the debounce. `PeekNamedPipe` reports real byte
+            // availability, so poll it and check the debounce between sleeps.
+            // When the handle isn't peekable (a console, or Wine's bridged
+            // pipe), fall back to the old wait so input still works.
+            DWORD avail = 0;
+            if (PeekNamedPipe(hIn, null, 0, null, &avail, null))
             {
-                flushPending(&app);
-                continue;
+                if (avail == 0)
+                {
+                    if (timeout == 0)
+                    {
+                        flushPending(&app);
+                        continue;
+                    }
+                    uint step = timeout == INFINITE ? 10 : (timeout > 5 ? 5 : timeout);
+                    Sleep(step);
+                    continue;
+                }
             }
-            if (r != WAIT_OBJECT_0)
-                break;
+            else
+            {
+                import core.sys.windows.winbase : WaitForSingleObject, WAIT_OBJECT_0;
+                import core.sys.windows.winerror : WAIT_TIMEOUT;
+                auto r = WaitForSingleObject(hIn, timeout);
+                if (r == WAIT_TIMEOUT)
+                {
+                    flushPending(&app);
+                    continue;
+                }
+                if (r != WAIT_OBJECT_0)
+                    break;
+            }
             if (!lspRead(&m, body_))
                 break;
             handleMessage(&app, m);
-            app.lastMsgMs = nowMs();
+            // The debounce clock is reset by `didChange` only (see there).
             GC.collect();
         }
     }
