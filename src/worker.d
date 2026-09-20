@@ -2967,35 +2967,23 @@ if (built && st != UniState.reuse)
             if (ops == "hover")
             {
                 auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
                 auto orig = jstr(jget(p, "origText"));
                 if (orig is null)
                     orig = "";
                 uint line = cast(uint)jint(jget(p, "line"));
                 uint col = cast(uint)jint(jget(p, "col"));
                 bool fullDecl = jbool(jget(p, "fullDecl"), false);
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, atext, orig);
-                    hoverAndSend(s, a, orig, line, col, fullDecl);
-                }))
-                    continue;
-if (built && st != UniState.reuse)
+                // Hover answers from the warm per-root cache (see `complete`):
+                // analysis is debounce-only, so this neither forks nor
+                // respawns. Best-effort on text that moved since the last
+                // debounce, same as completion.
+                if (auto c = path.idup in s.roots)
+                    hoverAndSend(s, *c, orig, line, col, fullDecl);
+                else
                 {
-                    if (!s.sharedReg)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    serverAnalyzeShared(s, path, atext, orig);
-                    }
-                    auto a = built ? s.uni.analysis : serverAnalyze(s, path, atext, orig);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
-                hoverAndSend(s, a, orig, line, col, fullDecl);
-                built = true;
+                    Analysis none;
+                    hoverAndSend(s, none, orig, line, col, fullDecl);
+                }
                 continue;
             }
             if (ops == "documentSymbol")
