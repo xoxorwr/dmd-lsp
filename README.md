@@ -1,3 +1,10 @@
+# IMPORTANT
+
+This is a **proof-of-concept (POC)** project. Its primary purpose is to research the feasibility of building a D language server directly on top of the `dmd` frontend, using `dmd`'s semantic analysis as a library.
+
+The ultimate goal is **not** to ship this POC as-is, but to use the results and experience gained here to produce a cleaned-up, production-ready implementation suitable for inclusion in `dmd` itself.
+
+
 # dmd-lsp
 
 A minimal, dmd-frontend-native language server for D. Diagnostics, completion,
