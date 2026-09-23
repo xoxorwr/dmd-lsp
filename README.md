@@ -4,6 +4,8 @@ This is a **proof-of-concept (POC)** project. Its primary purpose is to research
 
 The ultimate goal is **not** to ship this POC as-is, but to use the results and experience gained here to produce a cleaned-up, production-ready implementation suitable for inclusion in `dmd` itself.
 
+If you are looking for something more stable, check out my other LSP project: [dls](https://github.com/xoxorwr/dls).
+
 
 # dmd-lsp
 
