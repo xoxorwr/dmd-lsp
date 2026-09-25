@@ -421,6 +421,7 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
         return occ;
 
     auto savedCollect = g_collect;
+    auto savedCollectLine = g_collectLine;
     auto savedHits = g_hits;
     auto savedFile = g_refFile;
     auto savedText = g_refText;
@@ -429,6 +430,7 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
     auto savedLinesReady = g_lineStartReady;
 
     g_collect = true;
+    g_collectLine = line;
     g_hits = null;
     g_refFile = modulePath(mod);
     g_refText = text;
@@ -465,6 +467,7 @@ Occurrence occurrenceAt(Module mod, uint line, uint col, const(char)[] text)
     }
 
     g_collect = savedCollect;
+    g_collectLine = savedCollectLine;
     g_hits = savedHits;
     g_refFile = savedFile;
     g_refText = savedText;
@@ -676,8 +679,10 @@ private size_t refOffsetFast(uint line, uint col)
         return 0;
     if (line > g_lineStart.length)
         return g_refText.length;
+    // Clamped to the line's end, like `refOffset`.
+    size_t end = line < g_lineStart.length ? g_lineStart[line] - 1 : g_refText.length;
     size_t o = g_lineStart[line - 1] + (col - 1);
-    return o < g_refText.length ? o : g_refText.length;
+    return o < end ? o : end;
 }
 
 private void offsetLineColFast(size_t off, out uint line, out uint col)
@@ -919,6 +924,7 @@ private struct Hit
 
 private Hit[] g_hits; // collect mode (resolvedSymbolAt)
 private bool g_collect;
+private uint g_collectLine; // collect mode: the only line whose hits count
 private DeclKey g_key; // key mode (referencesForKey)
 private Identifier g_keyIdent; // interned target name (O(1) reject)
 private bool g_keyMode;
@@ -946,7 +952,10 @@ private bool useSpells(Loc loc, Identifier ident)
     ensureRefText();
     if (!g_refText.length)
         return true;
-    return textSpells(g_refText, loc.linnum(), loc.charnum(), ident.toString());
+    auto name = ident.toString();
+    if (loc.linnum() < 1 || loc.charnum() < 1 || !name.length)
+        return false;
+    return spellsAtFast(loc.linnum(), loc.charnum(), name);
 }
 
 private void emitAt(uint line, uint col, Dsymbol sym, Dsymbol target,
@@ -956,7 +965,8 @@ private void emitAt(uint line, uint col, Dsymbol sym, Dsymbol target,
         return;
     if (g_collect)
     {
-        g_hits ~= Hit(line, col, sym);
+        if (line == g_collectLine)
+            g_hits ~= Hit(line, col, sym);
         return;
     }
     if (!isTarget(sym, target))
@@ -994,7 +1004,8 @@ private void emitDecl(Loc loc, Dsymbol d, Dsymbol target, bool includeDecl,
     auto p = declPos(loc, d.ident);
     if (g_collect)
     {
-        g_hits ~= Hit(p.line, p.col, d);
+        if (p.line == g_collectLine)
+            g_hits ~= Hit(p.line, p.col, d);
         return;
     }
     if (!includeDecl || !isTarget(d, target))
@@ -1138,6 +1149,11 @@ extern (C++) final class RefWalker : SemanticTimeTransitiveVisitor
 
     override void visit(FuncDeclaration d)
     {
+        // Looking for what is on one line: a function that ends before it or
+        // starts after it has nothing there.
+        if (g_collect && d.endloc.linnum() && (g_collectLine < d.loc.linnum() ||
+                g_collectLine > d.endloc.linnum()))
+            return;
         decl(d);
         if (d.type)
             if (auto tf = d.type.isTypeFunction())

@@ -59,7 +59,7 @@ def sem_request():
           "params": {"textDocument": {"uri": URI}}})
     return sid[0]
 
-def get_tokens():
+def get_reply():
     my = sem_request()
     while True:
         m = read()
@@ -67,7 +67,10 @@ def get_tokens():
             send({"jsonrpc": "2.0", "id": m['id'], "result": None})
             continue
         if m.get('id') == my:
-            return m['result']['data']
+            return m
+
+def get_tokens():
+    return get_reply()['result']['data']
 
 def decode(data, text):
     lines = text.split('\n')
@@ -96,16 +99,19 @@ ab = bl[1].index('alpha')
 check('sem-alpha-present', (1, ab) in toks and toks[(1, ab)][1] == 'function',
       str(toks.get((1, ab))))
 
-# Edit: append a new function. Its name must not appear in the immediate
-# (stale) pull, because the analysis is still debounced.
+# Edit: append a new function. The analysis is still debounced, so the
+# immediate pull is answered ContentModified: the client (it takes refreshes)
+# keeps its own tokens, shifted by the edit, instead of getting the whole
+# stale set re-sent per keystroke.
 text2 = text + 'int gamma(int z) { return z; }\n'
 open(FILE, 'w').write(text2)
 send({"jsonrpc": "2.0", "method": "textDocument/didChange",
       "params": {"textDocument": {"uri": URI, "version": 2},
                  "contentChanges": [{"text": text2}]}})
-stale = decode(get_tokens(), text2)
+mid = get_reply()
+check('sem-mid-edit-content-modified',
+      'result' not in mid and mid.get('error', {}).get('code') == -32801, str(mid))
 g = text2.split('\n')[3].index('gamma')
-check('sem-stale-omits-new', (3, g) not in stale, str(stale.get((3, g))))
 
 # Wait past the debounce: the build lands, refresh fires, and a fresh pull
 # contains the new function.

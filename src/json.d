@@ -1695,6 +1695,14 @@ private void printEscaped(ref JsonPrinter p, const(char)* s)
     }
     for (const(char)* q = s; *q; q++)
     {
+        // Plain characters go in runs: one append per run, not per char.
+        const(char)* run = q;
+        while (*q && *q != '"' && *q != '\\' && cast(ubyte)*q >= 0x20)
+            q++;
+        if (q > run)
+            p.buf ~= run[0 .. q - run];
+        if (!*q)
+            break;
         char c = *q;
         switch (c)
         {

@@ -294,18 +294,16 @@ private bool classify(Dsymbol s, const(char)[] curFile, ref ubyte type,
     return false;
 }
 
-// True when the source at 1-based (line, col) spells `name`.
+// Line starts of the text `semanticTokens` is working on (see locIsName).
+private __gshared size_t[] g_lineStarts;
+
+// True when `text` at 1-based (line, col) spells `name`. O(1) to the line.
 private bool locIsName(const(char)[] text, uint line, uint col,
     const(char)[] name)
 {
-    size_t i = 0;
-    uint l = 1;
-    while (i < text.length && l < line)
-    {
-        if (text[i] == '\n')
-            l++;
-        i++;
-    }
+    if (line < 1 || line > g_lineStarts.length)
+        return false;
+    size_t i = g_lineStarts[line - 1];
     for (uint c = 1; c < col && i < text.length && text[i] != '\n'; c++)
         i++;
     if (i + name.length > text.length)
@@ -417,6 +415,12 @@ void semanticTokens(Module mod, const ref SynMod syn, const(char)[] text,
 {
     if (!mod || text.length == 0)
         return;
+    g_lineStarts = [size_t(0)];
+    foreach (i, c; text)
+        if (c == '\n')
+            g_lineStarts ~= i + 1;
+    scope (exit)
+        g_lineStarts = null;
     IdentHit[] ids;
     scanIdents(text, ids);
 

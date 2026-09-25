@@ -2266,6 +2266,11 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         // so read-only ops (completion, hover, references, ...) do not
         // accumulate their transient output across requests.
         s.scratch.reset();
+        import complete : flattenMemoBegin, flattenMemoEnd;
+
+        flattenMemoBegin();
+        scope (exit)
+            flattenMemoEnd();
         auto p = jparse(req);
         auto ops = p ? jstr(jget(p, "op")) : null;
         import timing : nowMs, traceMs;
@@ -2306,7 +2311,7 @@ private void serveRequest(ref ServerState s, const(char)[] req)
                     throw new Error("intentional crash test");
                 }
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto text = jstr(jget(p, "text"));
+            auto text = reqText(p, "text");
             if (text is null)
                 text = "";
             auto a = serverAnalyze(s, path, text);
@@ -2316,10 +2321,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "complete")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2342,10 +2347,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "signature")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2357,10 +2362,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "definition")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2373,10 +2378,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "implementStubs")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2388,10 +2393,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "inlayHint")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             auto a = cachedAnalysis(s, path);
@@ -2400,7 +2405,7 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         }
         if (ops == "foldingRange")
         {
-            auto text = jstr(jget(p, "text"));
+            auto text = reqText(p, "text");
             if (text is null)
                 text = "";
             sendFolds(foldingRanges(text));
@@ -2408,7 +2413,7 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         }
         if (ops == "documentLink")
         {
-            auto text = jstr(jget(p, "text"));
+            auto text = reqText(p, "text");
             if (text is null)
                 text = "";
             string[] dirs;
@@ -2426,10 +2431,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "documentHighlight")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2441,10 +2446,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "callHierarchy")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2457,10 +2462,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "typeHierarchy")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2473,10 +2478,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "implementation")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2488,10 +2493,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "references")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2512,10 +2517,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "prepareRename")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2532,10 +2537,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "rename")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2550,10 +2555,10 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "hover")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto atext = jstr(jget(p, "atext"));
+            auto atext = reqText(p, "atext");
             if (atext is null)
                 atext = "";
-            auto orig = jstr(jget(p, "origText"));
+            auto orig = reqText(p, "origText");
             if (orig is null)
                 orig = "";
             uint line = cast(uint)jint(jget(p, "line"));
@@ -2567,7 +2572,7 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "documentSymbol")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto text = jstr(jget(p, "text"));
+            auto text = reqText(p, "text");
             if (text is null)
                 text = "";
             auto a = cachedAnalysis(s, path);
@@ -2616,7 +2621,7 @@ private void serveRequest(ref ServerState s, const(char)[] req)
         if (ops == "semantic")
         {
             auto path = dupOrEmpty(jstr(jget(p, "path")));
-            auto text = jstr(jget(p, "text"));
+            auto text = reqText(p, "text");
             if (text is null)
                 text = "";
             // Tokens answer from the warm per-root cache too (see
@@ -2665,6 +2670,11 @@ private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
     import layers : levelRecoverable;
 
     auto savedArena = jcur;
+    scope (exit)
+    {
+        g_reqTexts[] = null;
+        g_reqTextCount = 0;
+    }
     if (!levelRecoverable(() { serveRequest(*w.s, req); }))
     {
         jcur = savedArena; // the op's scope guards did not run
@@ -2956,6 +2966,30 @@ private void parseAnalysis(JsonNode* root, ref WAnalysis out_)
     parseLint(jget(root, "lintParams"), out_.lintParams);
 }
 
+// Document texts ride beside a request instead of inside it: the request is
+// JSON (the ops layer was a child process once), and escaping a whole
+// document into it and parsing it back, several times per keystroke, was
+// most of the CPU an edit cost on a large file. The front and the ops share
+// the address space and the exchange is synchronous, so a slot index will do.
+private __gshared const(char)[][4] g_reqTexts;
+private __gshared size_t g_reqTextCount;
+
+private void addReqText(Json js, JsonNode* root, const(char)* key, const(char)[] text)
+{
+    assert(g_reqTextCount < g_reqTexts.length);
+    g_reqTexts[g_reqTextCount] = text is null ? "" : text;
+    js.add_number_to_object(root, key, g_reqTextCount++);
+}
+
+private const(char)[] reqText(JsonNode* p, const(char)* key)
+{
+    auto n = jget(p, key);
+    if (n is null)
+        return null;
+    auto i = cast(size_t) jint(n);
+    return i < g_reqTextCount ? g_reqTexts[i] : null;
+}
+
 ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] text,
     ref WAnalysis out_)
 {
@@ -2963,7 +2997,7 @@ ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] tex
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("analyze"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "text", zstr(text));
+    addReqText(js, root, "text", text);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -2981,8 +3015,8 @@ ExchangeResult workerComplete(ref Worker w, const(char)[] path, const(char)[] at
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("complete"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_string_to_object(root, "prefix", zstr(prefix));
@@ -3029,8 +3063,8 @@ ExchangeResult workerSignature(ref Worker w, const(char)[] path, const(char)[] a
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("signature"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;
@@ -3067,8 +3101,8 @@ ExchangeResult workerDefinition(ref Worker w, const(char)[] path, const(char)[] 
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("definition"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;
@@ -3095,8 +3129,8 @@ ExchangeResult workerTypeDefinition(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("definition"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_bool_to_object(root, "type", true);
@@ -3125,8 +3159,8 @@ ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("implementation"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;
@@ -3170,8 +3204,8 @@ ExchangeResult workerCallHierarchy(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("callHierarchy"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_string_to_object(root, "mode", zstr(mode));
@@ -3216,8 +3250,8 @@ ExchangeResult workerTypeHierarchy(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("typeHierarchy"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_string_to_object(root, "mode", zstr(mode));
@@ -3249,8 +3283,8 @@ ExchangeResult workerInlayHints(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("inlayHint"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -3277,7 +3311,7 @@ ExchangeResult workerFolding(ref Worker w, const(char)[] text, ref WFold[] out_)
     auto js = jmake();
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("foldingRange"));
-    js.add_string_to_object(root, "text", zstr(text));
+    addReqText(js, root, "text", text);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -3303,7 +3337,7 @@ ExchangeResult workerDocumentLinks(ref Worker w, const(char)[] text,
     auto js = jmake();
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("documentLink"));
-    js.add_string_to_object(root, "text", zstr(text));
+    addReqText(js, root, "text", text);
     auto da = js.create_array();
     foreach (d; dirs)
         js.add_item_to_array(da, js.create_string(zstr(d)));
@@ -3337,8 +3371,8 @@ ExchangeResult workerDocumentHighlight(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("documentHighlight"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;
@@ -3369,8 +3403,8 @@ ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("hover"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_bool_to_object(root, "fullDecl", fullDecl);
@@ -3396,7 +3430,7 @@ ExchangeResult workerSemantic(ref Worker w, const(char)[] path, const(char)[] te
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("semantic"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "text", zstr(text));
+    addReqText(js, root, "text", text);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -3428,7 +3462,7 @@ ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("documentSymbol"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "text", zstr(text));
+    addReqText(js, root, "text", text);
     char[] resp;
     if (!workerExchange(w, printJsonStr(root), resp))
         return ExchangeResult.failed;
@@ -3447,8 +3481,8 @@ ExchangeResult workerReferences(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("references"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_bool_to_object(root, "includeDeclaration", includeDecl);
@@ -3500,8 +3534,8 @@ ExchangeResult workerPrepareRename(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("prepareRename"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;
@@ -3528,8 +3562,8 @@ ExchangeResult workerRename(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("rename"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     js.add_string_to_object(root, "newName", zstr(newName));
@@ -3647,8 +3681,8 @@ ExchangeResult workerImplementStubs(ref Worker w, const(char)[] path,
     auto root = js.create_object();
     js.add_string_to_object(root, "op", zstr("implementStubs"));
     js.add_string_to_object(root, "path", zstr(path));
-    js.add_string_to_object(root, "atext", zstr(atext));
-    js.add_string_to_object(root, "origText", zstr(origText));
+    addReqText(js, root, "atext", atext);
+    addReqText(js, root, "origText", origText);
     js.add_number_to_object(root, "line", line);
     js.add_number_to_object(root, "col", col);
     char[] resp;

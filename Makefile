@@ -176,6 +176,7 @@ check: $(BIN) check-no-oop check-statics unittest
 	python3 tests/test_crash.py
 	python3 tests/test_crash.py segv
 	python3 tests/test_editor_session.py
+	python3 tests/test_editor_typing.py
 	python3 tests/test_spawn.py
 	python3 tests/test_index.py
 	python3 tests/test_mirror.py

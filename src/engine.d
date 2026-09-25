@@ -418,6 +418,20 @@ void ensureInit(ref Engine e)
     global.compileEnv.cCharLookupTable = IdentifierCharLookup.forTable(IdentifierTable.LR);
     foreach (p; e.cfg.importPaths)
         addImport(p);
+    // dmd looks for a module in the current directory after the import
+    // paths, and names what it finds there relative. Editors start the
+    // server in the workspace, so a project's own modules came in as
+    // `pkg/mod.d`, never matching the open documents' absolute paths: an
+    // edited document that the dependency level had loaded (any import cycle
+    // through it) went unnoticed, and it was analysed from the disk. The
+    // same directory as the last import path finds the same files, by
+    // absolute name.
+    {
+        import fsutil : currentDir;
+
+        if (auto cwd = currentDir())
+            addImport(cwd);
+    }
     foreach (p; e.cfg.stringPaths)
         addStringImport(p);
     applyDmdFlags(e.cfg.flags);

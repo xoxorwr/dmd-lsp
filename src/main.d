@@ -10,7 +10,7 @@ version (Windows)
 }
 
 import core.stdc.stdio : printf, fprintf, stderr;
-import core.stdc.stdlib : getenv;
+import core.stdc.stdlib : getenv, free;
 import core.stdc.signal : signal, SIG_IGN;
 version (Posix)
     import core.sys.posix.signal : SIGPIPE;
@@ -1851,21 +1851,12 @@ private string absolutePath(const(char)[] p)
     if (p.length >= 3 && p[1] == ':' && (p[2] == '/' || p[2] == '\\') &&
         ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')))
         return p.idup; // Windows drive-absolute
-    version (Posix)
-    {
-        import core.sys.posix.unistd : getcwd;
-        import core.stdc.string : strlen;
-        char[4096] buf;
-        if (getcwd(buf.ptr, buf.length) is null)
-            return p.idup;
-        auto cwd = buf[0 .. strlen(buf.ptr)];
-        return cast(string)((cwd ~ "/" ~ p).idup);
-    }
-    else
-    {
-        // No portable cwd without an OS call; dmd usually reports absolute.
+    import fsutil : currentDir;
+
+    auto cwd = currentDir();
+    if (cwd is null)
         return p.idup;
-    }
+    return (cwd ~ "/" ~ p).idup;
 }
 
 // file:// URI with minimal percent-encoding (round-trips with uriToPath).
@@ -1975,9 +1966,10 @@ private void handleMessage(App* app, ref RawMsg m)
                 // as the whole document replaces the buffer with a fragment
                 // (dmd then errors at the top of the "file", e.g. bogus
                 // "must start with BOM or ASCII character, not \xNN").
-                string base;
+                const(char)[] base;
                 if (auto d = sessionFind(app.session, path))
-                    base = d.text.idup;
+                    base = d.text;
+                char[] next; // malloc'd, adopted by the session below
                 for (auto c = changes.child; c; c = c.next)
                 {
                     auto tn = jget(c, "text");
@@ -1998,14 +1990,22 @@ private void handleMessage(App* app, ref RawMsg m)
                         el = cast(uint)jint(jget(en, "line"));
                         ec = cast(uint)jint(jget(en, "character"));
                     }
-                    base = applyChange(base, insert, hasRange, sl, sc, el, ec);
+                    auto t = applyChangeMalloc(base, insert, hasRange, sl, sc, el, ec);
+                    if (t is null)
+                        continue;
+                    if (next.ptr)
+                        free(next.ptr);
+                    next = t;
+                    base = t;
                 }
+                if (next.ptr is null)
+                    return;
                 // A keystroke is a delta patch to the in-memory buffer. The
                 // analysis runs after the debounce idle (cheap reuse when a
                 // completion already built the current buffer), so the doc is
                 // analyzed without saving, without a rebuild per key.
-                sessionUpdate(app.session, path, base);
-                pushDocToPool(app, path, base, true);
+                auto doc = sessionAdopt(app.session, path, next);
+                pushDocToPool(app, path, doc.text, true);
                 markPending(app, path);
                 // Restart the debounce clock only on an *edit*. Read-only
                 // requests (hover, completion, inlay hints, token pulls, ...)
@@ -2245,7 +2245,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             auto js = jmake();
@@ -2362,7 +2362,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2370,7 +2370,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, `{"signatures":[]}`);
                 return;
             }
-            string atext = analysisText(text, line, col);
+            // The op answers from the cached analysis: no placeholder text.
+            string atext = text;
             ops.WSig sig;
             auto js = jmake();
             if (workerSignatureRetry(app, path, atext, text, line, col, sig) && sig.found)
@@ -2411,7 +2412,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2484,7 +2485,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2571,7 +2572,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2607,7 +2608,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2646,7 +2647,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2701,7 +2702,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2709,7 +2710,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
                 return;
             }
-            string atext = analysisText(text, line, col);
+            // The op answers from the cached analysis: no placeholder text.
+            string atext = text;
             ops.WRef[] locs;
             if (workerDocumentHighlightRetry(app, path, atext, text, line, col, locs))
             {
@@ -2754,7 +2756,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2811,7 +2813,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2819,7 +2821,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
                 return;
             }
-            string atext = analysisText(text, line, col);
+            // The op answers from the cached analysis: no placeholder text.
+            string atext = text;
             ops.WDef def;
             bool ok = typeDef
                 ? workerTypeDefinitionRetry(app, path, atext, text, line, col, def)
@@ -2861,7 +2864,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2893,7 +2896,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2948,7 +2951,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -2956,7 +2959,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
                 return;
             }
-            string atext = analysisText(text, line, col);
+            // The op answers from the cached analysis: no placeholder text.
+            string atext = text;
             ops.WPrep prep;
             if (!workerPrepareRenameRetry(app, path, atext, text, line, col, prep)
                 || !prep.ok || !inProject(app, path))
@@ -2998,7 +3002,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -3127,7 +3131,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
             if (!text)
@@ -3172,7 +3176,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string text;
             auto d = sessionFind(app.session, path);
             if (d)
-                text = d.text.idup;
+                text = d.text;
             else
                 text = sessionReadDisk(path);
 
@@ -3189,6 +3193,15 @@ private void handleMessage(App* app, ref RawMsg m)
             // then refreshes them.
             if (hasPending(app, path) && app.debounceMs > 0)
             {
+                // A client that takes refreshes keeps its own tokens (shifted
+                // by the edit) on ContentModified and re-pulls when the build
+                // lands: cheaper than re-sending the whole stale set per key,
+                // and the stale set's positions are off after the edit.
+                if (app.semanticRefresh)
+                {
+                    lspRespondError(m.idJson, -32801, "content modified");
+                    return;
+                }
                 ops.WToken[] cached;
                 if (auto c = path.idup in app.tokCache)
                     cached = *c;
@@ -3216,6 +3229,18 @@ private void handleMessage(App* app, ref RawMsg m)
                     text = sessionReadDisk(path);
                 if (hasPending(app, path) && text)
                 {
+                    // Clients probe for actions on every cursor move
+                    // (triggerKind 2, the lightbulb), i.e. every keystroke:
+                    // mid-edit, answer none rather than analysing per key,
+                    // and let the debounced build's diagnostics bring them
+                    // (clients re-probe when those change). A user asking
+                    // (triggerKind 1) gets a fresh analysis.
+                    auto kind = jget(jget(p, "context"), "triggerKind");
+                    if (kind is null || jint(kind) != 1)
+                    {
+                        lspRespond(m.idJson, "[]");
+                        return;
+                    }
                     ops.WAnalysis a;
                     if (workerAnalyzeRetry(app, path, text, a))
                         app.cache[path.idup] = HitCache(a);
@@ -3346,7 +3371,8 @@ private void handleMessage(App* app, ref RawMsg m)
                         // method.
                         if (text)
                         {
-                            string atext = analysisText(text.idup, sl + 1, sc + 1);
+                            // The op answers from the cached analysis: no placeholder text.
+                            const(char)[] atext = text;
                             ops.WStub[] stubs;
                             if (workerImplementRetry(app, path, atext, text,
                                     sl + 1, sc + 1, stubs))
@@ -3960,7 +3986,9 @@ private int dmdLspMain(string[] args)
             handleMessage(&app, m);
             // The debounce clock is reset by `didChange` only (see there): a
             // read-only request must not postpone the pending analysis.
-            GC.collect();
+            // No collection per message: a level-0 collection scans every
+            // dmd heap for pointers back into it, and editors send several
+            // messages per keystroke. The GC collects when it needs to.
         }
     }
     else version (Windows)
@@ -4033,7 +4061,7 @@ private int dmdLspMain(string[] args)
                 break;
             handleMessage(&app, m);
             // The debounce clock is reset by `didChange` only (see there).
-            GC.collect();
+            // No collection per message (see the POSIX loop).
         }
     }
     else

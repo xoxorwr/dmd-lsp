@@ -617,10 +617,58 @@ private void flattenMembers(Dsymbols* mem, ref Dsymbol[] out_)
 {
     if (!mem)
         return;
-    Dsymbol[] direct;
-    foreach (i; 0 .. (*mem).length)
-        direct ~= (*mem)[i];
-    flattenArray(direct, out_);
+    if (g_flatMemoOn)
+    {
+        if (auto p = mem in g_flatMemo)
+            if (p.len == (*mem).length)
+            {
+                if (out_.length)
+                    out_ ~= p.flat;
+                else
+                    out_ = p.flat;
+                return;
+            }
+        Dsymbol[] flat;
+        flattenArray((*mem)[], flat);
+        // A sentinel past the end: the memo slice never ends at its block's
+        // used length, so a caller appending to what it got reallocates
+        // instead of writing into the shared list.
+        flat ~= null;
+        flat = flat[0 .. $ - 1];
+        g_flatMemo[mem] = FlatMemo((*mem).length, flat);
+        if (out_.length)
+            out_ ~= flat;
+        else
+            out_ = flat;
+        return;
+    }
+    flattenArray((*mem)[], out_);
+}
+
+// One op resolves thousands of names against the same few scopes (semantic
+// tokens, highlights, lint): flatten each member array once per op instead
+// of per lookup, which made those walks O(names x scope size) in time and
+// garbage. Keyed by the array and its length (lazy semantic appends
+// members). Only valid inside one op: a popped overlay frees the arrays.
+private struct FlatMemo
+{
+    size_t len;
+    Dsymbol[] flat;
+}
+
+private __gshared FlatMemo[Dsymbols*] g_flatMemo;
+private __gshared bool g_flatMemoOn;
+
+void flattenMemoBegin()
+{
+    g_flatMemo = null;
+    g_flatMemoOn = true;
+}
+
+void flattenMemoEnd()
+{
+    g_flatMemo = null;
+    g_flatMemoOn = false;
 }
 
 private void flattenArray(Dsymbol[] arr, ref Dsymbol[] out_)
@@ -2172,6 +2220,14 @@ private Dsymbol findImportMember(Module root, const(char)[] name)
 {
     if (!root || !root.members)
         return null;
+    // Inside a batch the same lookups repeat per token: answer from its
+    // index (built by the same walk, so the first match is the same).
+    if (g_batchImports !is null && g_batchRoot is root)
+    {
+        if (auto p = name in *g_batchImports)
+            return *p;
+        return null;
+    }
     Dsymbol[] flat;
     flattenMembers(root.members, flat);
     foreach (s; flat)
@@ -2212,6 +2268,10 @@ private Dsymbol findInModuleInterface(Module m, const(char)[] name, int depth)
     }
     return null;
 }
+
+// The import index of the running `resolveSymbolsBatch`, for its root.
+private __gshared Dsymbol[const(char)[]]* g_batchImports;
+private __gshared Module g_batchRoot;
 
 // Name -> symbol reachable through direct imports and their public
 // re-exports. Built once so per-token lookups don't re-flatten the module.
@@ -2949,9 +3009,20 @@ private Token[] lexLineTokens(const(char)[] lt)
         lex.scan(&t);
         if (t.value == TOK.endOfFile)
             break;
+        // Point into `lt` itself, so a token's column is `ptr - lt.ptr`.
+        // Its `loc` would do too, but every line lexed adds an entry to
+        // dmd's file table, whose lookups then scan linearly (semantic
+        // tokens lex every line of the document).
+        t.ptr = lt.ptr + (t.ptr - buf.ptr);
         toks ~= t;
     }
     return toks;
+}
+
+// 0-based column in `lt` of a token from `lexLineTokens(lt)`.
+private uint tokCol(const(char)[] lt, const ref Token t)
+{
+    return cast(uint)(t.ptr - lt.ptr);
 }
 
 // The dotted chain (as spelled in `lt`) ending at the identifier under `col`
@@ -2971,7 +3042,7 @@ private const(char)[] chainFromTokens(const(char)[] lt, const(Token)[] toks,
         // Token charnum is 1-based; compare in 0-based. The inclusive end also
         // accepts the 1-based columns the batch resolver passes (charnum) and
         // an end-of-word cursor (completion).
-        uint start0 = cast(uint) t.loc.charnum() - 1;
+        uint start0 = tokCol(lt, t);
         uint len = cast(uint) t.ident.toString().length;
         if (col >= start0 && col <= start0 + len)
         {
@@ -3014,8 +3085,8 @@ private const(char)[] chainFromTokens(const(char)[] lt, const(Token)[] toks,
         startIdx = cast(size_t) j;
     }
 
-    uint c0 = cast(uint) toks[startIdx].loc.charnum();
-    uint c1 = cast(uint) toks[idx].loc.charnum() +
+    uint c0 = tokCol(lt, toks[startIdx]) + 1;
+    uint c1 = tokCol(lt, toks[idx]) + 1 +
         cast(uint) toks[idx].ident.toString().length;
     if (c0 < 1 || c0 > c1 || c1 > lt.length + 1)
         return null;
@@ -3300,6 +3371,13 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
     indexMembers(rootMembers, rootByName);
     Dsymbol[const(char)[]] importByName;
     indexImportInterfaces(mod, importByName);
+    g_batchImports = &importByName;
+    g_batchRoot = mod;
+    scope (exit)
+    {
+        g_batchImports = null;
+        g_batchRoot = null;
+    }
     // Line-start offsets so each position maps to its line in O(1) instead
     // of rescanning the document from the top (O(tokens * size)).
     size_t[] lineStart = [size_t(0)];
@@ -3993,7 +4071,7 @@ private bool atStatementBoundary(const(char)[] text, uint line, uint col)
     while (n > 0 && trivia(toks[n - 1].value))
         n--;
     if (n > 0 && toks[n - 1].value == TOK.identifier &&
-        cast(size_t) (toks[n - 1].loc.charnum() - 1) +
+        tokCol(prefix, toks[n - 1]) +
             toks[n - 1].ident.toString().length == prefix.length)
         n--;
     while (n > 0 && trivia(toks[n - 1].value))

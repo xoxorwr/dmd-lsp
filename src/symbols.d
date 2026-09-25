@@ -409,6 +409,12 @@ DocSymbol[] documentSymbols(Module mod, const(char)[] text)
 {
     if (!mod || !mod.members)
         return null;
+    g_lineStarts = [size_t(0)];
+    foreach (i, c; text)
+        if (c == '\n')
+            g_lineStarts ~= i + 1;
+    scope (exit)
+        g_lineStarts = null;
     scope DocWalker w = new DocWalker();
     w.text = text;
     w.inAggregate = false;
@@ -416,6 +422,10 @@ DocSymbol[] documentSymbols(Module mod, const(char)[] text)
         (*mod.members)[i].accept(w);
     return w.out_;
 }
+
+// Line starts of the text `documentSymbols` is outlining, so each symbol's
+// line is found in O(1) rather than by a scan from the top.
+private __gshared size_t[] g_lineStarts;
 
 // Emits an outline node for each declaration. Aggregate/template/enum members
 // are visited with a fresh child walker; function bodies are not descended
@@ -526,14 +536,7 @@ private uint identCol(const(char)[] text, uint line0, uint col0,
 {
     if (!name.length)
         return col0;
-    size_t i = 0;
-    uint l = 0;
-    while (i < text.length && l < line0)
-    {
-        if (text[i] == '\n')
-            l++;
-        i++;
-    }
+    size_t i = line0 < g_lineStarts.length ? g_lineStarts[line0] : text.length;
     size_t ls = i;
     while (i < text.length && text[i] != '\n')
         i++;

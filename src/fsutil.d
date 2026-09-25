@@ -182,3 +182,27 @@ ulong fileStamp(const(char)[] path) nothrow
         return (t ^ (n << 1)) | 1;
     }
 }
+
+// The process's current directory, absolute (null if unavailable).
+string currentDir()
+{
+    import core.stdc.string : strlen;
+
+    char[4096] buf;
+    version (Posix)
+    {
+        import core.sys.posix.unistd : getcwd;
+
+        if (getcwd(buf.ptr, buf.length) is null)
+            return null;
+    }
+    else version (Windows)
+    {
+        import core.sys.windows.winbase : GetCurrentDirectoryA;
+
+        auto n = GetCurrentDirectoryA(cast(uint) buf.length, buf.ptr);
+        if (n == 0 || n >= buf.length)
+            return null;
+    }
+    return buf[0 .. strlen(buf.ptr)].idup;
+}

@@ -71,6 +71,10 @@ void layersSelect() nothrow @nogc
     import core.gc.config : config;
 
     config.gc = "layers";
+    // Mark on the collecting thread only. With druntime's mark threads, a
+    // collection took the same wall time and twice the CPU: they contend on
+    // the shared scan stack more than they share the work.
+    config.parallel = 0;
 }
 
 // Number of dmd levels (0 = only the runtime heap exists).
@@ -337,7 +341,43 @@ final class LayeredGC : GC
     this()
     {
         levels[0].gc = newConservative();
+        // Level 0 collects on its own schedule (see collectLevel0IfDue).
+        levels[0].gc.disable();
         gSaved.initialize();
+        level0Budget();
+    }
+
+    // A collection of level 0 scans every dmd heap: they are its roots, and
+    // hundreds of MB against the few MB level 0 holds. druntime's own trigger
+    // (the heap doubled since the last collection) fired every few hundred KB
+    // of server garbage, i.e. every keystroke or two in a large document, at
+    // tens of ms each. Collect it instead once it has allocated an eighth of
+    // what a collection scans: the scan stays at 8 bytes per byte allocated,
+    // and little garbage builds up.
+    size_t level0Next; // level-0 pages in use that trigger its next collection
+
+    static size_t pagesInUse(ConservativeGC g) nothrow @nogc
+    {
+        return g.gcx.usedSmallPages + g.gcx.usedLargePages;
+    }
+
+    void level0Budget() nothrow @nogc
+    {
+        size_t used = pagesInUse(levels[0].gc);
+        size_t scanned = used;
+        foreach (i; 1 .. depth + 1)
+            scanned += levels[i].gc.gcx.mappedPages;
+        enum minPages = 8 * 1024 * 1024 / PAGE;
+        level0Next = used + (scanned / 8 > minPages ? scanned / 8 : minPages);
+    }
+
+    void collectLevel0IfDue() nothrow
+    {
+        if (cur() !is levels[0].gc || pagesInUse(levels[0].gc) < level0Next)
+            return;
+        flushRoots();
+        levels[0].gc.collect();
+        level0Budget();
     }
 
     // -- level bookkeeping --
@@ -574,6 +614,7 @@ final class LayeredGC : GC
     {
         flushRoots();
         levels[0].gc.collect();
+        level0Budget();
         if (depth > 0)
             levels[depth].gc.collect();
         flushRoots();
@@ -610,6 +651,7 @@ final class LayeredGC : GC
 
     void* malloc(size_t size, uint bits, const TypeInfo ti) nothrow
     {
+        collectLevel0IfDue();
         flushRoots();
         auto r = cur().malloc(size, bits, ti);
         return r;
@@ -617,18 +659,21 @@ final class LayeredGC : GC
 
     BlkInfo qalloc(size_t size, uint bits, const scope TypeInfo ti) nothrow
     {
+        collectLevel0IfDue();
         flushRoots();
         return cur().qalloc(size, bits, ti);
     }
 
     void* calloc(size_t size, uint bits, const TypeInfo ti) nothrow
     {
+        collectLevel0IfDue();
         flushRoots();
         return cur().calloc(size, bits, ti);
     }
 
     void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
     {
+        collectLevel0IfDue();
         flushRoots();
         if (p is null)
             return cur().malloc(size, bits, ti);
@@ -791,8 +836,10 @@ final class LayeredGC : GC
 
     bool expandArrayUsed(void[] slice, size_t newUsed, bool atomic = false) nothrow @safe
     {
+        // No flushRoots: growing a block in place never adds a pool or
+        // collects, and this runs per array append (a root sync walks every
+        // level's pool table).
         return (() @trusted {
-            flushRoots();
             bool w;
             auto g = ownerGC(slice.ptr, w);
             return w && g is cur() ? g.expandArrayUsed(slice, newUsed, atomic) : false;
@@ -802,8 +849,7 @@ final class LayeredGC : GC
     size_t reserveArrayCapacity(void[] slice, size_t request, bool atomic = false) nothrow @safe
     {
         return (() @trusted {
-            flushRoots();
-            bool w;
+            bool w; // no flushRoots: see expandArrayUsed
             auto g = ownerGC(slice.ptr, w);
             return w && g is cur() ? g.reserveArrayCapacity(slice, request, atomic) : 0;
         })();

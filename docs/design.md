@@ -49,7 +49,12 @@ The mechanism:
   Allocation goes to the top level while dmd code runs (`levelEnter`), to
   level 0 otherwise. A level collects its own garbage normally (no region
   blow-up), and popping it unmaps all of its pools at once, whatever still
-  points into them (no conservative retention).
+  points into them (no conservative retention). Level 0 is the exception to
+  druntime's schedule: the dmd heaps are its roots, so a collection of its few
+  MB scans hundreds, and druntime's trigger (the heap doubled) fired every
+  keystroke or two in a large file. It collects once it has allocated an
+  eighth of what it scans. Marking is single-threaded: druntime's mark
+  threads took the same wall time and twice the CPU (scan-stack contention).
 - **Lower levels are write-protected.** While level k is on top, the pools of
   levels 1..k-1 are read-only. The first write to one of their pages faults;
   the handler (SIGSEGV / vectored exception handler) saves a copy of the page,
@@ -149,8 +154,12 @@ function that throws an `Error`, which unwinds into the op's `catch`.
   function-pointer/delegate variable renders `function`/`method` where it is
   called (`state.fn_on_tick()`) and `property`/`variable` where it is only
   read. On real Phobos this lifts identifier coverage from ~45% to ~55-78%.
-  A pull that arrives while an edit is still debounced is answered from the
-  cached token set (keyed on the buffer hash) instead of forcing a build.
+  A pull that arrives while an edit is still debounced never forces a build:
+  a client that takes `workspace/semanticTokens/refresh` gets ContentModified
+  (it keeps its own tokens, shifted by the edit, and re-pulls on the refresh),
+  any other gets the cached set (keyed on the buffer hash). Re-sending the
+  whole stale set per keystroke cost more than the rest of a keystroke, and
+  its positions are off after the edit.
   The idle flush computes and caches the token set for the fresh buffer
   *before* it sends `workspace/semanticTokens/refresh`, so the client's
   re-pull is a pure cache hit — the editor never waits on a scan/resolve.
@@ -252,13 +261,55 @@ it immediately (timeout 0). stdin runs unbuffered so kernel pipe state (what
 strands messages in the userspace buffer. On POSIX the loop waits in `poll`;
 on Windows a pipe handle is not a reliable `WaitForSingleObject` target, so it
 polls `PeekNamedPipe` (falling back to the wait when the handle isn't
-peekable). Semantic pulls during an edit are served from the token cache; the
-debounced build precomputes the new set before its
-`workspace/semanticTokens/refresh`.
+peekable). Semantic pulls during an edit are answered without a build (see
+the token notes above); the debounced build precomputes the new set before
+its `workspace/semanticTokens/refresh`.
+
+### What a keystroke costs
+
+Editors send a burst of requests per keystroke on their own: VS Code follows
+each `didChange` with document highlights, a code-action probe for the
+lightbulb, a semantic-token pull, inlay hints and the outline, plus completion
+on word starts. `tests/test_editor_typing.py` replays that on dmd's
+`expressionsem.d` (17k lines) and pins it: no analysis while typing, exactly
+one on the idle, every per-keystroke op far below the debounce (they take a
+few ms; ~10 ms of CPU per keystroke in all). What keeps it there:
+
+- The automatic code-action probe (`triggerKind` 2) answers none while an edit
+  is pending; asking explicitly (Ctrl+.) still analyses. It used to analyse,
+  i.e. once per keystroke.
+- No collection per message (the loop used to `GC.collect()` after each).
+- Document texts pass to the ops layer beside the request, not escaped into
+  its JSON; an edit builds the new buffer once, in malloc memory.
+- Cursor lookups (`occurrenceAt`) look at the cursor line only; walks that map
+  (line, col) to offsets use line-start tables (several were quadratic:
+  seconds per request on this file); member lists are flattened once per op.
+- An op that has no use for a placeholder variant is not sent one.
+
+Per build (the idle), the analysis and the token set are what remain (~180 ms
+and ~170 ms on `expressionsem.d` outside an import cycle).
+
+### Files in import cycles
+
+dmd resolves a module it finds through no import path relative to the current
+directory, and editors start the server in the workspace. A project's own
+modules then loaded as `pkg/mod.d` and never matched the documents' absolute
+paths: an edited document the dependency level had loaded through an import
+cycle was not recognised, and it was analysed from the disk. The engine adds
+the current directory as the last import path (same files, absolute names).
+
+Every module that imports an edited document, directly or through a cycle,
+must be analysed above it, so a document in a large cycle costs more per
+build: `expressionsem.d`, in cycles with most of dmd, ~380 ms after two
+one-time rebuilds of the dependency level (the first edit drops what reached
+the document; the next build learns back what did not). Projects that use
+string imports need their `-J` paths configured (`stringImportPaths`): a
+failed `import("...")` inside a cycle cascades into unrelated errors (dmd's own
+`alias visit = …` overloads report conflicts).
 
 ## Status
 
-Verified by `make check` (413 assertions across the LSP, semantic-token,
+Verified by `make check` (438 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, cache,
 debounce, config, memory and crash-recovery suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):
