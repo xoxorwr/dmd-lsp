@@ -99,9 +99,10 @@ jobs:
       - name: Build (ldmd2)
         shell: pwsh
         run: |
-          $src = @('src/main.d','src/arena.d','src/lsp.d','src/session.d','src/dmdwrap.d',
-                   'src/lexutil.d','src/lint.d','src/complete.d','src/server.d','src/semantic.d',
-                   'src/worker.d','src/json.d')
+          # `-i` compiles every module main.d imports (ours and the vendored
+          # frontend, incl. Windows-only root/strtold.d): no source list to
+          # keep in sync with the Makefile.
+          $src = @('src/main.d')
           $flags = @('-I','src','-i','-version=MARS','-version=NoMain','-version=GC',
                      '-version=NoBackend','-version=CallbackAPI','-version=DMDLIB',
                      '-preview=dip1000','-O','-Jsrc/dmd/res','-Jsrc/dmd','-Jstringimp')
@@ -110,7 +111,14 @@ jobs:
 
       - name: Smoke test
         shell: pwsh
-        run: .\dmd-lsp.exe --version
+        run: |
+          .\dmd-lsp.exe --version
+          # A batch analysis builds and pops memory levels (page protection
+          # through the vectored exception handler). Findings are fine (exit
+          # 1); a crash is not.
+          .\dmd-lsp.exe --check tests/ok.d tests/err.d
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
+          exit 0
 
       - name: Package
         shell: pwsh
