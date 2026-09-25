@@ -128,8 +128,13 @@ struct Engine
     bool recordFolds;
     string[] isolated;
 
-    // Body patches of the overlay's root (see "body patches" below).
-    PatchBase patch;
+    // Body patches of the overlay (see "body patches" below).
+    PatchState patch;
+    // The text each open document was registered with dmd on the warm and
+    // on the overlay level (level 0): what a module loaded there was read from.
+    string[string] warmTexts;
+    string[string] overlayTexts;
+    uint warmDepth, overlayDepth;
 
     // L4
     bool overlay;
@@ -153,18 +158,28 @@ struct BodySpan
 // The overlay root's analysis that edits inside function bodies are patched
 // onto: its text, its bodies, and, for each body that may be re-analysed in
 // place, the function's bytes from before its body was analysed.
-struct PatchBase
+// An open document the overlay's universe loaded (on the warm or overlay
+// level), as edits inside its function bodies are patched onto it.
+struct DocBase
 {
-    bool valid;
-    bool patched;              // a patch level is on top of the overlay
-    bool othersChanged;        // another document changed since the base
     string path;
-    string text;
-    BodySpan[] spans;
-    void[][] pristine;         // per span, null when not swappable
-    Analysis base;             // the root's analysis at `text`
-    string[] loadedFiles;      // files the base loaded on the overlay, and
-    ulong[] loadedStamps;      // their fileStamp: a patch keeps them
+    string text;               // the text dmd loaded it from
+    BodySpan[] spans;          // its bodies (the loaded module's functions)
+    void[][] pristine;         // per span: bytes from before semantic 3 (roots)
+    bool root;                 // analysed as a root on the overlay
+    Analysis base;             // its analysis at `text` (roots)
+}
+
+// Body patches of the overlay (see "body patches" below).
+struct PatchState
+{
+    bool patched;              // a patch level is on top of the overlay
+    bool diskChanged;          // a file changed on disk since the overlay
+    size_t sinkMark;           // e.sink length when the patch level was pushed
+    DocBase[] docs;
+    DocPlan[] plans;           // the patch level's (valid while it is on top)
+    string[] loadedFiles;      // files loaded on the overlay, and their
+    ulong[] loadedStamps;      // fileStamp: patches keep them
 }
 
 // A module dmd loaded: its file and the modules it imports.
@@ -234,8 +249,6 @@ void engineDocChanged(ref Engine e, const(char)[] path, bool edited)
             return;
     }
     e.generation++;
-    if (path != e.patch.path)
-        e.patch.othersChanged = true;
     // An edited document is served from its buffer: the dependency levels
     // drop it, and what reaches it, when the next analysis plans them.
     if (edited && !contains(e.edited, path))
@@ -251,7 +264,7 @@ void engineDiskChanged(ref Engine e, const(char)[] path)
     scope (exit)
         levelResume(t);
     e.generation++;
-    e.patch.othersChanged = true;
+    e.patch.diskChanged = true;
     if (path !is null)
         e.docHash.remove(cast(string) path); // remove only hashes the key
     if (path is null || contains(e.warmFiles, path))
@@ -334,7 +347,10 @@ void engineScratch(ref Engine e, scope void delegate() fn)
 void engineHardReset(ref Engine e)
 {
     levelAbandonAll();
-    e.patch = PatchBase.init;
+    e.patch = PatchState.init;
+    g_ctfeCount = 0;
+    e.warmTexts = null;
+    e.overlayTexts = null;
     gSink = null;
     e.initialized = false;
     e.overlay = false;
@@ -423,7 +439,9 @@ void popOverlay(ref Engine e)
         traceMs("overlay.pop", nowMs() - t0);
     if (e.patch.patched)
         levelPop();
-    e.patch = PatchBase.init;
+    e.patch = PatchState.init;
+    e.overlayTexts = null;
+    g_ctfeCount = 0; // the functions it names are gone with the overlay
     levelPop();
     engineCheckIdentifiers("after overlay pop");
     e.overlay = false;
@@ -445,6 +463,7 @@ void popWarm(ref Engine e)
     e.warmPaths = null;
     e.warmFiles = null;
     e.warmDiags = null;
+    e.warmTexts = null;
 }
 
 void popDeps(ref Engine e)
@@ -563,16 +582,16 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
     foreach (ref r; e.roots)
         if (why == "new-root" && r.path == path)
             why = "text-changed";
-    // An edit inside function bodies of the overlay's root: re-analyse only
-    // those bodies.
+    // What changed since the overlay was built, when it is only edits inside
+    // function bodies (and new roots): patch them onto it, no rebuild.
     if (!variant)
     {
         Analysis pa;
-        if (tryPatch(e, path, text, h, pa))
+        if (tryIncremental(e, path, text, h, pa))
             return pa;
     }
-    // Anything changed since the overlay was built, or a variant on either
-    // side: start a fresh overlay.
+    // Anything else changed since the overlay was built, or a variant on
+    // either side: start a fresh overlay.
     if (e.overlay && (variant || e.overlayVariant || e.overlayGeneration != e.generation))
         popOverlay(e);
     // An overlay holding an older text of this root cannot take the new one
@@ -584,16 +603,25 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
                 popOverlay(e);
                 break;
             }
+    if (e.overlay && e.patch.patched)
+        popOverlay(e); // a new root cannot go under a patch
     if (!e.overlay)
         ensureDeps(e, path, text);
     if (!e.overlay)
         ensureWarm(e, path, text);
     if (!e.overlay)
         pushOverlay(e, variant);
+    return analyzeRoot(e, path, text, h, variant, why);
+}
 
+// Analyse `path` as a root on the overlay (the top level): parse it from
+// `text`, or finish the bodies of the module an import already loaded from
+// that text. Not a variant: record it as a patch base.
+Analysis analyzeRoot(ref Engine e, const(char)[] path, const(char)[] text, ulong h,
+    bool variant, string why)
+{
     auto t0 = nowMs();
     Analysis a;
-    bool fresh;
     BodySpan[] spans;
     void[][] pristine;
     levelEnter();
@@ -607,9 +635,9 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         lspConstFolded = e.recordFolds ? &noteFold : null;
         scope (exit)
             lspConstFolded = null;
+        immutable patchable = !variant && !e.recordFolds;
         immutable loadedBefore = Module.amodules.length;
         auto m = findLoaded(path);
-        fresh = m is null;
         if (m is null)
         {
             immutable errorsBefore = global.errors;
@@ -620,21 +648,24 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
                 a.syn = snapshotModule(m, text);
                 // The base for body patches: what the parse laid out (before
                 // semantic can add or rewrite members).
-                if (!variant && !e.recordFolds && !a.syntaxErrors)
+                if (patchable && !a.syntaxErrors)
                     spans = bodySpans(m, text);
                 semanticRoot(m, spans, pristine);
             }
         }
         else
         {
-            // Loaded already, as an import of another root, or on L2/L3 (an
-            // unedited file whose disk text is `text`, or an edited one loaded
-            // from this same buffer): finish its bodies. Its declaration-level
-            // errors were reported when it was loaded, into that level's sink.
+            // Loaded already, as an import of another root, or on a lower
+            // level (an unedited file whose disk text is `text`, or an edited
+            // one loaded from this same buffer): finish its bodies. Its
+            // declaration-level errors were reported when it was loaded, into
+            // that level's sink.
             a.syn = snapshotModule(m, text);
             logDebug("analyse module bodies: '%.*s' (loaded on a lower level)",
                 cast(int) path.length, path.ptr);
-            finishImported(m);
+            if (patchable)
+                spans = bodySpans(m, text);
+            finishBodies(m, spans, pristine);
         }
         logLoaded(loadedBefore, variant ? "overlay, variant" : "overlay", null);
         a.module_ = cast(void*) m;
@@ -660,34 +691,34 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         }
     a.errors = errs;
     if (a.ok)
-    {
-        auto m = cast(Module) a.module_;
-        lintUnusedImports(&e.lintArena, m, path, text, errs != 0, a.lintImports);
-        lintUnusedParams(&e.lintArena, m, path, text, errs != 0, a.lintParams);
-        // The hits slice `path`/`text` and dmd's identifiers; the arena is C
-        // memory the GC does not scan, so give them copies that live as long
-        // as the arena (this overlay).
-        ownLintStrings(e.lintArena, a.lintImports);
-        ownLintStrings(e.lintArena, a.lintParams);
-    }
+        lint(e, a, path, text);
     recordGraph(e);
     noteOverlayLoads(e);
     levelLeave();
     traceMs(variant ? "analyze.variant" : "analyze", nowMs() - t0, why ~ " " ~ path);
     engineCheckIdentifiers("after analyze");
-    e.roots ~= Root(path.idup, h, a);
-    if (fresh && spans.length)
+    replaceRoot(e, path, h, a);
+    if (!variant)
     {
-        e.patch = PatchBase.init;
-        e.patch.valid = true;
-        e.patch.path = path.idup;
-        e.patch.text = text.idup;
-        e.patch.spans = spans;
-        e.patch.pristine = pristine;
-        e.patch.base = a;
+        if (spans.length)
+            setDocBase(e, DocBase(path.idup, text.idup, spans, pristine, true, a));
+        dropCtfed(e, 0);
+        noteDocs(e);
         overlayFiles(e, e.patch.loadedFiles, e.patch.loadedStamps);
     }
     return a;
+}
+
+// Unused imports and parameters of a root's analysis. The hits slice
+// `path`/`text` and dmd's identifiers; the arena is C memory the GC does not
+// scan, so give them copies that live as long as the arena (this overlay).
+void lint(ref Engine e, ref Analysis a, const(char)[] path, const(char)[] text)
+{
+    auto m = cast(Module) a.module_;
+    lintUnusedImports(&e.lintArena, m, path, text, a.errors != 0, a.lintImports);
+    lintUnusedParams(&e.lintArena, m, path, text, a.errors != 0, a.lintParams);
+    ownLintStrings(e.lintArena, a.lintImports);
+    ownLintStrings(e.lintArena, a.lintParams);
 }
 
 void pushOverlay(ref Engine e, bool variant)
@@ -699,30 +730,47 @@ void pushOverlay(ref Engine e, bool variant)
     e.overlay = true;
     e.overlayVariant = variant;
     e.overlayGeneration = e.generation;
+    e.overlayDepth = levelDepth();
     e.sink.reset();
     gSink = &e.sink;
-    addOpenDocuments(e);
+    addOpenDocuments(e, e.overlayTexts);
 }
 
-// Serve open documents from their buffers on the level just pushed. L2 never
-// loaded an edited one, so these are the copies dmd will find.
-void addOpenDocuments(ref Engine e)
+// Serve open documents from their buffers on the top level: what dmd loads
+// from here on reads them. The dependency levels never loaded an edited one.
+// `texts` records what each was registered with (level 0).
+void addOpenDocuments(ref Engine e, ref string[string] texts)
 {
-    import dmd.root.filename : FileName;
-
     if (e.docs.openPaths is null)
         return;
-    levelEnter();
-    scope (exit)
-        levelLeave();
     foreach (p; e.docs.openPaths())
     {
         auto t = e.docs.open(p);
         if (t is null)
             continue;
-        auto buf = cast(ubyte[]) (t ~ '\0');
-        global.fileManager.add(FileName(p.idup), buf[0 .. $ - 1]);
+        registerBuffer(p, t);
+        auto s = levelSuspend();
+        texts[p.idup] = t.idup;
+        levelResume(s);
     }
+}
+
+// Make dmd read `path` from `text`. A registration made earlier (a lower
+// level, or before an edit) is replaced: the file table keeps the first
+// entry for a name, and a stale one would be read by the next load.
+void registerBuffer(const(char)[] path, const(char)[] text)
+{
+    import dmd.root.filename : FileName;
+
+    levelEnter();
+    scope (exit)
+        levelLeave();
+    auto buf = cast(ubyte[]) (text ~ '\0');
+    auto files = &__traits(getMember, global.fileManager, "files");
+    if (auto v = files.lookup(path))
+        v.value = buf[0 .. $ - 1];
+    else
+        global.fileManager.add(FileName(path.idup), buf[0 .. $ - 1]);
 }
 
 // ---- L3 -------------------------------------------------------------------------
@@ -749,12 +797,13 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
         levelPush(dmdGlobalRanges());
         e.warmBuilt = true;
         e.warmStale = false;
+        e.warmDepth = levelDepth();
     }
     // The buffers as they are now, before each copy: a copy may load an open
     // document (an import of its root) that was opened or edited since the
     // level was pushed. What it loads is tracked in `warmFiles`, so a later
     // edit of that document invalidates the level.
-    addOpenDocuments(e);
+    addOpenDocuments(e, e.warmTexts);
     DiagSink sink; // level 0 (see onDiag)
     gSink = &sink;
     const(char)[][] loaded;
@@ -1286,6 +1335,17 @@ void noteCtfe(FuncDeclaration fd) nothrow
     g_ctfeFns[g_ctfeCount++] = cast(void*) fd;
 }
 
+// Functions CTFE ran since record `from` are no longer swappable, whichever
+// document they are in: their bodies are part of what the caller saw.
+void dropCtfed(ref Engine e, size_t from)
+{
+    foreach (k; from .. g_ctfeCount)
+        foreach (ref d; e.patch.docs)
+            foreach (i, ref sp; d.spans)
+                if (sp.fd is g_ctfeFns[k] && i < d.pristine.length)
+                    d.pristine[i] = null;
+}
+
 bool ctfeCalled(void* fd) nothrow @nogc
 {
     foreach (i; 0 .. g_ctfeCount)
@@ -1382,56 +1442,406 @@ void[] snapshotFunction(FuncDeclaration fd)
     return (cast(void*) copy.ptr)[0 .. size];
 }
 
-// Re-analyse the edited bodies of the overlay's root in place, when that is
-// all that changed. False: analyse it in full.
-bool tryPatch(ref Engine e, const(char)[] path, const(char)[] text, ulong h, ref Analysis out_)
+// Patch what changed since the overlay was built onto it, and answer `path`
+// from it: pop the previous patch (back to the base), make `path` a root of
+// the overlay if it is not one (its bodies finished, or parsed and analysed),
+// then, on a patch level, swap in the edited bodies of every document that
+// changed. False when something changed that patches cannot take: rebuild.
+bool tryIncremental(ref Engine e, const(char)[] path, const(char)[] text, ulong h,
+    ref Analysis out_)
 {
-    auto pb = &e.patch;
-    if (!pb.valid || pb.othersChanged || pb.path != path || !e.overlay ||
-        e.overlayVariant || e.recordFolds || e.isolated.length)
+    if (!e.overlay || e.overlayVariant || e.recordFolds || e.isolated.length ||
+        e.patch.diskChanged)
         return false;
-    // A patch keeps every level and what the base loaded: none of it may have
-    // changed on disk (a change without a notification; see ensureDeps).
+    // Patches keep every level and what the overlay loaded: none of it may
+    // have changed on disk (a change without a notification; see ensureDeps).
     if (changedOnDisk(e))
         return false;
-    auto t0 = nowMs();
-    // Back to the base (the previous patch's writes are undone).
-    if (pb.patched)
+    // Nothing changed since the patch: a root it patched is answered from it
+    // (its analysis is built when first asked for).
+    if (e.patch.patched && e.overlayGeneration == e.generation)
+        foreach (ref pl; e.patch.plans)
+            if (e.patch.docs[pl.doc].path == path && e.patch.docs[pl.doc].root)
+            {
+                auto a = patchedAnalysis(e, e.patch.docs[pl.doc], pl);
+                replaceRoot(e, path, fnv1a64(cast(const(ubyte)[]) pl.text), a);
+                out_ = a;
+                return true;
+            }
+    unpatch(e);
+
+    // `path` as a root of the overlay, at the text dmd loaded it from.
+    auto d = findDoc(e, path);
+    if (d is null || !d.root)
     {
-        levelPop();
-        pb.patched = false;
-        replaceRoot(e, path, fnv1a64(cast(const(ubyte)[]) pb.text), pb.base);
+        auto m = findLoaded(path);
+        string baseText;
+        if (m is null)
+            baseText = text.idup; // new: parsed from the buffer
+        else if (d !is null)
+            baseText = d.text; // an open document another root imported
+        else
+        {
+            // Loaded from disk on a dependency level: fine while unedited.
+            import session : sessionReadDisk;
+
+            baseText = sessionReadDisk(path);
+            if (baseText is null || (text != baseText && contains(e.edited, path)))
+                return false;
+        }
+        analyzeRoot(e, path, baseText, fnv1a64(cast(const(ubyte)[]) baseText), false,
+            m is null ? "new-root" : "finish-bodies");
+        d = findDoc(e, path);
+        if (d is null || !d.root)
+        {
+            // Not patchable (e.g. it does not parse): answer from the root's
+            // analysis only if that is the current text.
+            if (baseText != text)
+                return false;
+            out_ = rootAnalysis(e, path);
+            e.overlayGeneration = e.generation;
+            return true;
+        }
     }
-    if (text == pb.text)
+
+    // What changed since the overlay loaded it.
+    auto t0 = nowMs();
+    DocPlan[] plans;
+    foreach (i, ref doc; e.patch.docs)
     {
+        auto cur = doc.path == path ? text : currentText(e, doc.path);
+        if (cur !is null && cur != doc.text)
+            plans ~= DocPlan(i, cur);
+    }
+    // Open documents the overlay did not load, changed since it registered
+    // them: a later load must read the buffer.
+    const(char)[][] stale;
+    if (e.docs.openPaths !is null)
+        foreach (p; e.docs.openPaths())
+            if (findDoc(e, p) is null)
+                if (auto r = p in e.overlayTexts)
+                {
+                    auto cur = e.docs.open(p);
+                    if (cur !is null && cur != *r)
+                        stale ~= p;
+                }
+    if (!plans.length && !stale.length)
+    {
+        restoreRoots(e);
         e.overlayGeneration = e.generation;
-        out_ = pb.base;
+        out_ = rootAnalysis(e, path);
         return true;
     }
+
     levelPush(dmdGlobalRanges());
-    pb.patched = true;
-    bool ok;
-    Analysis a;
+    e.patch.patched = true;
+    e.patch.sinkMark = e.sink.msgs.length;
     string why;
+    bool ok;
     {
         levelEnter();
         scope (exit)
             levelLeave();
-        ok = applyPatch(e, path, text, a, why);
+        foreach (p; stale)
+            registerBuffer(p, e.docs.open(p));
+        ok = true;
+        foreach (ref pl; plans)
+            if (!planDoc(e, pl, why))
+            {
+                ok = false;
+                break;
+            }
+        if (ok)
+            why = applyPlans(e, plans);
     }
     if (!ok)
     {
-        levelPop();
-        pb.patched = false;
+        unpatch(e);
         traceMs("patch.declined", nowMs() - t0, why ~ " " ~ path);
         return false;
     }
-    replaceRoot(e, path, h, a);
+    // The roots' analyses: the base's for those unchanged; for `path` its
+    // patched one; the other patched roots' when asked for (see above).
+    restoreRoots(e);
+    e.patch.plans = plans;
+    foreach (ref pl; plans)
+        if (e.patch.docs[pl.doc].root)
+        {
+            auto pd = &e.patch.docs[pl.doc];
+            if (pd.path == path)
+                replaceRoot(e, path, fnv1a64(cast(const(ubyte)[]) pl.text),
+                    patchedAnalysis(e, *pd, pl));
+            else
+                dropRoot(e, pd.path);
+        }
     e.overlayGeneration = e.generation;
     traceMs("analyze.patch", nowMs() - t0, why ~ " " ~ path);
     engineCheckIdentifiers("after patch");
-    out_ = a;
+    out_ = rootAnalysis(e, path);
     return true;
+}
+
+// A document's edit, as a patch: its new text parsed, its bodies, and which
+// of them changed.
+struct DocPlan
+{
+    size_t doc; // index in e.patch.docs
+    const(char)[] text;
+    Module parsed;
+    BodySpan[] spans;
+    size_t[] changed;
+}
+
+// Drop the patch level: every document is back at the text the overlay
+// loaded, and the roots at their base analyses.
+void unpatch(ref Engine e)
+{
+    if (!e.patch.patched)
+        return;
+    levelPop();
+    e.patch.patched = false;
+    e.patch.plans = null;
+    e.sink.msgs.length = e.patch.sinkMark;
+    restoreRoots(e);
+}
+
+void dropRoot(ref Engine e, const(char)[] path)
+{
+    foreach (i, ref r; e.roots)
+        if (r.path == path)
+        {
+            e.roots[i] = e.roots[$ - 1];
+            e.roots.length--;
+            return;
+        }
+}
+
+void restoreRoots(ref Engine e)
+{
+    foreach (ref d; e.patch.docs)
+        if (d.root)
+            replaceRoot(e, d.path, fnv1a64(cast(const(ubyte)[]) d.text), d.base);
+}
+
+Analysis rootAnalysis(ref Engine e, const(char)[] path)
+{
+    foreach (ref r; e.roots)
+        if (r.path == path)
+            return r.a;
+    return Analysis.init;
+}
+
+DocBase* findDoc(ref Engine e, const(char)[] path)
+{
+    foreach (ref d; e.patch.docs)
+        if (d.path == path)
+            return &d;
+    return null;
+}
+
+void setDocBase(ref Engine e, DocBase d)
+{
+    if (auto p = findDoc(e, d.path))
+        *p = d;
+    else
+        e.patch.docs ~= d;
+}
+
+// The document's text now: its buffer, else the disk (closed since).
+const(char)[] currentText(ref Engine e, const(char)[] path)
+{
+    import session : sessionReadDisk;
+
+    if (e.docs.open !is null)
+        if (auto t = e.docs.open(path))
+            return t;
+    return sessionReadDisk(path);
+}
+
+// Record the open documents the overlay's universe loaded on the warm or the
+// overlay level (imports of the roots): edits of their bodies are patched.
+void noteDocs(ref Engine e)
+{
+    if (e.docs.open is null)
+        return;
+    immutable lowest = e.warmBuilt ? e.warmDepth : e.overlayDepth;
+    foreach (m; Module.amodules)
+    {
+        immutable lv = levelOf(cast(void*) m);
+        if (lv < lowest || isSynthetic(moduleName(m)))
+            continue;
+        auto f = m.srcfile.toString();
+        if (findDoc(e, f) !is null || e.docs.open(f) is null)
+            continue;
+        const(char)[] text;
+        if (lv >= e.overlayDepth)
+            if (auto t = f in e.overlayTexts)
+                text = *t;
+        if (text is null)
+            if (auto t = f in e.warmTexts)
+                text = *t;
+        if (text is null)
+            continue; // not read from a buffer we know
+        levelEnter();
+        auto spans = bodySpans(m, text);
+        levelLeave();
+        auto t = levelSuspend();
+        setDocBase(e, DocBase(f.idup, text.idup, spans, new void[][](spans.length), false));
+        levelResume(t);
+    }
+}
+
+// Parse `pl.text` and check it only differs from the document's base text
+// inside function bodies that can be swapped. Parse errors are fine inside
+// the edited bodies (a statement being typed): the parser recovers there.
+bool planDoc(ref Engine e, ref DocPlan pl, ref string why)
+{
+    import dmdwrap : dmdParseNoRegister;
+
+    auto d = &e.patch.docs[pl.doc];
+    if (!d.spans.length)
+        return decline(why, "no-bodies");
+    size_t diagFrom = e.sink.msgs.length;
+    auto pr = dmdParseNoRegister(d.path, pl.text, false);
+    if (!pr.ok)
+        return decline(why, "syntax-errors");
+    pl.parsed = cast(Module) pr.module_;
+    pl.spans = bodySpans(pl.parsed, pl.text);
+    if (pl.spans.length != d.spans.length)
+        return decline(why, "declarations-changed");
+    // Outside the bodies, the text must be the same.
+    size_t po = 0, pn = 0;
+    foreach (i; 0 .. pl.spans.length + 1)
+    {
+        immutable oe = i < pl.spans.length ? d.spans[i].start : d.text.length;
+        immutable ne = i < pl.spans.length ? pl.spans[i].start : pl.text.length;
+        if (d.text[po .. oe] != pl.text[pn .. ne])
+            return decline(why, "declarations-changed");
+        if (i == pl.spans.length)
+            break;
+        po = d.spans[i].end;
+        pn = pl.spans[i].end;
+        if (d.text[d.spans[i].start .. po] != pl.text[pl.spans[i].start .. pn])
+            pl.changed ~= i;
+    }
+    if (pl.changed.length > 32)
+        return decline(why, "too-many-bodies");
+    // Swappable: a root's function with its pre-semantic3 bytes, or one
+    // nothing analysed (an import's; CTFE analyses what it runs).
+    foreach (i; pl.changed)
+    {
+        auto fd = cast(FuncDeclaration) d.spans[i].fd;
+        if (d.pristine[i] is null && fd.semanticRun >= PASS.semantic3)
+            return decline(why, "body-not-swappable");
+    }
+    foreach (k; diagFrom .. e.sink.msgs.length)
+    {
+        auto m = &e.sink.msgs[k];
+        bool inChanged;
+        foreach (i; pl.changed)
+            inChanged |= m.file == d.path && m.line >= pl.spans[i].startLine &&
+                m.line <= pl.spans[i].endLine;
+        if (!inChanged)
+            return decline(why, "syntax-errors");
+    }
+    return true;
+}
+
+// Swap the planned bodies in and analyse those whose old ones were analysed.
+string applyPlans(ref Engine e, DocPlan[] plans)
+{
+    import dmd.funcsem : functionSemantic3;
+    import dmd.dsymbolsem : runDeferredSemantic3;
+    import dmd.dinterpret : lspCtfeCalled;
+
+    FuncDeclaration[] analyse;
+    size_t bodies;
+    foreach (ref pl; plans)
+    {
+        auto d = &e.patch.docs[pl.doc];
+        shiftLines(*d, pl.spans);
+        foreach (i; pl.changed)
+        {
+            auto fd = cast(FuncDeclaration) d.spans[i].fd;
+            auto nfd = cast(FuncDeclaration) pl.spans[i].fd;
+            if (d.pristine[i] !is null)
+            {
+                memcpy(cast(void*) fd, d.pristine[i].ptr, d.pristine[i].length);
+                analyse ~= fd;
+            }
+            fd.fbody = nfd.fbody;
+            fd.endloc = nfd.endloc;
+            bodies++;
+        }
+    }
+    lspCtfeCalled = &noteCtfe;
+    immutable ctfeBefore = g_ctfeCount;
+    foreach (fd; analyse)
+        functionSemantic3(fd);
+    runDeferredSemantic3();
+    lspCtfeCalled = null;
+    dropCtfed(e, ctfeBefore);
+    recordGraph(e);
+    char[40] b;
+    import core.stdc.stdio : snprintf;
+
+    auto n = snprintf(b.ptr, b.length, "%d docs, %d bodies", cast(int) plans.length,
+        cast(int) bodies);
+    return b[0 .. n].idup;
+}
+
+// A root's analysis after a patch of its document: the base's, its messages
+// moved like the text (but those inside the bodies analysed again), the
+// patch's messages for the file, lint of the patched module.
+Analysis patchedAnalysis(ref Engine e, ref DocBase d, ref DocPlan pl)
+{
+    Analysis a;
+    a.module_ = d.base.module_;
+    a.ok = true;
+    levelEnter();
+    scope (exit)
+        levelLeave();
+    a.syn = snapshotModule(pl.parsed, pl.text);
+    uint errs = 0;
+    foreach (ref m; d.base.diags)
+    {
+        if (m.file != d.path)
+        {
+            a.diags ~= m;
+            continue;
+        }
+        int shift = 0;
+        bool inside = false;
+        foreach (k, ref sp; d.spans)
+        {
+            if (m.line > sp.endLine)
+                shift += cast(int) pl.spans[k].newlines - cast(int) sp.newlines;
+            else
+            {
+                if (m.line >= sp.startLine)
+                    foreach (c; pl.changed)
+                        inside |= c == k;
+                break;
+            }
+        }
+        if (inside)
+            continue;
+        auto nm = m;
+        nm.line = m.line + shift;
+        a.diags ~= nm;
+        if (nm.kind == 'E')
+            errs++;
+    }
+    foreach (i, ref m; e.sink.msgs)
+        if (i >= e.patch.sinkMark && m.file == d.path)
+        {
+            a.diags ~= m;
+            if (m.kind == 'E')
+                errs++;
+        }
+    a.errors = errs;
+    lint(e, a, d.path, pl.text);
+    return a;
 }
 
 // Files on the overlay level (not the roots), with their stamps.
@@ -1495,154 +1905,15 @@ void replaceRoot(ref Engine e, const(char)[] path, ulong h, Analysis a)
     e.roots ~= Root(path.idup, h, a);
 }
 
-// On the patch level: parse `text`, check that only bodies changed, swap and
-// analyse them. `why` says what was done or why not.
-bool applyPatch(ref Engine e, const(char)[] path, const(char)[] text, ref Analysis a,
-    ref string why)
-{
-    import dmdwrap : dmdParseNoRegister;
-    import dmd.funcsem : functionSemantic3;
-    import dmd.dsymbolsem : runDeferredSemantic3;
-    import dmd.dinterpret : lspCtfeCalled;
-
-    auto pb = &e.patch;
-    // Parse errors are fine inside the edited bodies (a statement being
-    // typed): the parser recovers there, and they are reported with the
-    // patch. Anywhere else the structure may be lost.
-    size_t diagFrom = e.sink.msgs.length;
-    auto pr = dmdParseNoRegister(path, text, false);
-    if (!pr.ok)
-        return decline(why, "syntax-errors");
-    auto nm = cast(Module) pr.module_;
-    auto spans = bodySpans(nm, text);
-    if (spans.length != pb.spans.length)
-        return decline(why, "declarations-changed");
-    // Outside the bodies, the text must be the same.
-    size_t po = 0, pn = 0;
-    size_t[] changed;
-    foreach (i; 0 .. spans.length + 1)
-    {
-        immutable oe = i < spans.length ? pb.spans[i].start : pb.text.length;
-        immutable ne = i < spans.length ? spans[i].start : text.length;
-        if (pb.text[po .. oe] != text[pn .. ne])
-            return decline(why, "declarations-changed");
-        if (i == spans.length)
-            break;
-        po = pb.spans[i].end;
-        pn = spans[i].end;
-        if (pb.text[pb.spans[i].start .. po] != text[spans[i].start .. pn])
-            changed ~= i;
-    }
-    foreach (i; changed)
-        if (pb.pristine[i] is null)
-            return decline(why, "body-not-swappable");
-    foreach (k; diagFrom .. e.sink.msgs.length)
-    {
-        auto d = &e.sink.msgs[k];
-        bool inChanged;
-        foreach (i; changed)
-            inChanged |= d.file == path && d.line >= spans[i].startLine &&
-                d.line <= spans[i].endLine;
-        if (!inChanged)
-            return decline(why, "syntax-errors");
-    }
-    if (changed.length > 32)
-        return decline(why, "too-many-bodies");
-
-    // Positions after each body move by the lines it gained.
-    shiftLines(e, spans);
-
-    // Swap the bodies, then analyse them.
-    FuncDeclaration[] fds;
-    foreach (i; changed)
-    {
-        auto fd = cast(FuncDeclaration) pb.spans[i].fd;
-        auto nfd = cast(FuncDeclaration) spans[i].fd;
-        memcpy(cast(void*) fd, pb.pristine[i].ptr, pb.pristine[i].length);
-        fd.fbody = nfd.fbody;
-        fd.endloc = nfd.endloc;
-        fds ~= fd;
-    }
-    lspCtfeCalled = &noteCtfe;
-    immutable ctfeBefore = g_ctfeCount;
-    foreach (fd; fds)
-        functionSemantic3(fd);
-    runDeferredSemantic3();
-    lspCtfeCalled = null;
-    // A body evaluated at compile time from now on is no longer swappable.
-    foreach (k; ctfeBefore .. g_ctfeCount)
-        foreach (i, ref sp; pb.spans)
-            if (sp.fd is g_ctfeFns[k])
-                pb.pristine[i] = null;
-
-    auto m = cast(Module) pb.base.module_;
-    a.module_ = cast(void*) m;
-    a.ok = true;
-    a.syn = snapshotModule(nm, text);
-    // The base's messages, moved like the text, but those inside the bodies
-    // analysed again; then theirs.
-    uint errs = 0;
-    foreach (ref d; pb.base.diags)
-    {
-        if (d.file != path)
-        {
-            a.diags ~= d;
-            continue;
-        }
-        int shift = 0;
-        bool inside = false;
-        foreach (k, ref sp; pb.spans)
-        {
-            if (d.line > sp.endLine)
-                shift += cast(int) spans[k].newlines - cast(int) sp.newlines;
-            else if (d.line >= sp.startLine)
-            {
-                foreach (c; changed)
-                    inside |= c == k;
-                break;
-            }
-            else
-                break;
-        }
-        if (inside)
-            continue;
-        auto nd = d;
-        nd.line = d.line + shift;
-        a.diags ~= nd;
-        if (nd.kind == 'E')
-            errs++;
-    }
-    foreach (i, ref d; e.sink.msgs)
-        if (i >= diagFrom)
-        {
-            a.diags ~= d;
-            if (d.kind == 'E' && d.file == path)
-                errs++;
-        }
-    a.errors = errs;
-    lintUnusedImports(&e.lintArena, m, path, text, errs != 0, a.lintImports);
-    lintUnusedParams(&e.lintArena, m, path, text, errs != 0, a.lintParams);
-    ownLintStrings(e.lintArena, a.lintImports);
-    ownLintStrings(e.lintArena, a.lintParams);
-    recordGraph(e);
-    char[16] b;
-    import core.stdc.stdio : snprintf;
-
-    auto n = snprintf(b.ptr, b.length, "%d bodies", cast(int) changed.length);
-    why = b[0 .. n].idup;
-    return true;
-}
-
-// Make the root's positions follow the new text: from the end of each body
+// Make a document's positions follow its new text: from the end of each body
 // on, lines move by what the bodies up to it gained (`#line`-style
-// substitutions on the root's location table entry; its own level undoes them).
-void shiftLines(ref Engine e, BodySpan[] spans)
+// substitutions on its location table entry; the patch level undoes them).
+void shiftLines(ref DocBase d, BodySpan[] spans)
 {
     import dmd.location : BaseLoc;
     static import dmd.location;
 
-    auto pb = &e.patch;
-    auto first = cast(FuncDeclaration) pb.spans[0].fd;
+    auto first = cast(FuncDeclaration) d.spans[0].fd;
     immutable idx = __traits(getMember, first.loc, "index");
     auto table = __traits(getMember, dmd.location, "locFileTable");
     BaseLoc* bl;
@@ -1653,12 +1924,12 @@ void shiftLines(ref Engine e, BodySpan[] spans)
         return;
     BaseLoc[] subs = [BaseLoc(bl.filename, null, 0, 0)];
     int delta = 0;
-    foreach (k, ref sp; pb.spans)
+    foreach (k, ref sp; d.spans)
     {
-        immutable d = cast(int) spans[k].newlines - cast(int) sp.newlines;
-        if (d == 0)
+        immutable dl = cast(int) spans[k].newlines - cast(int) sp.newlines;
+        if (dl == 0)
             continue;
-        delta += d;
+        delta += dl;
         subs ~= BaseLoc(bl.filename, null, sp.end, delta);
     }
     bl.substitutions = subs.length > 1 ? subs : null;
@@ -1693,7 +1964,6 @@ void semanticRoot(Module m, BodySpan[] spans, ref void[][] pristine)
     import dmd.dinterpret : lspCtfeCalled;
     import dmdwrap : dmdHasUnloadedImport;
 
-    g_ctfeCount = 0;
     lspCtfeCalled = &noteCtfe;
     scope (exit)
         lspCtfeCalled = null;
@@ -1715,13 +1985,25 @@ void semanticRoot(Module m, BodySpan[] spans, ref void[][] pristine)
             pristine[i] = null;
 }
 
-void finishImported(Module m)
+// Analyse the bodies of a module an import loaded (semantic 3), keeping the
+// bytes of each function in `spans` that may later be re-analysed in place.
+void finishBodies(Module m, BodySpan[] spans, ref void[][] pristine)
 {
     import dmd.semantic3 : semantic3;
     import dmd.dsymbolsem : runDeferredSemantic3;
+    import dmd.dinterpret : lspCtfeCalled;
 
+    pristine = new void[][](spans.length);
+    foreach (i, ref sp; spans)
+        pristine[i] = snapshotFunction(cast(FuncDeclaration) sp.fd);
+    lspCtfeCalled = &noteCtfe;
+    scope (exit)
+        lspCtfeCalled = null;
     m.semantic3(null);
     runDeferredSemantic3();
+    foreach (i, ref sp; spans)
+        if (pristine[i] !is null && ctfeCalled(sp.fd))
+            pristine[i] = null;
 }
 
 // Debug (LAYERS_CHECK=1): every identifier dmd's table holds must be a live GC

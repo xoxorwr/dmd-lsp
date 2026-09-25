@@ -158,7 +158,7 @@ mark = log_size()
 # edit invalidated out of the cached levels (expressionsem.d is in import
 # cycles with most of dmd), so wait for it rather than for a fixed time.
 end = time.time() + 60
-while time.time() < end and not re.search(r'\] analyze: ', log_since(mark)):
+while time.time() < end and not re.search(r'\] analyze(\.patch)?: ', log_since(mark)):
     time.sleep(0.1)
 time.sleep(1.0) # nothing else may follow
 idle = log_since(mark)
@@ -167,9 +167,10 @@ def ops(log):
     return [(n, int(ms)) for ms, n in re.findall(r'\] op: (\d+) ms \((\w+)\)', log)]
 
 check('every-request-answered', not missing, str(missing))
-typed_analyses = re.findall(r'\] analyze(?:\.variant)?: .*', typing)
+typed_analyses = re.findall(r'\] analyze(?:\.variant|\.patch)?: .*', typing)
 check('no-analysis-per-keystroke', not typed_analyses, str(typed_analyses[:3]))
-idle_analyses = re.findall(r'\] analyze: .*', idle)
+# A full analysis or, for an edit inside a body, a body patch.
+idle_analyses = re.findall(r'\] analyze(?:\.patch)?: .*', idle)
 check('one-analysis-after-typing', len(idle_analyses) == 1, str(idle_analyses))
 slow = [(n, ms) for n, ms in ops(typing) if ms > OP_CEILING_MS]
 check('per-keystroke-ops-fast', not slow, str(slow[:5]))

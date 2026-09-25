@@ -41,8 +41,8 @@ Everything now runs in the server process, on a stack of **memory levels**
 | 2 | libraries: druntime/Phobos modules that import only library code | a file it loaded changes on disk (never by an edit) |
 | 3 | dependencies: the project's modules the roots need, analysed like imports | a file it loaded changes, it would have to contain an edited document, or the overlay keeps loading a module it could hold |
 | 4 | warm: a copy of the current root under another module name | root switch; an edited document it loaded changes; a level below rebuilt |
-| 5 | the overlay: the roots analysed since the last change, from their buffers | a change the root's body patches cannot take (lazily, on the next analysis) |
-| 6 | a body patch of the overlay's root | the next edit of the root (replaced), or the overlay popped |
+| 5 | the overlay: the roots analysed from their buffers, and the edited documents they loaded | a change body patches cannot take (lazily, on the next analysis) |
+| 6 | the body patches: edits inside function bodies of those documents | replaced by the next analysis, or with the overlay |
 
 The mechanism:
 
@@ -241,40 +241,58 @@ constant searches).
 
 ### Body patches
 
-An edit inside function bodies of the overlay's root changes nothing another
-module can see, as long as the bodies belong to plain functions with declared
-return type and attributes that nothing evaluated at compile time. Then only
-those bodies are analysed again, in place, on level 6 (`tryPatch`,
-`applyPatch` in `engine.d`):
+An edit inside function bodies changes nothing another module can see, as
+long as the bodies belong to plain functions with declared return type and
+attributes that nothing evaluated at compile time. Such edits never rebuild
+anything: they are patched onto the overlay, on level 6 (`tryIncremental` in
+`engine.d`), for every open document the overlay loaded, not only the roots.
+So switching between two files being edited costs a patch, not a rebuild.
 
-- The root's full analysis is the **base**. Its parse records each function
-  body's span; between semantic 2 and 3 the engine keeps the bytes of every
-  function whose body may later be swapped (no constructor, destructor,
-  invariant, unittest, literal or nested function; no `auto`, no inferred
-  attributes, no contracts), and H6 ([hacks.md](hacks.md)) marks every
-  function the interpreter ran as not swappable.
-- An edit is patched when only the root changed since the base, nothing it
-  rests on changed on disk, and the new text equals the base's byte for byte
-  outside the bodies. Parse errors are allowed inside the edited bodies (a
-  statement being typed): the parser recovers there. Each changed function
-  is restored to its bytes from before its body was analysed, takes the new
-  body and is analysed again (`functionSemantic3`); callers, overload sets and
-  vtables keep pointing at the same object.
-- Positions follow the new text through the location table: from the end of
-  each body on, lines move by what the bodies up to it gained (the `#line`
-  substitutions of the root's `BaseLoc`). Only text after a closing `}` on the
-  same line keeps a stale column.
-- The base's messages are carried over, moved the same way, except those
-  inside the re-analysed bodies; the patch's own follow. Lint runs on the
-  patched module; the pre-semantic snapshot comes from the new parse.
-- Each edit pops the previous patch and patches from the base again (the
-  base is re-built by a full analysis after 32 changed bodies, an edit outside
-  bodies, a CTFE'd body, another document's change, or a disk change).
+- Each such document has a **base**: the text dmd loaded it from (what the
+  engine registered as its buffer on that level), its function bodies' spans,
+  and, for a root, its analysis at that text. A root's parse records the
+  spans; between semantic 2 and 3 of a root (or before its bodies are
+  finished, for a document an import loaded first), the engine keeps the
+  bytes of every function whose body may later be swapped (no constructor,
+  destructor, invariant, unittest, literal or nested function; no `auto`, no
+  inferred attributes, no contracts). H6 ([hacks.md](hacks.md)) records every
+  function the interpreter runs while the overlay lives; those are not
+  swappable, whichever document they are in.
+- Every analysis request first pops the previous patch, so every document is
+  back at its base, and makes the requested file a root of the overlay if it
+  is not one (finishing the bodies of a document an import loaded, or parsing
+  a new one). Then, on a new level 6, each document whose buffer differs from
+  its base is parsed and compared: its text must equal the base's byte for
+  byte outside the bodies (parse errors are allowed inside the edited bodies:
+  a statement being typed). A changed function with kept bytes is restored to
+  them, takes the new body and is analysed again (`functionSemantic3`); one
+  nothing analysed (an import's) just takes the new body. Callers, overload
+  sets and vtables keep pointing at the same object.
+- Positions follow each document's new text through the location table: from
+  the end of each body on, lines move by what the bodies up to it gained (the
+  `#line` substitutions of the document's `BaseLoc`). So a definition in
+  another document lands on its current line. Only text after a closing `}`
+  on the same line keeps a stale column.
+- The requested root's analysis is its base's, messages moved the same way
+  (except those inside the re-analysed bodies), plus the patch's own for the
+  file, with lint of the patched module. Another patched root's is built from
+  the same patch when asked for, until something changes again.
+- Open documents the overlay has not loaded but whose buffer changed are
+  registered again on the patch level: a later load (a function-local import
+  in an edited body) reads the buffer. Registration replaces an earlier one:
+  dmd's file table keeps the first entry for a name.
+- Anything else is a full analysis: an edit outside bodies, a CTFE'd or
+  already-analysed body without kept bytes, more than 32 changed bodies in a
+  document, a change on disk, a reference search, or a completion variant.
+  The first edit of a file the dependency level held from disk is one too
+  (the level must drop it); from then on its edits are patches.
 
-On dmd's `expressionsem.d` (in import cycles with most of the compiler) this
-turns a re-analysis from ~500 ms into ~40–80 ms, most of it the new parse and
-the lint; the bodies themselves take a few ms. `tests/test_body_patch.py`
-pins the behaviour, positions included.
+On dmd's tree (`expressionsem.d` and `dsymbolsem.d`, both in import cycles
+with most of the compiler) an edit costs ~60–100 ms instead of ~500 ms, and
+switching between the two files as much; most of it is parsing the changed
+files again and the lint, the bodies themselves take a few ms.
+`tests/test_body_patch.py` and `tests/test_multi_patch.py` pin the behaviour,
+positions included.
 
 ### Completion never analyses
 
@@ -380,7 +398,7 @@ failed `import("...")` inside a cycle cascades into unrelated errors (dmd's own
 
 ## Status
 
-Verified by `make check` (443 assertions across the LSP, semantic-token,
+Verified by `make check` (484 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, cache,
 debounce, config, memory and crash-recovery suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):
