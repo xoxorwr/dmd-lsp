@@ -4,7 +4,6 @@ module session;
 // Doc text is malloc-managed and replaced on update, so memory does not
 // grow with edits and never lives on a dmd memory level.
 
-import arena;
 import core.stdc.stdlib : malloc, free;
 import core.stdc.string : memcpy;
 
@@ -16,7 +15,6 @@ struct DocEntry
 
 struct Session
 {
-    Arena perm; // analysis output pinned across requests (lint hits)
     DocEntry[] docs; // GC array (cold path only)
 }
 

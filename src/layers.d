@@ -367,7 +367,7 @@ final class LayeredGC : GC
         size_t scanned = used;
         foreach (i; 1 .. depth + 1)
             scanned += levels[i].gc.gcx.mappedPages;
-        enum minPages = 8 * 1024 * 1024 / PAGE;
+        enum minPages = 4 * 1024 * 1024 / PAGE;
         level0Next = used + (scanned / 8 > minPages ? scanned / 8 : minPages);
     }
 

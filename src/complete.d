@@ -1553,6 +1553,13 @@ private void walkStmt(Statement s, FuncDeclaration cur, const ref SynMod syn, ui
                             collectInFunc(fd, syn, cursorLine, prefix, a, o, seen);
                     }
                 }
+                else if (auto ls = localTypeDecl(de.declaration, cursorLine))
+                {
+                    const(char)[] nm = ls.ident.toString();
+                    if (hasPrefix(nm, prefix))
+                        pushItem(a, o, nm, kindOf(ls), typeDetail(symType(ls)),
+                            docOf(ls), "0", seen, ls);
+                }
             }
             else
                 walkDelegateExpr(es.exp, cur, syn, cursorLine, prefix, a, o, seen, 0);
@@ -2392,6 +2399,19 @@ private void collectDelegateSlots(Expression e, uint cursorLine, ref NameType[] 
     }
 }
 
+// A named type-level declaration in a function body (struct, class, enum,
+// alias, template) declared by `cursorLine`, else null. Local variables and
+// nested functions have their own handling.
+private Dsymbol localTypeDecl(Dsymbol d, uint cursorLine)
+{
+    if (!d || !d.ident || d.loc.linnum() > cursorLine)
+        return null;
+    if (d.isAggregateDeclaration() || d.isEnumDeclaration() ||
+        d.isAliasDeclaration() || d.isTemplateDeclaration())
+        return d;
+    return null;
+}
+
 private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
 {
     if (!s || s.loc.linnum() > cursorLine)
@@ -2407,6 +2427,8 @@ private void collectSemSlots(Statement s, uint cursorLine, ref NameType[] r)
                     if (vd.ident && vd.loc.linnum() <= cursorLine)
                         r ~= NameType(vd.ident.toString(), vd.type, null, vd);
                 }
+                else if (auto ls = localTypeDecl(de.declaration, cursorLine))
+                    r ~= NameType(ls.ident.toString(), null, null, ls);
             }
             else
                 collectDelegateSlots(es.exp, cursorLine, r, 0);

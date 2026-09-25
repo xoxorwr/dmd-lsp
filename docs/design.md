@@ -209,7 +209,10 @@ cost **no** analysis; each debounced edit costs one):
 
 Every analysis and level build logs its reason under `DMD_LSP_TIMING=1`
 (`analyze: 5 ms (doc-changed app.d)`, `deps: … (learned …)`), which is how the
-budget test counts them.
+budget test counts them. `DMD_LSP_DEBUG=1` goes one step further: a line per
+module dmd parses and analyses, and the level it lands on (`dependencies`,
+`warm`, `overlay`, `overlay, variant`), plus parse-only passes (the imports
+scan, the workspace index).
 
 Workspace references for a function, type, field or ordinary variable analyse
 the candidate importers as further roots of the current overlay. A constant
@@ -227,6 +230,20 @@ next analysis, so after an edit the previous analysis stays valid (and is used)
 until the debounced pass replaces it. When there is none (first request, or the
 overlay was dropped), that one request analyses. Read-only requests (hover,
 definition, signature, tokens, highlights, symbols) share this behaviour.
+
+Completion has one exception: it analyses when the pass it would read could
+not parse its text. A pause in mid-statement
+(`img` before its `.`) has the idle pass analyse text the parser derails on,
+and the scopes past the error are gone until the next pass. Completion then
+analyses its placeholder variant, which parses (cached per text like any
+analysis, so it costs one analysis until the buffer parses again). A parser
+patch that ends a statement missing its `;` at the line break (instead of
+consuming the next line's first token) was measured against this: the same
+completion results on the common half-typed forms, and fewer cascading
+diagnostics mid-edit (11 errors down to 2 for `foo` before its `.`), but only
+for the forms it recognises (an unclosed `[` or `(` still derails), at the
+cost of another dmd patch. Not adopted; the fallback covers what the variant
+repairs, whatever the parser does.
 
 The one freshness cost is a **debounce**: as-you-type completion can be one idle
 cycle behind the last edit. That is invisible in practice because a member name
@@ -309,7 +326,7 @@ failed `import("...")` inside a cycle cascades into unrelated errors (dmd's own
 
 ## Status
 
-Verified by `make check` (438 assertions across the LSP, semantic-token,
+Verified by `make check` (443 assertions across the LSP, semantic-token,
 completion-burst/prefix/scope, real-world session, broken-body, cache,
 debounce, config, memory and crash-recovery suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):

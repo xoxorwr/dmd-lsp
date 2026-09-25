@@ -36,7 +36,7 @@ import dmdwrap : DiagMsg, DiagSink, gSink, applyDmdFlags;
 import lint : LintOut, lintUnusedImports, lintUnusedParams;
 import complete : SynMod, snapshotModule;
 import session : fnv1a64;
-import log : log;
+import log : log, logDebug, debugLogEnabled;
 import timing : nowMs, traceMs;
 
 import dmd.dmodule : Module;
@@ -52,6 +52,9 @@ struct Analysis
     LintOut lintImports;
     LintOut lintParams;
     SynMod syn; // pre-semantic structure snapshot (see complete.d)
+    // The text did not parse cleanly: the parser may have lost the structure
+    // after the error (a half-typed statement derails it into what follows).
+    bool syntaxErrors;
     // Uses of constants dmd folded away during this analysis (dmd `VarExp`s,
     // only recorded during reference search: engineBeginUnfolded).
     void*[] folds;
@@ -225,10 +228,15 @@ Analysis engineAnalyze(ref Engine e, const(char)[] path, const(char)[] text)
 // It gets an overlay of its own, dropped by the next `engineAnalyze`.
 Analysis engineAnalyzeVariant(ref Engine e, const(char)[] path, const(char)[] text)
 {
+    auto h = fnv1a64(cast(const(ubyte)[]) text);
+    if (e.overlay && e.overlayVariant && e.overlayGeneration == e.generation)
+        foreach (ref r; e.roots)
+            if (r.path == path && r.hash == h)
+                return r.a;
     auto t = levelSuspend();
     scope (exit)
         levelResume(t);
-    return analyzeFresh(e, path.idup, text.idup, fnv1a64(cast(const(ubyte)[]) text), true);
+    return analyzeFresh(e, path.idup, text.idup, h, true);
 }
 
 // Run `fn` with dmd available on a scratch level above everything, then drop
@@ -513,10 +521,13 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         lspConstFolded = e.recordFolds ? &noteFold : null;
         scope (exit)
             lspConstFolded = null;
+        immutable loadedBefore = Module.amodules.length;
         auto m = findLoaded(path);
         if (m is null)
         {
+            immutable errorsBefore = global.errors;
             m = parseRoot(path, text);
+            a.syntaxErrors = global.errors != errorsBefore;
             if (m !is null)
                 a.syn = snapshotModule(m, text);
             if (m !is null)
@@ -529,8 +540,11 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
             // from this same buffer): finish its bodies. Its declaration-level
             // errors were reported when it was loaded, into that level's sink.
             a.syn = snapshotModule(m, text);
+            logDebug("analyse module bodies: '%.*s' (loaded on a lower level)",
+                cast(int) path.length, path.ptr);
             finishImported(m);
         }
+        logLoaded(loadedBefore, variant ? "overlay, variant" : "overlay", null);
         a.module_ = cast(void*) m;
         a.ok = m !is null;
         a.folds = g_folds; // overlay memory, like the rest of the analysis
@@ -647,6 +661,7 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
             levelLeave();
         immutable before = Module.amodules.length;
         analyzeCopy(text, e.warmPaths.length);
+        logLoaded(before, "warm", path);
         // What this copy loaded: the real root among it means the root is in
         // an import cycle, and its copy is no use (the overlay could not
         // load the root from the buffer).
@@ -674,6 +689,26 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
             e.warmFiles ~= f.idup;
     e.warmDiags ~= sink.msgs;
     traceMs("warm", nowMs() - t0, why ~ " " ~ path);
+}
+
+// DMD_LSP_DEBUG: one line per module dmd loaded since `from` (parsed, then
+// analysed as it is imported), with the level that holds it. The warm copy of
+// a root is named after the root (`copyOf`).
+void logLoaded(size_t from, const(char)* level, const(char)[] copyOf)
+{
+    if (!debugLogEnabled())
+        return;
+    foreach (m; Module.amodules[from .. $])
+    {
+        const(char)[] f = m.srcfile.toString();
+        if (f == "__dmdlsp_deps.d")
+            continue; // the synthetic module importing the dependencies
+        if (copyOf !is null && isWarmCopy(m.ident.toString()))
+            logDebug("parse & analyse module: '%.*s' (%s, renamed copy)",
+                cast(int) copyOf.length, copyOf.ptr, level);
+        else
+            logDebug("parse & analyse module: '%.*s' (%s)", cast(int) f.length, f.ptr, level);
+    }
 }
 
 // Module name of the n-th warm copy.
@@ -776,7 +811,9 @@ void ensureDeps(ref Engine e, const(char)[] path, const(char)[] text)
         DiagSink sink; // level 0 (see onDiag)
         gSink = &sink;
         {
+            immutable before = Module.amodules.length;
             loadModules(want);
+            logLoaded(before, "dependencies", null);
         }
         // Modules that must not be here, and the wanted names that pull them in.
         string[] bannedDmd;
@@ -841,6 +878,7 @@ string[] rootImports(ref Engine e, const(char)[] path, const(char)[] text)
     string[] res;
     string[] tmp;
     engineScratch(e, () {
+        logDebug("parse module: '%.*s' (imports scan)", cast(int) path.length, path.ptr);
         auto pr = dmdParseNoRegister(path, text);
         if (!pr.ok)
             return;

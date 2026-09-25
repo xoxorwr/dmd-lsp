@@ -45,7 +45,11 @@ VSCODE_DIR = editor/vscode
 
 all: $(BIN)
 
-$(BIN): $(SRC) Makefile stringimp/SYSCONFDIR.imp
+# The vendored frontend is compiled through `-i`: list it so a patch or a
+# re-vendor rebuilds.
+VENDORED = $(wildcard src/dmd/*.d src/dmd/*/*.d src/dmd/*/*/*.d)
+
+$(BIN): $(SRC) $(VENDORED) Makefile stringimp/SYSCONFDIR.imp
 	$(DC) $(DFLAGS) $(SRC) -of$(BIN)
 
 # Windows exe built under Wine, using a Windows dmd inside the default prefix.
@@ -177,6 +181,7 @@ check: $(BIN) check-no-oop check-statics unittest
 	python3 tests/test_crash.py segv
 	python3 tests/test_editor_session.py
 	python3 tests/test_editor_typing.py
+	python3 tests/test_completion_edits.py
 	python3 tests/test_spawn.py
 	python3 tests/test_index.py
 	python3 tests/test_mirror.py

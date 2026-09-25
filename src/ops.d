@@ -9,7 +9,7 @@ module ops;
 
 
 import arena;
-import log : log;
+import log : log, logDebug;
 import json;
 import lsp;
 import session;
@@ -786,6 +786,7 @@ private void buildIndexNow(ref ServerState s, string[] files)
             auto text = sessionReadDisk(f);
             if (!text)
                 continue;
+            logDebug("parse module: '%.*s' (workspace index)", cast(int) f.length, f.ptr);
             auto pr = dmdParseNoRegister(f, text);
             if (!pr.ok || !pr.module_)
                 continue;
@@ -2341,6 +2342,12 @@ private void serveRequest(ref ServerState s, const(char)[] req)
             // Completion answers from the analysis the overlay holds (the
             // last debounced/open/save pass), so typing never re-analyses.
             auto a = warmOrAnalyze(s, path, atext, orig);
+            // Unless that pass could not parse the text: a statement
+            // half-typed at the last idle (`upng` before its `.`) can derail
+            // the parser into what follows, and the scopes completion needs
+            // are gone until the next pass. The placeholder variant parses.
+            if (a.syntaxErrors && atext != orig)
+                a = serverAnalyze(s, path, atext, orig);
             completeAndSend(s, a, orig, line, col, prefix);
             continue;
         }

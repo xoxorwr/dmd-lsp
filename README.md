@@ -94,7 +94,9 @@ Then point any LSP client at `dmd-lsp` over stdio (see [Features](#features)).
 ```
 
 Set `DMD_LSP_TIMING=1` to print phase timings (discovery, index build,
-analysis, workspace-wide references) to stderr.
+analysis, workspace-wide references) to stderr, and `DMD_LSP_DEBUG=1` to log
+every module the server parses or analyses, with the level that holds it
+(`debug: parse & analyse module: 'src/app.d' (overlay)`).
 
 ## Configuration
 
