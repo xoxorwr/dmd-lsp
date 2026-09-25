@@ -1,5 +1,5 @@
 // dmd-lsp: LSP front end (struct-only). All dmd work happens in the
-// worker (see worker.d); this module holds only session/config
+// worker (see ops.d); this module holds only session/config
 // state and formats results.
 module main;
 
@@ -20,39 +20,27 @@ import json;
 import lsp;
 import server;
 import session;
-import worker;
+import ops;
 import pathutil : dirOf, isDFilePath, isDlsJson, resolveCfgPath, sameDir;
 import fsutil : findDFiles;
 import complete : extractPrefix, posInCode;
 import semantic : tokenTypes, tokenModifiers;
+import references : resolvedSymbolAt, findReferences;
+import symbols : foldingRanges, DocSymbol;
+import dmd.dmodule : Module;
 import log : log;
 
 struct HitCache
 {
-    worker.WAnalysis analysis; // last analysis (lint, for codeAction)
+    ops.WAnalysis analysis; // last analysis (lint, for codeAction)
 }
 
-// Default pool size: a handful of genuinely-open files (measured sessions
-// needed 5-8 roots). Overridable from dls.json / initializationOptions.
-enum uint defaultMaxWorkers = 4;
-
-// Off by default: one worker per root (the pool). A shared universe that holds
-// several resident roots cannot be mutated in place safely — re-parsing a root
-// that a resident module imports leaves that importer holding stale symbols,
-// which the conservative GC cannot reclaim (see docs/reclamation.md). Setting
-// `sharedRegistry: true` opts back into the one-worker registry for
-// experimentation; it leaks on exactly that pattern.
-enum bool defaultSharedRegistry = false;
-
-// Experimental (PLAN2 Task 2, DMD_LSP_SHARED=1): route every root to the MRU
-// worker so one process serves many roots on a shared module registry, and the
-// worker avoids respawning on a root switch.
-// One single-root worker. `root` is the file whose universe it currently
-// holds; `indexBuilt` tracks the per-process workspace index.
+// The analysis side (one in-process `ops.Worker`, see poolAcquire) and
+// whether its workspace index is built.
 struct PoolEntry
 {
     string root; // bound root path ("" when unbound)
-    worker.Worker wk;
+    ops.Worker wk;
     ulong stamp; // LRU clock
     bool indexBuilt; // this worker's workspace index is warm
 }
@@ -62,9 +50,9 @@ struct App
     Session session; // open document texts (perm arena inside)
     HitCache[string] cache; // GC map, cold path only
     bool shutdownRequested = false;
-    bool workerNotified = false; // one-shot user notice when the worker won't start
     bool labelDetails = false; // client supports CompletionItem.labelDetails
     string[] pending; // paths with unanalyzed changes (debounced analysis)
+    string[] editedDocs; // documents edited this session (see pushDocToPool)
     ulong lastMsgMs = 0; // last stdin activity, monotonic ms
     ulong debounceMs = 500; // idle delay before analyzing pending changes
     bool debounceSet = false; // true when --debounce-ms= was given (beats file)
@@ -79,23 +67,11 @@ struct App
     string[] flags; // effective dmd flags (CLI ++ dls.json)
     ulong configGen = 0; // bumped on import-path change; invalidates worker
     FileConfig fileCfg; // project dls.json (see below)
-    // Single-root analysis workers, one per analyzed root, LRU-evicted at
-    // `maxWorkers`. Revisited roots stay warm instead of paying a fresh
-    // kill+spawn+re-init on every switch. MRU entry is last.
     PoolEntry[] pool;
-    uint maxWorkers = defaultMaxWorkers;
-    bool maxWorkersSet = false; // editor/CLI explicitly set it
-    // Shared module registry: one worker serves all roots on a persistent
-    // registry, capped at `sharedMaxModules`. Default on for POSIX.
-    bool sharedRegistry = defaultSharedRegistry;
-    bool sharedRegistrySet = false;
-    uint sharedMaxModules = 2048;
-    bool sharedMaxModulesSet = false;
-    ulong poolClock = 0; // LRU stamp source
     // Semantic tokens: last result per path and the text hash it was computed
     // from, so a pull that arrives mid-edit is served from cache instead of
     // forcing a synchronous rebuild per keystroke.
-    worker.WToken[][string] tokCache;
+    ops.WToken[][string] tokCache;
     ulong[string] tokHash;
     bool wantSemantic = false; // client supports textDocument/semanticTokens
     bool semanticRefresh = false; // client supports workspace/semanticTokens/refresh
@@ -127,12 +103,6 @@ struct FileConfig
     bool hasDebounce = false;
     bool inlayHints = false;
     bool hasInlayHints = false;
-    uint maxWorkers = defaultMaxWorkers;
-    bool hasMaxWorkers = false;
-    bool sharedRegistry = defaultSharedRegistry;
-    bool hasSharedRegistry = false;
-    uint sharedMaxModules = 2048;
-    bool hasSharedMaxModules = false;
     bool autoImports = false;
     bool hasAutoImports = false;
     bool fullTypeHover = true;
@@ -205,7 +175,7 @@ private JsonNode* jrange(Json js, uint sl, uint sc, uint el, uint ec)
     return o;
 }
 
-private JsonNode* buildDiagnostics(Json js, const ref worker.WAnalysis a)
+private JsonNode* buildDiagnostics(Json js, const ref ops.WAnalysis a)
 {
     auto arr = js.create_array();
     foreach (ref d; a.diags)
@@ -241,23 +211,20 @@ private JsonNode* buildDiagnostics(Json js, const ref worker.WAnalysis a)
     return arr;
 }
 
-// Run an analyze request against the worker, respawning once if needed.
-// already served its single universe. `realOnly` forces the universe to have
-// parsed the real text (open/save, where diagnostics must be exact); false
-// lets the analyze reuse a live completion placeholder by identity, which is
-// the cheap path while typing.
+// Run an analyze request against the ops layer, retrying once on a failed op
+// (which reset the engine).
 private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text,
-    ref worker.WAnalysis out_, bool realOnly = false)
+    ref ops.WAnalysis out_)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
         auto w = poolAcquire(app, path);
         if (w is null)
             return false;
-        auto r = workerAnalyze(w.wk, path, text, out_, realOnly);
-        if (r == worker.ExchangeResult.ok)
+        auto r = workerAnalyze(w.wk, path, text, out_);
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.failed || r == worker.ExchangeResult.respawn)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -267,10 +234,10 @@ private bool workerAnalyzeRetry(App* app, const(char)[] path, const(char)[] text
     return false;
 }
 
-// Run a completion request against the worker, respawning once if needed.
+// Run a completion request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] atext,
     const(char)[] origText, uint line, uint col, const(char)[] prefix,
-    ref worker.WItem[] items)
+    ref ops.WItem[] items)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -278,9 +245,9 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
         if (w is null)
             return false;
         auto r = workerComplete(w.wk, path, atext, origText, line, col, prefix, items);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             // Drop it; the next attempt rebinds (spawning as needed).
             poolDrop(app, path);
@@ -291,9 +258,9 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
     return false;
 }
 
-// Run a signature-help request against the worker, respawning once if needed.
+// Run a signature-help request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] atext,
-    const(char)[] origText, uint line, uint col, ref worker.WSig sig)
+    const(char)[] origText, uint line, uint col, ref ops.WSig sig)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -301,9 +268,9 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
         if (w is null)
             return false;
         auto r = workerSignature(w.wk, path, atext, origText, line, col, sig);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             // Drop it; the next attempt rebinds (spawning as needed).
             poolDrop(app, path);
@@ -314,9 +281,9 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
     return false;
 }
 
-// Run a goto-definition request against the worker, respawning once if needed.
+// Run a goto-definition request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] atext,
-    const(char)[] origText, uint line, uint col, ref worker.WDef def)
+    const(char)[] origText, uint line, uint col, ref ops.WDef def)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -324,9 +291,9 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
         if (w is null)
             return false;
         auto r = workerDefinition(w.wk, path, atext, origText, line, col, def);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             // Drop it; the next attempt rebinds (spawning as needed).
             poolDrop(app, path);
@@ -340,7 +307,7 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
 // Same, for `textDocument/typeDefinition`.
 private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    ref worker.WDef def)
+    ref ops.WDef def)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -348,9 +315,9 @@ private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerTypeDefinition(w.wk, path, atext, origText, line, col, def);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -363,7 +330,7 @@ private bool workerTypeDefinitionRetry(App* app, const(char)[] path,
 // Same, for `textDocument/implementation` (returns every location).
 private bool workerImplementationRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    ref worker.WRef[] locs)
+    ref ops.WRef[] locs)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -371,9 +338,9 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerImplementation(w.wk, path, atext, origText, line, col, locs);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -386,7 +353,7 @@ private bool workerImplementationRetry(App* app, const(char)[] path,
 // Same, for call hierarchy.
 private bool workerCallHierarchyRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    const(char)[] mode, ref worker.WCallItem[] items, ref worker.WCall[] calls)
+    const(char)[] mode, ref ops.WCallItem[] items, ref ops.WCall[] calls)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -395,9 +362,9 @@ private bool workerCallHierarchyRetry(App* app, const(char)[] path,
             return false;
         auto r = workerCallHierarchy(w.wk, path, atext, origText, line, col,
             mode, items, calls);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -410,7 +377,7 @@ private bool workerCallHierarchyRetry(App* app, const(char)[] path,
 // Type hierarchy (prepare/supertypes/subtypes).
 private bool workerTypeHierarchyRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    const(char)[] mode, ref worker.WTypeItem[] items)
+    const(char)[] mode, ref ops.WTypeItem[] items)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -419,9 +386,9 @@ private bool workerTypeHierarchyRetry(App* app, const(char)[] path,
             return false;
         auto r = workerTypeHierarchy(w.wk, path, atext, origText, line, col,
             mode, items);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -447,7 +414,7 @@ private JsonNode* makeRange(Json js, uint sl, uint sc, uint el, uint ec)
 }
 
 // A `CallHierarchyItem` from a worker item.
-private JsonNode* callItemJson(Json js, const ref worker.WCallItem it)
+private JsonNode* callItemJson(Json js, const ref ops.WCallItem it)
 {
     auto o = js.create_object();
     js.add_string_to_object(o, "name", zstr(it.name));
@@ -464,7 +431,7 @@ private JsonNode* callItemJson(Json js, const ref worker.WCallItem it)
 }
 
 // A `TypeHierarchyItem` from a worker item.
-private JsonNode* typeItemJson(Json js, const ref worker.WTypeItem it)
+private JsonNode* typeItemJson(Json js, const ref ops.WTypeItem it)
 {
     auto o = js.create_object();
     js.add_string_to_object(o, "name", zstr(it.name));
@@ -481,7 +448,7 @@ private JsonNode* typeItemJson(Json js, const ref worker.WTypeItem it)
 
 // Same, for `textDocument/inlayHint`.
 private bool workerInlayHintsRetry(App* app, const(char)[] path,
-    const(char)[] atext, const(char)[] origText, ref worker.WHint[] hints)
+    const(char)[] atext, const(char)[] origText, ref ops.WHint[] hints)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -489,9 +456,9 @@ private bool workerInlayHintsRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerInlayHints(w.wk, path, atext, origText, hints);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -502,7 +469,7 @@ private bool workerInlayHintsRetry(App* app, const(char)[] path,
 }
 
 // Same, for `textDocument/foldingRange` (text-only, no analysis).
-private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[] folds)
+private bool workerFoldingRetry(App* app, const(char)[] text, ref ops.WFold[] folds)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -510,9 +477,9 @@ private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[]
         if (w is null)
             return false;
         auto r = workerFolding(w.wk, text, folds);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, null);
             continue;
@@ -524,7 +491,7 @@ private bool workerFoldingRetry(App* app, const(char)[] text, ref worker.WFold[]
 
 // `textDocument/documentLink` (text-only).
 private bool workerDocumentLinksRetry(App* app, const(char)[] text,
-    const(string)[] dirs, ref worker.WLink[] links)
+    const(string)[] dirs, ref ops.WLink[] links)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -532,9 +499,9 @@ private bool workerDocumentLinksRetry(App* app, const(char)[] text,
         if (w is null)
             return false;
         auto r = workerDocumentLinks(w.wk, text, dirs, links);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, null);
             continue;
@@ -547,7 +514,7 @@ private bool workerDocumentLinksRetry(App* app, const(char)[] text,
 // Same, for `textDocument/documentHighlight`.
 private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    ref worker.WRef[] locs)
+    ref ops.WRef[] locs)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -555,9 +522,9 @@ private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerDocumentHighlight(w.wk, path, atext, origText, line, col, locs);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -567,9 +534,9 @@ private bool workerDocumentHighlightRetry(App* app, const(char)[] path,
     return false;
 }
 
-// Run a hover request against the worker, respawning once if needed.
+// Run a hover request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
-    const(char)[] origText, uint line, uint col, ref worker.WHover hov)
+    const(char)[] origText, uint line, uint col, ref ops.WHover hov)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -578,9 +545,9 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
             return false;
         auto r = workerHover(w.wk, path, atext, origText, line, col, hov,
             app.fullTypeHover);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             // Drop it; the next attempt rebinds (spawning as needed).
             poolDrop(app, path);
@@ -591,7 +558,7 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
     return false;
 }
 
-// Run a documentSymbol request against the worker, respawning once if needed.
+// Run a documentSymbol request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
     const(char)[] text, ref string resultJson)
 {
@@ -601,9 +568,9 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerDocumentSymbol(w.wk, path, text, resultJson);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -613,10 +580,10 @@ private bool workerDocumentSymbolRetry(App* app, const(char)[] path,
     return false;
 }
 
-// Run a references request against the worker, respawning once if needed.
+// Run a references request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerReferencesRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    bool includeDecl, ref worker.WRefs refs)
+    bool includeDecl, ref ops.WRefs refs)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -625,9 +592,9 @@ private bool workerReferencesRetry(App* app, const(char)[] path,
             return false;
         auto r = workerReferences(w.wk, path, atext, origText, line, col,
             includeDecl, refs);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -637,10 +604,10 @@ private bool workerReferencesRetry(App* app, const(char)[] path,
     return false;
 }
 
-// Run a prepareRename request against the worker, respawning once if needed.
+// Run a prepareRename request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerPrepareRenameRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    ref worker.WPrep prep)
+    ref ops.WPrep prep)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -649,9 +616,9 @@ private bool workerPrepareRenameRetry(App* app, const(char)[] path,
             return false;
         auto r = workerPrepareRename(w.wk, path, atext, origText, line, col,
             prep);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -661,10 +628,10 @@ private bool workerPrepareRenameRetry(App* app, const(char)[] path,
     return false;
 }
 
-// Run a rename request against the worker, respawning once if needed.
+// Run a rename request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerRenameRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    const(char)[] newName, ref worker.WRename res)
+    const(char)[] newName, ref ops.WRename res)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -673,9 +640,9 @@ private bool workerRenameRetry(App* app, const(char)[] path,
             return false;
         auto r = workerRename(w.wk, path, atext, origText, line, col, newName,
             res);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -742,7 +709,7 @@ private bool workerBuildIndexRetry(App* app, const(char)[] path, string[] files)
         auto w = poolAcquire(app, path);
         if (w is null)
             return false;
-        if (workerBuildIndex(w.wk, files) == worker.ExchangeResult.ok)
+        if (workerBuildIndex(w.wk, files) == ops.ExchangeResult.ok)
             return true;
         poolDrop(app, path);
     }
@@ -750,7 +717,7 @@ private bool workerBuildIndexRetry(App* app, const(char)[] path, string[] files)
 }
 
 private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
-    ref worker.WIndexSym[] syms)
+    ref ops.WIndexSym[] syms)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -758,7 +725,7 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
         if (w is null)
             return false;
         auto r = workerWorkspaceSymbol(w.wk, query, syms);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
         poolDrop(app, null);
     }
@@ -766,126 +733,44 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
 }
 
 // Find the pool entry bound to `path`, or null.
-private PoolEntry* poolFind(App* app, const(char)[] path)
-{
-    if (path !is null)
-        foreach (ref e; app.pool)
-            if (e.root == path)
-                return &e;
-    return null;
-}
-
-// Most-recently-used entry, or null when the pool is empty.
-private PoolEntry* poolMRU(App* app)
-{
-    return app.pool.length ? &app.pool[$ - 1] : null;
-}
-
-// Notify the user once if a worker cannot start.
-private void poolNotifyFail(App* app)
-{
-    log("worker: start failed");
-    if (!app.workerNotified)
-    {
-        app.workerNotified = true;
-        Notice n;
-        n.have = true;
-        n.type = 1;
-        n.text = "dmd-lsp: could not start the analysis worker; see the dmd-lsp output channel";
-        notifyNotice(n);
-    }
-}
-
-// Find or create the worker bound to `path` (null: the MRU worker, created
-// unbound when the pool is empty). Evicts the least-recently-used worker when
-// the pool is full. Returns null only when a spawn fails.
+// The analysis side is one in-process `Worker` (ops.d) over the engine. The
+// pool vocabulary stayed: `poolAcquire` returns it (creating it on first use
+// or after a config change), `poolDrop` is a no-op the retry loops call after a
+// failed op (the op has already reset the engine).
 private PoolEntry* poolAcquire(App* app, const(char)[] path)
 {
-    if (app.sharedRegistry && app.pool.length)
-    {
-        auto e = poolMRU(app);
-        e.stamp = ++app.poolClock;
-        return e;
-    }
-    if (path !is null)
-    {
-        if (auto hit = poolFind(app, path))
-        {
-            hit.stamp = ++app.poolClock;
-            return hit;
-        }
-    }
-    else if (app.pool.length)
-    {
-        auto e = poolMRU(app);
-        e.stamp = ++app.poolClock;
-        return e;
-    }
-    immutable uint cap = app.maxWorkers ? app.maxWorkers : 1;
-    if (app.pool.length && app.pool.length >= cap)
-    {
-        size_t lru = 0;
-        foreach (i; 1 .. app.pool.length)
-            if (app.pool[i].stamp < app.pool[lru].stamp)
-                lru = i;
-        workerKill(app.pool[lru].wk);
-        foreach (i; lru .. app.pool.length - 1)
-            app.pool[i] = app.pool[i + 1];
-        app.pool.length--;
-    }
+    if (app.pool.length)
+        return &app.pool[0];
     PoolEntry e;
-    e.root = path is null ? null : path.idup;
-    e.stamp = ++app.poolClock;
-    // The new worker must not inherit (and thus keep alive) the pipes of
-    // workers already in the pool, or killing one would block in waitpid.
-    int[] closeInChild;
-    foreach (ref other; app.pool)
+    DocProvider docs;
+    docs.open = (const(char)[] p) {
+        auto d = sessionFind(app.session, p);
+        return d ? d.text : null;
+    };
+    docs.openPaths = () {
+        const(char)[][] r;
+        foreach (ref d; app.session.docs)
+            if (isDFilePath(d.path))
+                r ~= d.path;
+        return r;
+    };
+    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, docs))
     {
-        workerChildFds(other.wk, closeInChild);
-        workerDisinherit(other.wk);
-    }
-    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, closeInChild,
-        app.sharedRegistry, app.sharedMaxModules))
-    {
-        poolNotifyFail(app);
+        log("worker: start failed");
         return null;
     }
-    app.workerNotified = false;
-    primeWorkerDocs(app, e.wk);
+    // Documents edited before a config change are still edited.
+    foreach (p; app.editedDocs)
+        engineDocChanged(workerEngine(e.wk), p, true);
     app.pool ~= e;
-    return &app.pool[$ - 1];
+    return &app.pool[0];
 }
 
-// Kill and remove the worker bound to `path` (null: the MRU worker). Its
-// universe and workspace index die with it.
 private void poolDrop(App* app, const(char)[] path)
 {
-    // Shared-registry mode has one worker serving every root, so a
-    // `needRespawn` (root switch, cap hit, config) is not bound to `path`:
-    // drop the MRU worker.
-    if (app.sharedRegistry)
-        path = null;
-    size_t idx = size_t.max;
-    if (path is null)
-    {
-        if (app.pool.length)
-            idx = app.pool.length - 1;
-    }
-    else
-        foreach (i, ref e; app.pool)
-            if (e.root == path)
-            {
-                idx = i;
-                break;
-            }
-    if (idx == size_t.max)
-        return;
-    workerKill(app.pool[idx].wk);
-    foreach (i; idx .. app.pool.length - 1)
-        app.pool[i] = app.pool[i + 1];
-    app.pool.length--;
 }
 
+// Config changed (or shutting down): drop the engine with every dmd level.
 private void poolDropAll(App* app)
 {
     foreach (ref e; app.pool)
@@ -893,33 +778,38 @@ private void poolDropAll(App* app)
     app.pool = null;
 }
 
-// A workspace source changed: every worker's parse-only index is stale.
-private void poolInvalidateIndex(App* app)
+// A workspace source changed on disk: the symbol index and any dependency
+// level holding that file are stale.
+private void poolInvalidateIndex(App* app, const(char)[] path = null)
 {
     foreach (ref e; app.pool)
+    {
         e.indexBuilt = false;
+        engineDiskChanged(workerEngine(e.wk), path);
+    }
 }
 
-// Open-document mirror: push an open doc's current text (or its removal) to
-// every pooled worker, so a dependency that is open unsaved is analyzed from
-// the editor buffer, not disk. Best-effort — a failed push just leaves that
-// worker on disk bytes until it is respawned (and primed) again.
-private void pushDocToPool(App* app, const(char)[] path, const(char)[] text)
+// A document's text changed. `edited`: it no longer (necessarily) matches
+// disk, so the engine serves it from the buffer and keeps it out of the
+// dependency level from now on.
+private void pushDocToPool(App* app, const(char)[] path, const(char)[] text, bool edited)
 {
+    if (edited && !isDlsJson(path))
+    {
+        bool known = false;
+        foreach (p; app.editedDocs)
+            known |= p == path;
+        if (!known)
+            app.editedDocs ~= path.idup;
+    }
     foreach (ref e; app.pool)
-        worker.workerSetDoc(e.wk, path, text);
+        engineDocChanged(workerEngine(e.wk), path, edited);
 }
 
 private void pushDocRemovalToPool(App* app, const(char)[] path)
 {
     foreach (ref e; app.pool)
-        worker.workerSetDoc(e.wk, path, null);
-}
-
-private void primeWorkerDocs(App* app, ref worker.Worker w)
-{
-    foreach (ref d; app.session.docs)
-        worker.workerSetDoc(w, d.path, d.text);
+        engineDocChanged(workerEngine(e.wk), path, false);
 }
 
 // Build the workspace index in the worker bound to `path` (null: the MRU
@@ -951,7 +841,7 @@ private bool ensureIndex(App* app, const(char)[] path)
 // Modules exporting `name` (exact) or starting with it (`prefix`) that the
 // document does not already import.
 private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
-    ref worker.WIndexSym[] out_, bool prefix = false)
+    ref ops.WIndexSym[] out_, bool prefix = false)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -961,9 +851,9 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
         auto r = prefix
             ? workerImportCompletions(w.wk, name, path, out_)
             : workerImportCandidates(w.wk, name, path, out_);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -976,7 +866,7 @@ private bool workerImportRetry(App* app, const(char)[] name, const(char)[] path,
 // Interface/abstract methods a class still needs to implement.
 private bool workerImplementRetry(App* app, const(char)[] path,
     const(char)[] atext, const(char)[] origText, uint line, uint col,
-    ref worker.WStub[] out_)
+    ref ops.WStub[] out_)
 {
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -984,9 +874,9 @@ private bool workerImplementRetry(App* app, const(char)[] path,
         if (w is null)
             return false;
         auto r = workerImplementStubs(w.wk, path, atext, origText, line, col, out_);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -1155,18 +1045,18 @@ private string[] indexFiles(App* app)
     return uniq;
 }
 
-// Run a semantic-tokens request against the worker, respawning once if needed.
+// Run a semantic-tokens request against the ops layer, retrying once on a failed op (which reset the engine).
 private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] text,
-    ref worker.WToken[] toks){
+    ref ops.WToken[] toks){
     for (int attempt = 0; attempt < 2; attempt++)
     {
         auto w = poolAcquire(app, path);
         if (w is null)
             return false;
         auto r = workerSemantic(w.wk, path, text, toks);
-        if (r == worker.ExchangeResult.ok)
+        if (r == ops.ExchangeResult.ok)
             return true;
-        if (r == worker.ExchangeResult.respawn || r == worker.ExchangeResult.failed)
+        if (r == ops.ExchangeResult.failed)
         {
             poolDrop(app, path);
             continue;
@@ -1179,7 +1069,7 @@ private bool workerSemanticRetry(App* app, const(char)[] path, const(char)[] tex
 // Semantic tokens for `text`, cached by text hash. Called after every build
 // (so the client's post-refresh pull is an instant hit) and by the token
 // request itself. Returns null only when the text is empty.
-private worker.WToken[] refreshTokens(App* app, const(char)[] path,
+private ops.WToken[] refreshTokens(App* app, const(char)[] path,
     const(char)[] text)
 {
     if (!text.length)
@@ -1188,7 +1078,7 @@ private worker.WToken[] refreshTokens(App* app, const(char)[] path,
     if (auto hp = path.idup in app.tokHash)
         if (*hp == h)
             return app.tokCache[path.idup];
-    worker.WToken[] toks;
+    ops.WToken[] toks;
     if (workerSemanticRetry(app, path, text, toks))
     {
         app.tokCache[path.idup] = toks;
@@ -1243,7 +1133,7 @@ private void sendWatchRegistration(App* app)
 }
 
 // LSP SemanticTokens result (delta-encoded data) for a token list.
-private string tokensResultJson(worker.WToken[] toks)
+private string tokensResultJson(ops.WToken[] toks)
 {
     auto js = jmake();
     auto res = js.create_object();
@@ -1273,27 +1163,14 @@ private string tokensResultJson(worker.WToken[] toks)
     return printJsonStr(res);
 }
 
-// Analyze + publish diagnostics + precompute tokens for one document.
-// `realOnly` is true for open/save (diagnostics must be exact) and false for
-// the debounced keypress analyze (reuse a live universe when possible).
-private void publishFor(App* app, const(char)[] path, const(char)[] text,
-    bool realOnly = false)
+// Analyze + publish diagnostics + precompute tokens for one document (open,
+// save, and the debounced pass after edits).
+private void publishFor(App* app, const(char)[] path, const(char)[] text)
 {
-    worker.WAnalysis a;
-    if (!workerAnalyzeRetry(app, path, text, a, realOnly))
+    ops.WAnalysis a;
+    if (!workerAnalyzeRetry(app, path, text, a))
         return;
     clearPending(app, path);
-    // Trivia-only save: the program is unchanged, so keep the previously
-    // published diagnostics instead of re-analysing. The worker invalidated
-    // its universe (positions moved); drop position-keyed caches so the next
-    // semantic pull rebuilds.
-    if (a.unchanged)
-    {
-        app.cache.remove(path.idup);
-        app.tokCache.remove(path.idup);
-        app.tokHash.remove(path.idup);
-        return;
-    }
     app.cache[path.idup] = HitCache(a);
     auto js = jmake();
     auto diags = buildDiagnostics(js, a);
@@ -1327,7 +1204,7 @@ private void flushPending(App* app)
         else
             text = sessionReadDisk(p);
         if (text)
-            publishFor(app, p, text, false);
+            publishFor(app, p, text);
         clearPending(app, p);
     }
 }
@@ -1422,29 +1299,6 @@ private void applyConfig(App* app, JsonNode* node)
     {
         app.fullTypeHover = jbool(fh, true);
         app.fullTypeHoverSet = true;
-    }
-    if (auto mw = jget(obj, "maxWorkers"))
-    {
-        long v = jint(mw);
-        if (v > 0 && v <= 64)
-        {
-            app.maxWorkers = cast(uint) v;
-            app.maxWorkersSet = true;
-        }
-    }
-    if (auto sr = jget(obj, "sharedRegistry"))
-    {
-        app.sharedRegistry = jbool(sr, false);
-        app.sharedRegistrySet = true;
-    }
-    if (auto mm = jget(obj, "maxModules"))
-    {
-        long v = jint(mm);
-        if (v > 0 && v <= 1_000_000)
-        {
-            app.sharedMaxModules = cast(uint) v;
-            app.sharedMaxModulesSet = true;
-        }
     }
 }
 
@@ -1619,35 +1473,6 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         fc.hasFullTypeHover = true;
         fc.fullTypeHover = jbool(fh, true);
     }
-    if (auto mw = jget(doc, "maxWorkers"))
-    {
-        if ((mw.type & 0xFF) == JsonNumber)
-        {
-            long v = jint(mw);
-            if (v > 0 && v <= 64)
-            {
-                fc.hasMaxWorkers = true;
-                fc.maxWorkers = cast(uint) v;
-            }
-        }
-    }
-    if (auto sr = jget(doc, "sharedRegistry"))
-    {
-        fc.hasSharedRegistry = true;
-        fc.sharedRegistry = jbool(sr, false);
-    }
-    if (auto mm = jget(doc, "maxModules"))
-    {
-        if ((mm.type & 0xFF) == JsonNumber)
-        {
-            long v = jint(mm);
-            if (v > 0 && v <= 1_000_000)
-            {
-                fc.hasSharedMaxModules = true;
-                fc.sharedMaxModules = cast(uint) v;
-            }
-        }
-    }
     // Raw dmd flags (e.g. -preview=rvaluerefparam, -betterC, -version=Foo).
     fc.flags = jstrArray(jget(doc, "flags"));
     app.fileCfg = fc;
@@ -1659,12 +1484,7 @@ private Notice loadFileConfig(App* app, const(char)[] root)
         app.autoImports = fc.autoImports;
     if (!app.fullTypeHoverSet && fc.hasFullTypeHover)
         app.fullTypeHover = fc.fullTypeHover;
-    if (!app.maxWorkersSet && fc.hasMaxWorkers)
-        app.maxWorkers = fc.maxWorkers;
-    if (!app.sharedRegistrySet && fc.hasSharedRegistry)
-        app.sharedRegistry = fc.sharedRegistry;
-    if (!app.sharedMaxModulesSet && fc.hasSharedMaxModules)
-        app.sharedMaxModules = fc.sharedMaxModules;
+
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -1696,12 +1516,6 @@ private void clearFileConfig(App* app)
         app.autoImports = false;
     if (!app.fullTypeHoverSet)
         app.fullTypeHover = true;
-    if (!app.maxWorkersSet)
-        app.maxWorkers = defaultMaxWorkers;
-    if (!app.sharedRegistrySet)
-        app.sharedRegistry = defaultSharedRegistry;
-    if (!app.sharedMaxModulesSet)
-        app.sharedMaxModules = 2048;
     if (app.inlayHints != prevHints)
         sendInlayHintRefresh(app);
     refreshImports(app);
@@ -2125,8 +1939,11 @@ private void handleMessage(App* app, ref RawMsg m)
                 sessionOpen(app.session, path, text);
                 if (!isDlsJson(path))
                 {
-                    pushDocToPool(app, path, text);
-                    publishFor(app, path, text, true);
+                    // An editor may open a buffer that differs from disk
+                    // (unsaved, restored session): that counts as an edit.
+                    auto disk = sessionReadDisk(path);
+                    pushDocToPool(app, path, text, disk is null || disk != text);
+                    publishFor(app, path, text);
                 }
             }
             else if (m.method == "textDocument/didChange")
@@ -2177,7 +1994,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 // completion already built the current buffer), so the doc is
                 // analyzed without saving, without a rebuild per key.
                 sessionUpdate(app.session, path, base);
-                pushDocToPool(app, path, base);
+                pushDocToPool(app, path, base, true);
                 markPending(app, path);
                 // Restart the debounce clock only on an *edit*. Read-only
                 // requests (hover, completion, inlay hints, token pulls, ...)
@@ -2221,19 +2038,19 @@ private void handleMessage(App* app, ref RawMsg m)
                     if (text)
                     {
                         sessionUpdate(app.session, path, text);
-                        pushDocToPool(app, path, text);
-                        publishFor(app, path, text, true);
+                        pushDocToPool(app, path, text, true);
+                        publishFor(app, path, text);
                     }
                 }
                 else if (auto d = sessionFind(app.session, path))
                 {
                     if (d.text)
-                        publishFor(app, path, d.text, true);
+                        publishFor(app, path, d.text);
                 }
                 else if (auto disk = sessionReadDisk(path))
                 {
                     sessionUpdate(app.session, path, disk);
-                    publishFor(app, path, disk, true);
+                    publishFor(app, path, disk);
                 }
             }
             else if (m.method == "workspace/didChangeWatchedFiles")
@@ -2256,9 +2073,10 @@ private void handleMessage(App* app, ref RawMsg m)
                             continue;
                         if (isDFilePath(path))
                         {
-                            // A workspace source changed: every worker's
-                            // symbol index is stale. Rebuild lazily.
-                            poolInvalidateIndex(app);
+                            // A workspace source changed on disk: the
+                            // symbol index is stale (rebuilt lazily), and so
+                            // is a dependency level that loaded it.
+                            poolInvalidateIndex(app, path);
                             continue;
                         }
                         if (!isDlsJson(path))
@@ -2272,8 +2090,12 @@ private void handleMessage(App* app, ref RawMsg m)
                 }
             }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            log("%.*s failed: %.*s", cast(int) m.method.length, m.method.ptr,
+                cast(int) ex.msg.length, ex.msg.ptr);
+            foreach (line; ex.info)
+                log("  %.*s", cast(int) line.length, line.ptr);
         }
         return;
     }
@@ -2429,7 +2251,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 auto prefix = extractPrefix(text, line, col);
                 if (lineIsImport(text, line))
                     ensureIndex(app, path); // module/member completion needs it
-                worker.WItem[] witems;
+                ops.WItem[] witems;
                 if (workerCompleteRetry(app, path, atext, text, line, col, prefix, witems))
                 {
                     foreach (ref it; witems)
@@ -2481,7 +2303,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     !prefixAfterDot(text, line, col, prefix.length))
                 {
                     ensureIndex(app, path);
-                    worker.WIndexSym[] cands;
+                    ops.WIndexSym[] cands;
                     if (workerImportRetry(app, prefix, path, cands, true))
                     {
                         bool[string] have;
@@ -2541,7 +2363,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            worker.WSig sig;
+            ops.WSig sig;
             auto js = jmake();
             if (workerSignatureRetry(app, path, atext, text, line, col, sig) && sig.found)
             {
@@ -2589,7 +2411,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "[]");
                 return;
             }
-            worker.WHint[] hints;
+            ops.WHint[] hints;
             if (workerInlayHintsRetry(app, path, text, text, hints))
             {
                 auto js = jmake();
@@ -2663,8 +2485,8 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             ensureIndex(app, path); // incoming calls are workspace-wide
-            worker.WCallItem[] items;
-            worker.WCall[] calls;
+            ops.WCallItem[] items;
+            ops.WCall[] calls;
             if (workerCallHierarchyRetry(app, path, text, text, line, col, mode,
                 items, calls))
             {
@@ -2751,7 +2573,7 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             if (mode == "subtypes")
                 ensureIndex(app, path); // subtypes are workspace-wide
-            worker.WTypeItem[] items;
+            ops.WTypeItem[] items;
             if (workerTypeHierarchyRetry(app, path, text, text, line, col, mode,
                 items))
             {
@@ -2785,7 +2607,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 lspRespond(m.idJson, "null");
                 return;
             }
-            worker.WFold[] folds;
+            ops.WFold[] folds;
             if (workerFoldingRetry(app, text, folds))
             {
                 auto js = jmake();
@@ -2829,7 +2651,7 @@ private void handleMessage(App* app, ref RawMsg m)
             string[] dirs = app.stringPaths.dup;
             if (auto pd = dirOf(path))
                 dirs ~= pd;
-            worker.WLink[] links;
+            ops.WLink[] links;
             if (workerDocumentLinksRetry(app, text, dirs, links))
             {
                 auto js = jmake();
@@ -2880,7 +2702,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            worker.WRef[] locs;
+            ops.WRef[] locs;
             if (workerDocumentHighlightRetry(app, path, atext, text, line, col, locs))
             {
                 auto js = jmake();
@@ -2934,7 +2756,7 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             string atext = analysisText(text, line, col);
             ensureIndex(app, path); // enables workspace-wide implementation search
-            worker.WRef[] locs;
+            ops.WRef[] locs;
             if (workerImplementationRetry(app, path, atext, text, line, col, locs))
             {
                 auto js = jmake();
@@ -2990,7 +2812,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            worker.WDef def;
+            ops.WDef def;
             bool ok = typeDef
                 ? workerTypeDefinitionRetry(app, path, atext, text, line, col, def)
                 : workerDefinitionRetry(app, path, atext, text, line, col, def);
@@ -3073,7 +2895,7 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             string atext = analysisText(text, line, col);
             ensureIndex(app, path); // enables workspace-wide references
-            worker.WRefs refs;
+            ops.WRefs refs;
             if (workerReferencesRetry(app, path, atext, text, line, col,
                 includeDecl, refs))
             {
@@ -3127,7 +2949,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            worker.WPrep prep;
+            ops.WPrep prep;
             if (!workerPrepareRenameRetry(app, path, atext, text, line, col, prep)
                 || !prep.ok || !inProject(app, path))
             {
@@ -3178,7 +3000,7 @@ private void handleMessage(App* app, ref RawMsg m)
             }
             string atext = analysisText(text, line, col);
             ensureIndex(app, path); // completeness needs the import graph
-            worker.WRename rn;
+            ops.WRename rn;
             if (!workerRenameRetry(app, path, atext, text, line, col, newName, rn))
             {
                 lspRespondError(m.idJson, -32803, "rename failed");
@@ -3249,7 +3071,7 @@ private void handleMessage(App* app, ref RawMsg m)
             if (q is null)
                 q = "";
             ensureIndex(app, null);
-            worker.WIndexSym[] syms;
+            ops.WIndexSym[] syms;
             if (workerWorkspaceSymbolRetry(app, q, syms))
             {
                 auto js = jmake();
@@ -3306,7 +3128,7 @@ private void handleMessage(App* app, ref RawMsg m)
                 return;
             }
             string atext = analysisText(text, line, col);
-            worker.WHover hov;
+            ops.WHover hov;
             if (workerHoverRetry(app, path, atext, text, line, col, hov) && hov.found)
             {
                 string value;
@@ -3359,7 +3181,7 @@ private void handleMessage(App* app, ref RawMsg m)
             // then refreshes them.
             if (hasPending(app, path) && app.debounceMs > 0)
             {
-                worker.WToken[] cached;
+                ops.WToken[] cached;
                 if (auto c = path.idup in app.tokCache)
                     cached = *c;
                 lspRespond(m.idJson, tokensResultJson(cached));
@@ -3386,7 +3208,7 @@ private void handleMessage(App* app, ref RawMsg m)
                     text = sessionReadDisk(path);
                 if (hasPending(app, path) && text)
                 {
-                    worker.WAnalysis a;
+                    ops.WAnalysis a;
                     if (workerAnalyzeRetry(app, path, text, a))
                         app.cache[path.idup] = HitCache(a);
                 }
@@ -3485,7 +3307,7 @@ private void handleMessage(App* app, ref RawMsg m)
                                 importInsertPos(text, il, ic);
                                 haveInsert = true;
                             }
-                            worker.WIndexSym[] cands;
+                            ops.WIndexSym[] cands;
                             if (!workerImportRetry(app, nm, path, cands))
                                 continue;
                             foreach (cand; cands)
@@ -3517,7 +3339,7 @@ private void handleMessage(App* app, ref RawMsg m)
                         if (text)
                         {
                             string atext = analysisText(text.idup, sl + 1, sc + 1);
-                            worker.WStub[] stubs;
+                            ops.WStub[] stubs;
                             if (workerImplementRetry(app, path, atext, text,
                                     sl + 1, sc + 1, stubs))
                             {
@@ -3560,20 +3382,6 @@ private void handleMessage(App* app, ref RawMsg m)
         return;
     }
     lspRespondError(m.idJson, -32601, "method not found: " ~ m.method);
-}
-
-private ulong parseHex(const(char)[] s, size_t from, size_t to)
-{
-    ulong v = 0;
-    foreach (i; from .. to)
-    {
-        char c = s[i];
-        v <<= 4;
-        if (c >= '0' && c <= '9') v |= c - '0';
-        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
-    }
-    return v;
 }
 
 private int runCheck(string[] files, string[] imports, string[] stringImports = null,
@@ -3985,16 +3793,56 @@ private string trimAscii(const(char)[] s)
 
 enum dmdLspVersion = "0.3.0";
 
-int main(string[] args)
+// Raw C entry point. We take over druntime's startup so the garbage collector
+// can be chosen from `argv`/env *before* druntime initialises it (the GC is
+// picked lazily on the first allocation, which a D module constructor may
+// trigger). Once chosen it cannot be swapped, so this is the only place the
+// decision can be made. `rt_init`/`rt_term` then do what `_d_run_main` would.
+extern (C) int main(int argc, char** argv)
 {
-    // Worker mode: this process is a spawned analysis child. Scan every
-    // argument: a spawn that omits argv[0] makes `--worker` arrive as args[0].
-    foreach (a; args)
-        if (a == "--worker")
-        {
-            workerMain();
-            return 0;
-        }
+    // dmd runs in this process on memory levels (layers.d): select the GC
+    // that implements them before the runtime starts.
+    import layers : layersSelect;
+    layersSelect();
+    // A fault in dmd (a null dereference on broken code) must fail the
+    // request, not the server: have druntime turn SIGSEGV into an Error the op
+    // guard catches. Installed before the runtime starts, so the memory-level
+    // write-fault handler goes on top and forwards everything else to it.
+    version (linux) version (X86_64)
+    {
+        import etc.linux.memoryerror : registerMemoryErrorHandler;
+        registerMemoryErrorHandler();
+    }
+    import core.runtime : rt_init, rt_term;
+    if (rt_init() == 0)
+        return 1;
+    int rc;
+    try
+        rc = dmdLspMain(rtArgs(argc, argv));
+    catch (Throwable)
+        rc = 1;
+    rt_term();
+    return rc;
+}
+
+// Rebuild the D argument vector after `rt_init`. Drop druntime's own
+// `--DRT-*` options (as `_d_run_main` does): they are not application files.
+private string[] rtArgs(int argc, char** argv)
+{
+    import core.stdc.string : strlen;
+    string[] args;
+    foreach (i; 0 .. argc)
+    {
+        auto a = (cast(const(char)*) argv[i])[0 .. strlen(argv[i])];
+        if (a.length >= 6 && a[0 .. 6] == "--DRT-")
+            continue;
+        args ~= a.idup;
+    }
+    return args;
+}
+
+private int dmdLspMain(string[] args)
+{
 
     string[] imports;
     string[] stringImports;
@@ -4015,6 +3863,11 @@ int main(string[] args)
             check = true;
         else if (a == "--stdio")
             stdio_ = true;
+        else if (a == "--region-gc" || a == "--no-region-gc")
+        {
+            // GC selection already happened pre-runtime (selectGC); accepted
+            // here so it is not mistaken for a file argument.
+        }
         else if (a.length > 9 && a[0 .. 9] == "--import=")
             imports ~= a[9 .. $].idup;
         else if (a.length > 16 && a[0 .. 16] == "--string-import=")
@@ -4038,7 +3891,7 @@ int main(string[] args)
         }
         else if (a == "--help" || a == "-h")
         {
-            printf("usage: dmd-lsp [--stdio] [--check FILE...] [--import=DIR]... [--string-import=DIR]... [--flag=FLAG]... [--debounce-ms=N]\n");
+            printf("usage: dmd-lsp [--stdio] [--check FILE...] [--import=DIR]... [--string-import=DIR]... [--flag=FLAG]... [--debounce-ms=N] [--no-region-gc]\n");
             return 0;
         }
         else
@@ -4051,7 +3904,7 @@ int main(string[] args)
     // the analysis runs on the debounce idle (so the unsaved doc is analysed
     // without a save), reusing the live universe when the text is unchanged
     // since the last build. open/save force a real rebuild for exact
-    // diagnostics. All dmd work happens in the worker (worker.d); the
+    // diagnostics. All dmd work happens in the worker (ops.d); the
     // parent holds no dmd state, so nothing accumulates across rebuilds.
     App app;
     app.debounceMs = debounceMs;
@@ -4059,24 +3912,6 @@ int main(string[] args)
     app.baseImports = imports;
     app.baseStringImports = stringImports;
     app.baseFlags = flags;
-    // `DMD_LSP_SHARED` / `DMD_LSP_SHARED_MAX_MODULES` override config (tests).
-    {
-        import core.stdc.stdlib : getenv, atol;
-        if (getenv("DMD_LSP_SHARED") !is null)
-        {
-            app.sharedRegistry = true;
-            app.sharedRegistrySet = true;
-        }
-        if (auto e = getenv("DMD_LSP_SHARED_MAX_MODULES"))
-        {
-            auto v = atol(e);
-            if (v > 0)
-            {
-                app.sharedMaxModules = cast(uint) v;
-                app.sharedMaxModulesSet = true;
-            }
-        }
-    }
     refreshImports(&app);
     version (Posix)
         signal(SIGPIPE, SIG_IGN); // client may close stdout

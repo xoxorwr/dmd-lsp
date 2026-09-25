@@ -6359,7 +6359,7 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
         }
         Type t = cle.type.typeSemantic(cle.loc, sc);
         auto init = initializerSemantic(cle.initializer, sc, t, INITnointerpret, global.errorSink);
-        auto e = initializerToExpression(init, t, sc.inCfile);
+        auto e = initializerToExpression(init, sc, t, eSink);
         if (!e)
         {
             eSink.error(cle.loc, "cannot convert initializer `%s` to expression", toChars(init));
@@ -18944,7 +18944,6 @@ void semanticTypeInfo(Scope* sc, Type t)
             if (global.params.useTypeInfo)
             {
                 getTypeInfoType(sd.loc, t, &scx);
-                sd.requestTypeInfo = true;
             }
         }
         else if (!sc.minst)
@@ -18955,7 +18954,6 @@ void semanticTypeInfo(Scope* sc, Type t)
         else
         {
             getTypeInfoType(sd.loc, t, sc);
-            sd.requestTypeInfo = true;
 
             // https://issues.dlang.org/show_bug.cgi?id=15149
             // if the typeid operand type comes from a
@@ -19003,9 +19001,6 @@ void semanticTypeInfo(Scope* sc, Type t)
             }
         }
     }
-
-    /* Note structural similarity of this Type walker to that in isSpeculativeType()
-     */
 
     Type tb = t.toBasetype();
     switch (tb.ty)
@@ -19165,7 +19160,7 @@ Expression getConstInitializer(VarDeclaration vd, bool needFullType = true)
         vd.inuse--;
     }
 
-    Expression e = vd._init.initializerToExpression(needFullType ? vd.type : null);
+    Expression e = vd._init.initializerToExpression(null, needFullType ? vd.type : null, global.errorSink);
     global.gag = oldgag;
     return e;
 }

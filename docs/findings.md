@@ -4,8 +4,9 @@ Engineering notes from making the dmd frontend work as a long-lived library
 (an LSP daemon) that re-analyzes a changing file many times in one process.
 
 Scope: why the naive "init once / reset between requests" approaches leak,
-what the retention actually is, what we tried, what worked, and the current
-recommendation.
+what the retention actually is, what we tried, what worked, and how it ended:
+§12 (memory levels) is the current design and supersedes the process-boundary
+recommendation of §6/§8/§11.
 
 ## 1. The problem
 
@@ -453,6 +454,77 @@ is dereferenced), and swapping in the new module aborts in
 
 A residual ~2.6 MB/edit remains from a member reference held by the `Module`
 itself; see upstream.md patch 6.
+
+## 12. Resolution: memory levels (in-process, exact, no reset list)
+
+§5 showed that exact reclamation needs whole-heap freeing, and failed on two
+counts: a bump region cannot collect *within* an analysis (dmd allocates GBs of
+temporaries, so the peak exploded), and freeing it wholesale left dangling
+every pointer the *surviving* state had taken into it — the endless reset list
+(§5.2, appendix). §11.6 located the real retention: the surviving universe is
+*mutated* to point into the new analysis (imports, instances, interned types).
+Both problems have one answer.
+
+**One druntime GC per level.** A `GC` implementation registered with druntime
+(`src/layers.d`) fronts one `ConservativeGC` *instance* per level. The
+conservative GC can be instantiated several times (`emplace` + its own `Gcx`),
+and its destructor unmaps every pool. So a level collects its own garbage
+normally (no region blow-up), and popping it frees everything at once without
+asking who still points in (no conservative retention). Routing is by pool
+ownership: a pointer-based call (`free`, `realloc`, `query`, the array-capacity
+protocol) goes to the level that owns the block; a block of a *lower* level is
+never freed, grown or re-tagged, only copied.
+
+**Copy-on-write for the levels below.** While a level is on top, the pools of
+the levels under it are `mprotect`ed read-only. dmd's mutations of the
+surviving universe fault on first write; the handler saves the page and makes
+it writable. Pop copies the pages back. Every mutation §11.6 found — and every
+one it did not — is captured by the MMU instead of a list. The saved pages are
+also exactly the roots the top level needs from below (nothing else below can
+point into it), so collections stay cheap.
+
+**Globals by reflection.** Static state is the one part the MMU cannot scope to
+dmd (the data segment is shared with druntime and the server). It is finite:
+compile-time reflection over the vendored modules enumerates module-level and
+class-static variables (~140 KB in 36 merged ranges), plus ~30 function-local
+statics by mangled name. Push snapshots them, pop restores them. The reset
+hooks, `Loc.checkpoint`, `StringTable.removeWhere`, template-instance tracking
+and eviction are all unnecessary: the frontend is vendored as upstream plus
+three LSP hacks and one allocator patch.
+
+Pitfalls found on the way:
+
+- `OutBuffer` allocated with C `malloc`: a global buffer (`Lexer.stringbuffer`)
+  reallocated in a level and then "restored" by the globals snapshot pointed at
+  a freed chunk. All dmd memory must be GC memory: `OutBuffer` now allocates
+  through `Mem` under `version (DMDLIB)`.
+- dmd code running on level 0 (the server's heap, never protected) relocated
+  dmd structures there (the identifier table grew into a level-0 block); later
+  levels then wrote into them unprotected. dmd code must only run with a dmd
+  level as the allocation target.
+- `Gcx.Dtor` never unmaps `toscanRoots` (the parallel-mark root stack): ~0.3 MB
+  leaked per popped level until the destroyer resets it.
+- druntime's array-append cache (`__blkcache`) is thread-local and shared by
+  all heaps: cleared on every push/pop, or it describes unmapped blocks.
+- Reflection's `allMembers` lists selective imports (libc `stderr`) and
+  `@property` getters (a function address): the variable must be declared in
+  the scope being walked, and its address must be a pointer to data.
+- dmd's identifier table is built by a static constructor, i.e. on level 0: it
+  is rebuilt on level 1.
+
+Measured (`tests/layers_probe.d`, `tests/test_memory.py`):
+
+| case | per edit | pop | memory |
+|---|---|---|---|
+| Phobos-heavy root, 86-module deps | ~140 ms analysis, 1.2k dirty pages | ~2 ms | flat over 240 edits, 4 full rebuilds |
+| same, with the warm level (a renamed copy of the root caching library instances) | ~20 ms, 0.9k dirty pages | ~3 ms | flat |
+| `expressionsem.d` (cycle spans the frontend) | ~420 ms (whole cycle) | ~1.7 ms | flat |
+| LSP server, 60 edits / 120 root switches | — | — | ±0 kB RSS |
+
+This is the mechanism the old recommendation asked for ("a druntime-conformant
+region GC", §8) without writing a GC: the conformance comes from druntime's own
+collector, the region comes from instantiating it per level, and the part a
+region could not do — undoing what the survivors did — comes from the MMU.
 
 ## Appendix: representative reset surface (frontend)
 

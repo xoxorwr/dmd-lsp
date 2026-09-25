@@ -719,23 +719,6 @@ private size_t refOffset(const(char)[] text, uint line, uint col)
     return i;
 }
 
-private void offsetLineCol(const(char)[] text, size_t off, out uint line, out uint col)
-{
-    line = 1;
-    col = 1;
-    size_t n = off < text.length ? off : text.length;
-    foreach (i; 0 .. n)
-    {
-        if (text[i] == '\n')
-        {
-            line++;
-            col = 1;
-        }
-        else
-            col++;
-    }
-}
-
 // A source span is trustworthy only if the text at (line, col) actually
 // spells `ident`. Mixin/CTFE-generated symbols get synthetic `Loc`s that point
 // at unrelated source (e.g. a generated `printValue` reported inside `main`),

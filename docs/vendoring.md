@@ -1,18 +1,23 @@
 # Vendoring
 
-`src/dmd/` is a snapshot of `../dmd/compiler/src/dmd` (branch `lsp-fixes`:
-upstream `master` + the patches in [upstream.md](upstream.md)) containing the
-exact `-i` closure plus the two string imports it needs (`VERSION`,
-`res/default_ddoc_theme.ddoc`): **146 files, ~6.9 MB**. It carries the fixes
-listed in [upstream.md](upstream.md), so the build needs no `../dmd` at all —
-only the D compiler's druntime/phobos are external.
+`src/dmd/` is stock upstream dmd — `../dmd-stock`, `master` at `fb655c9`
+(source-identical to `4edd2c3f77`) — cut to the exact `-i` closure plus the two
+string imports it needs (`VERSION`, `res/default_ddoc_theme.ddoc`), with the
+patches in `patches/` applied:
 
-This is packaging, **not a fork**: do not edit files under `src/dmd/`. Fix
-in `../dmd` (with permission), then re-copy. The one exception is the
-tooling-only hacks listed in [hacks.md](hacks.md); those are edited in place
-and are lost (loudly) on the next `make vendor`.
+| patch | what | doc |
+|---|---|---|
+| `h1-no-manifest-expand.patch` | `optimize.d`, `initsem.d` | [hacks.md](hacks.md) H1 |
+| `h2-baseclass-loc.patch` | `dclass.d`, `dsymbolsem.d` | [hacks.md](hacks.md) H2 |
+| `h5-keep-errored-bodies.patch` | `statementsem.d` | [hacks.md](hacks.md) H5 |
+| `outbuffer-mem.patch` | `common/outbuffer.d` | [upstream.md](upstream.md) |
 
-The set is exactly what the frontend imports (nothing extra to strip).
+No other file differs from stock. The build needs no dmd checkout; only the D
+compiler's druntime/phobos are external.
+
+This is packaging, **not a fork**: never edit `src/dmd/` directly. Change a
+patch (edit the vendored file, then regenerate the patch against stock with
+`diff -u`), or add one to `patches/` and document it.
 
 ## Cross-platform
 
@@ -26,32 +31,36 @@ The closure was derived on Linux/x86_64. Extras needed elsewhere:
 - `dmd/iasm.d` and `dmd/backend/symbol.d` are intentionally absent: the
   build sets `-version=NoBackend`, so those imports are compiled out.
 
-`dmd-lsp` is cross-platform: on POSIX the worker is `fork()`ed; on Windows it
-is spawned via `CreateProcess` with `--worker` and the stdio loop waits on the
-stdin handle.
+`dmd-lsp` is a single process on every platform; the memory levels protect
+pages with `mprotect` + a SIGSEGV handler on POSIX and `VirtualProtect` + a
+vectored exception handler on Windows.
 
 ## Refreshing
 
 ```sh
-make vendor   # re-derive the closure from ../dmd and re-copy (+ PLATFORM_EXTRA)
+make vendor                  # from ../dmd-stock: copy the closure, apply patches/, regenerate src/dmdmodules.d
+make vendor DMD_DIR=~/dmd    # from another checkout
+make vendor BRANCH=master    # a ref of $(DMD_DIR), via a temporary worktree
+make check-statics           # the function-local statics list in src/dmdglobals.d is complete
 ```
 
-Run it after pulling the dev tree. Once the patches land upstream, delete
-`src/dmd/`, point `-I` at `../dmd/compiler/src` again, and drop `make vendor`.
+A patch that no longer applies stops the vendor step; refresh it against the
+new stock file and re-check its behaviour (`make check`).
 
 **Always run the [reclamation.md](reclamation.md) vendor-update checklist after
-a refresh.** It is what tells you whether a dmd bump invalidated a reset
-invariant, broke the in-place re-parse field list, or finally unlocked a
-reclamation trigger.
+a refresh**: a new global or a new `malloc` user in dmd is what can break a
+memory level.
 
 ## Makefile
 
 ```sh
-make              # builds ./dmd-lsp (from the vendored src/dmd/)
-make check        # struct-only guard + batch fixtures + LSP regression suite
-make check-no-oop # guard: src/ (outside the vendor) has no class/interface
-make deps         # audit exactly which dmd modules got pulled in
-make vendor       # re-copy the frontend closure from ../dmd
+make                # builds ./dmd-lsp (from the vendored src/dmd/)
+make check          # struct-only guard + batch fixtures + LSP regression suite
+make check-no-oop   # guard: src/ (outside the vendor) has no class/interface
+make check-statics  # guard: every mutable dmd function-local static is snapshotted
+make probe          # tests/layers_probe.d: level push/pop timing and RSS on a file
+make deps           # audit exactly which dmd modules got pulled in
+make vendor         # re-copy the closure from ../dmd-stock and apply patches/
 make clean
 ```
 

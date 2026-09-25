@@ -131,10 +131,14 @@ bool lspRead(RawMsg* outm, ref string body_)
 // Parsed trees and built responses live here; extracting code must dup
 // anything that outlives the current message (session perm arena / idup).
 __gshared Arena jtmp;
+// The arena the helpers below use. The ops layer (ops.d) switches it to its
+// own for the duration of a request, so the front end's in-flight JSON (the
+// request it is sending, the result it is building) survives the op.
+__gshared Arena* jcur = &jtmp;
 
 Json jmake()
 {
-    return Json.create(Allocator(&jtmp));
+    return Json.create(Allocator(jcur));
 }
 
 // Parse a JSON document into jtmp (appends; null on failure).
@@ -149,7 +153,7 @@ JsonNode* jparse(const(char)[] text)
 // NUL-terminated arena copy for C-string JSON APIs.
 const(char)* zstr(const(char)[] s)
 {
-    char* p = cast(char*)jtmp.alloc(s.length + 1);
+    char* p = cast(char*)jcur.alloc(s.length + 1);
     if (!p)
         return null;
     if (s.length)
@@ -206,29 +210,6 @@ bool jbool(JsonNode* n, bool def = false)
     if ((n.type & 0xFF) == JsonFalse)
         return false;
     return def;
-}
-
-size_t jlen(JsonNode* arr)
-{
-    if (!arr || (arr.type & 0xFF) != JsonArray)
-        return 0;
-    size_t n = 0;
-    for (auto c = arr.child; c; c = c.next)
-        n++;
-    return n;
-}
-
-JsonNode* jat(JsonNode* arr, size_t i)
-{
-    if (!arr || (arr.type & 0xFF) != JsonArray)
-        return null;
-    auto c = arr.child;
-    while (c && i > 0)
-    {
-        c = c.next;
-        i--;
-    }
-    return c;
 }
 
 void lspWrite(string jsonBody)

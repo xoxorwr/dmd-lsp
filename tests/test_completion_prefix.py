@@ -13,7 +13,7 @@ ERR = '/tmp/dmd-lsp-prefix.err'
 errf = open(ERR, 'w')
 proc = subprocess.Popen([BIN, '--stdio', '--debounce-ms=400', '--import=/tmp'],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=errf, env=dict(os.environ, DMD_LSP_TRACE_SPAWN='1'))
+                        stderr=errf, env=dict(os.environ, DMD_LSP_TIMING='1'))
 
 fails = []
 def check(name, cond, extra=''):
@@ -51,9 +51,9 @@ def read():
         data += proc.stdout.read(n - len(data))
     return json.loads(data)
 
-def spawns():
+def analyses():
     errf.flush()
-    return open(ERR).read().count('spawn')
+    return open(ERR).read().count('] analyze')
 
 # Advertise semantic tokens too: it turns on the token precompute, which is
 # what clobbered the completion universe when the idle flush fired between
@@ -81,7 +81,7 @@ send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
                                  "version": 1, "text": mk('')}}})
 read()
 time.sleep(0.3)
-before = spawns()
+before = analyses()
 
 counts = []
 for i, ch in enumerate('alpin'):
@@ -103,8 +103,8 @@ for i, ch in enumerate('alpin'):
             counts.append(len([l for l in labels if l not in BUILTIN_PROPS]))
             break
 
-after = spawns()
-check('prefix-one-build', after - before <= 1, 'extra_spawns=%d' % (after - before))
+after = analyses()
+check('prefix-one-build', after - before <= 1, 'extra_analyses=%d' % (after - before))
 check('prefix-filtering', counts == [2, 2, 2, 1, 1], str(counts))
 
 # A partial identifier *after other code* (`auto x = al`) must also
@@ -123,7 +123,7 @@ send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
                                  "version": 1, "text": mk2('')}}})
 read()
 time.sleep(0.3)
-before = spawns()
+before = analyses()
 for i, ch in enumerate('alpin'):
     t = 'alpin'[:i + 1]
     send({"jsonrpc": "2.0", "method": "textDocument/didChange",
@@ -140,9 +140,9 @@ for i, ch in enumerate('alpin'):
             continue
         if m.get('id') == rid:
             break
-after = spawns()
+after = analyses()
 check('word-after-code-one-build', after - before <= 1,
-      'extra_spawns=%d' % (after - before))
+      'extra_analyses=%d' % (after - before))
 
 proc.stdin.close()
 time.sleep(0.2)

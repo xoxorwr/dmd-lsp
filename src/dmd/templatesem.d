@@ -556,8 +556,7 @@ bool declareParameter(TemplateParameter _this, Scope* sc)
  */
 private size_t arrayObjectHash(ref Objects oa1)
 {
-    import dmd.root.hash : mixHash, calcHash;
-    import core.stdc.string : strlen;
+    import dmd.root.hash : mixHash;
 
     size_t hash = 0;
     foreach (o1; oa1)
@@ -565,8 +564,7 @@ private size_t arrayObjectHash(ref Objects oa1)
         /* Must follow the logic of match()
          */
         if (auto t1 = isType(o1))
-            // Hash deco content: equal types can have distinct deco pointers.
-            hash = mixHash(hash, t1.deco ? calcHash(t1.deco[0 .. strlen(t1.deco)]) : 0);
+            hash = mixHash(hash, cast(size_t)t1.deco);
         else if (auto e1 = getExpression(o1))
             hash = mixHash(hash, expressionHash(e1));
         else if (auto s1 = isDsymbol(o1))
@@ -5422,7 +5420,7 @@ private RootObject declareParameter(TemplateDeclaration td, Scope* sc, TemplateP
     /* So the caller's o gets updated with the result of semantic() being run on o
      */
     if (v)
-        o = v._init.initializerToExpression();
+        o = v._init.initializerToExpression(sc, null, global.errorSink);
     return o;
 }
 
@@ -6656,12 +6654,6 @@ private MATCH deduceTypeHelper(Type t, out Type at, Type tparam)
 }
 
 private __gshared Expression emptyArrayElement = null;
-
-/// Reset the module's global state between analyses.
-void deinitialize() nothrow
-{
-    emptyArrayElement = null;
-}
 
 /*
  * Returns `true` if `t` is a reference type, or an array of reference types.

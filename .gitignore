@@ -1,6 +1,7 @@
 # Build artifacts (see Makefile `clean`)
 /dmd-lsp
 /dmd-lsp-ut
+/layers-probe
 *.o
 *.obj
 *.a

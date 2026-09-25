@@ -46,9 +46,9 @@ extern (C++) struct BaseClass
     // are a copy of the InterfaceDeclaration.interfaces
     BaseClass[] baseInterfaces;
 
-    // dmd-lsp (H2): source location of this base's type usage. `type` above is
-    // overwritten with the resolved type during semantic (losing the only Loc),
-    // so keep it here for the language server. Guarded by src/references.d.
+    // dmd-lsp H2 (docs/hacks.md): source location of this base's type usage.
+    // `type` is overwritten with the resolved type during semantic (losing the
+    // only Loc), so keep it here for the language server.
     Loc loc;
 
     extern (D) this(Type type)

@@ -8,7 +8,9 @@ How `dmd-lsp` works and the conventions it is built on.
   self-contained ([vendoring](vendoring.md)). `../dmd` is a read-only
   reference/dev tree — refresh with `make vendor`, never edit `src/dmd/`.
 - Do not edit `../dmd` without explicit permission.
-- Our code is `struct`-only (no `class`/`interface`/inheritance).
+- Our code is `struct`-only (no `class`/`interface`/inheritance), except
+  interop adapters: dmd `Visitor` subclasses, the dmd `ErrorSink` subclass and
+  the `LayeredGC` druntime GC.
 - Our code uses no phobos (`std.*`): JSON comes from the vendored
   `src/json.d` (kdom's `rt.json` adapted: `Arena` allocator, `core.stdc`
   libc, plus a serializer); files via C stdio.
@@ -20,50 +22,101 @@ How `dmd-lsp` works and the conventions it is built on.
 - Toolchain targets the 2.113.0 line (never system dmd). LDC's `ldmd2` is
   supported (`make DC=ldmd2`) and is what CI/nightlies use.
 
-## Memory model: warm workers, in-place re-parse
+## Memory levels
 
-The LSP front end holds only session docs, config and the debounce
-bookkeeping. Analysis runs in a worker process (`worker.d`, cross-platform):
-POSIX `fork()`s the server, Windows spawns this executable with `--worker`;
-either way the child speaks length-prefixed frames over pipes. By default a
-small **pool** of per-file workers is used, one root each, up to `maxWorkers`,
-least-recently-used evicted. `sharedRegistry: true` opts into a single worker
-that keeps every loaded module resident and serves every root; it is off by
-default because it cannot be mutated safely (below). (Pool workers must close
-the other members' pipe fds in the child, or a killed worker never sees EOF and
-the server blocks in `waitpid`.)
+dmd is a singleton compiler: its state is global, and a universe is one fully
+connected graph (parent links, scopes, interned types, template instances).
+Analysing a module *mutates* the modules it imports: instances are cached on
+the imported template, types are interned in a global table, lazily analysed
+functions of imported modules are finished in place. That is why a superseded
+analysis could not be reclaimed in a long-lived process and the server used to
+isolate dmd in worker processes ([findings.md](findings.md)).
 
-The expensive part is the *dependency closure* (for the dmd frontend, ~420 ms:
-~110 ms parse + ~220 ms `dsymbolSemantic` + root bodies). A **root-text-only**
-edit that is safe to reparent is re-parsed in place on the warm closure
-(`dmdReparseModule`), which evicts the previous root module and its interned
-types and parses into the same `Module` so importers' `imp.mod` stay valid.
-The per-generation frontend caches are reset by the patches in
-[upstream.md](upstream.md).
+Everything now runs in the server process, on a stack of **memory levels**
+(`src/layers.d`, `src/engine.d`):
 
-**The safety condition is `!dmdRootHasImporters(root)`** — it is centralized in
-`canIncrementalReparse`. Re-parsing a root that a *resident* module imports
-leaves that importer holding symbols from the replaced AST; dmd's conservative
-GC then keeps the whole universe reachable, so RSS grows per edit. When the
-condition does not hold, the pool rebuilds at the **process boundary**
-(`needRespawn`): the parent discards the worker and the OS reclaims everything.
-A pool worker's closure can itself contain an importer of its root, so "one root
-per worker" is not sufficient — the predicate is checked, not assumed.
+| Level | Holds | Popped when |
+|---|---|---|
+| 0 | the runtime and the server (documents, config, replies) | never |
+| 1 | dmd, configured: identifier table, basic types, import paths, flags | config change |
+| 2 | dependencies: the modules the roots import, analysed like imports | a file it loaded changes, or it would have to contain an edited document |
+| 3 | warm: a copy of the current root under another module name | root switch; an edited document it loaded changes; level 2 rebuilt |
+| 4 | the overlay: the roots analysed since the last change, from their buffers | any document change (lazily, on the next analysis) |
 
-A dependency/config change likewise replies `needRespawn` (or drops every worker
-on a config change), and a root switch is absorbed by the pool when the root is
-warm, otherwise spawning/binding a worker (evicting the LRU when full). Process
-isolation is the reclamation boundary because the conservative GC cannot prove
-a discarded universe unreachable in-process (see [findings.md](findings.md)).
-The decision and the checklist to re-run on every dmd bump are in
-[reclamation.md](reclamation.md).
+The mechanism:
 
-The universe records which buffer it parsed (`analysisHash`) and which
-document version it was keyed to (`rootHash`): that decides whether a request
-is served from the warm universe (`reuse`), re-parsed in place
-(`incremental`) or rebuilt (`miss`). Completion does not participate in this
-classification: it reads the per-root cache the debounce leaves behind (see
-*Completion never analyses*).
+- **One heap per level.** The GC (`LayeredGC`, registered with druntime before
+  `rt_init`) is a front for one druntime `ConservativeGC` instance per level.
+  Allocation goes to the top level while dmd code runs (`levelEnter`), to
+  level 0 otherwise. A level collects its own garbage normally (no region
+  blow-up), and popping it unmaps all of its pools at once, whatever still
+  points into them (no conservative retention).
+- **Lower levels are write-protected.** While level k is on top, the pools of
+  levels 1..k-1 are read-only. The first write to one of their pages faults;
+  the handler (SIGSEGV / vectored exception handler) saves a copy of the page,
+  makes it writable and registers it as a root of level k (only a written page
+  can point into level k). Popping level k copies the saved pages back.
+- **dmd's globals are snapshotted.** `src/dmdglobals.d` lists every mutable
+  static of the vendored frontend: module-level and class-static variables by
+  compile-time reflection over the modules in `src/dmdmodules.d` (generated by
+  `tools/gen-dmdmodules.sh`), function-local statics by mangled name
+  (`make check-statics` fails when the vendored tree gains one). A push
+  snapshots them, a pop restores them.
+
+So popping the overlay returns the dependency level to exactly the bytes it had
+before the edit — template instances, interned types and everything else dmd
+cached are undone without dmd knowing, and nothing accumulates. It is the
+guarantee `fork()` gave, in-process, scoped to dmd, and portable: page
+protection is `mprotect` on POSIX and `VirtualProtect` on Windows.
+
+Rules that keep it sound (checked by `LAYERS_CHECK=1` and the tests):
+
+- **dmd code never runs on level 0.** Ops run in dmd mode (`ops.d`
+  `serveRequest`), so whatever dmd allocates or relocates lands on a dmd level;
+  level 0 is not protected, so a dmd structure moved there would escape the
+  rollback.
+- **Nothing outlives its level.** An `Analysis` is valid until the overlay
+  pops; what must survive longer is copied to level 0 (`levelSuspend`), e.g.
+  diagnostics (`onDiag`), the workspace index, the reference-search key. The
+  JSON reply is the natural copy-out point: it is serialised before the next
+  analysis can pop anything.
+- **All dmd memory is GC memory.** `OutBuffer` allocated with C `malloc`, which
+  no level versions; the vendored `outbuffer.d` routes it through `Mem` (the
+  GC) under `version (DMDLIB)` ([upstream.md](upstream.md)).
+- **dmd's static-constructor state is rebuilt on level 1** (the identifier
+  table): level 0 is never rolled back, so dmd must not write to it.
+
+Why a warm level: every overlay starts from the levels below it, so template
+instances created by the previous analysis are gone, and a Phobos-heavy root
+re-instantiates `format`, `writeln`, `to`, `map`, ... on every edit (~140 ms
+for a 12-line `std.algorithm` sample). Level 3 analyses the root's text once
+under the module name `__dmdlsp_warm`: the instances it creates with
+library-only arguments are cached there and hit by every later analysis of the
+real root (~20 ms for the same sample). Instances over the copy's own types
+never match the real root's and are just dead weight. The copy cannot collide
+with the real root (its module declaration is dropped). A root whose copy
+imports the root itself (an import cycle) runs without a warm level.
+
+What goes on level 2: the imports of the roots (from a parse on a scratch
+level), plus what later overlays had to load from disk. It never holds an
+*edited* document or anything that imports one (a cycle through the root):
+those are loaded in the overlay, from the buffer, on every analysis. Unedited
+open documents may live there (their buffer is the disk text). Level 2 records
+the size and mtime of every file it loaded and is rebuilt when one changes.
+
+Costs, measured with `tests/layers_probe.d` and an LSP client: an overlay pop
+is ~2–3 ms (a thousand saved pages) and a push ~1 ms; a small Phobos-heavy
+root analyses in ~20 ms per edit with the warm level (~140 ms without), about
+30 ms from `didChange` to published diagnostics; the dmd frontend's own
+`expressionsem.d`, whose import cycle spans the frontend, re-analyses the whole
+cycle per edit (~420 ms) — the price of never serving an importer stale
+symbols. RSS is flat over hundreds of edits and full rebuilds
+(`tests/test_memory.py`).
+
+Failure recovery: an op that throws (a dmd assert, or a segfault turned into an
+`Error` by druntime's memory-error handler) is logged, every dmd level is
+dropped (`engineHardReset`) and the request fails; the next one starts from a
+fresh level 1 in the same process (`tests/test_crash.py`).
 
 ## Semantic pipeline
 
@@ -98,7 +151,7 @@ classification: it reads the per-root cache the debounce leaves behind (see
   *before* it sends `workspace/semanticTokens/refresh`, so the client's
   re-pull is a pure cache hit — the editor never waits on a scan/resolve.
   So the debounce governs analysis even though tokens are pulled eagerly.
-  Token resolution runs against the universe built from the real text, so
+  Token resolution runs against the analysis of the real text, so
   highlighting never depends on completion request order. Locals the
   pre-semantic snapshot knows but semantic dropped are classified from the
   snapshot, so the real, potentially-invalid buffer still highlights. The
@@ -106,62 +159,43 @@ classification: it reads the per-root cache the debounce leaves behind (see
   initializer (`auto q = Point(...)`, `new Point(...)`,
   `auto s = factory!(State)()`), so member access above the error keeps its
   `property`/`method` colour.
-- dmd's message-kind output is rerouted to stderr: it
-  bypasses `DiagnosticHandler` straight to stdout, which would corrupt LSP
-  framing. `initDMD` leaves the lexer identifier tables unset (stock sets
+- dmd's message-kind output (`pragma(msg)`) is rerouted to stderr by
+  replacing the compiler's `ErrorSink` (`LspErrorSink`): it bypasses
+  `DiagnosticHandler` straight to stdout, which would corrupt LSP framing. (It
+  used to be caught by swapping fd 1 around each analysis, which is not stable
+  for a process that also writes the LSP stream on Windows.) `initDMD` leaves the lexer identifier tables unset (stock sets
   them from CLI flags), which segfaults on the first non-ASCII identifier —
   initialized like stock does.
 
-## Universe cache
+## Analysis cache
 
-The warm universe (`server.Universe`) is reused while inputs are identical —
-same root text (`fnv1a64`), same dep disk bytes (hashes recorded from
-`Module.src`), same config generation. A request the warm universe can answer
-is served with zero dmd work; the residual cost is piping the document in. A
-**root-text-only** miss is handled by `serverAnalyzeIncremental`
-(evict root, re-analyze it in place on the warm closure), see *Memory model*. A miss for any other reason (different
-root, config generation, dep bytes) replies `needRespawn`.
-
-Deps are fingerprinted from the bytes dmd consumed (`Module.src`): disk bytes
-for an unopened file, and the pushed **open-doc mirror** for a draft (H4,
-[hacks.md](hacks.md#h4-filemanagersetfilecontents--replaceable-file-contents-open-doc-mirror)),
-so an unsaved dependency edit invalidates the closure immediately. A same-text
-`didChange` still marks pending, so a change on disk under an open buffer is
-re-checked.
+The overlay is the cache. `engineAnalyze(path, text)` returns the overlay's
+analysis when it holds this exact text and nothing changed since; otherwise the
+overlay is popped (restoring level 2) and the root is analysed in a fresh one.
+Several roots share an overlay: analysing another file (a reference candidate,
+a hierarchy item, an open importer) adds it on top of the same dependencies.
 
 ### Completion never analyses
 
-Completion answers from the **warm universe**, never by re-parsing the buffer
-mid-typing. The worker keeps a per-root cache (`ServerState.roots`, path → the
-last `Analysis` of that file), written by every open/save/debounce analysis. The
-`complete` op looks the document's path up there and completes against it — it
-touches no semantic state and forks no child. When the cache is cold (the first
-request, or a dependency edit forced a full reset that freed every module
-pointer, dropping all cached roots), that one request falls back to an analysis
-and re-caches it, rather than returning an empty list. Read-only requests
-(hover, definition, signature, tokens, highlights, symbols) share this behaviour.
+Completion answers from the analysis the overlay already holds for the file,
+never by re-parsing the buffer mid-typing. Nothing pops the overlay until the
+next analysis, so after an edit the previous analysis stays valid (and is used)
+until the debounced pass replaces it. When there is none (first request, or the
+overlay was dropped), that one request analyses. Read-only requests (hover,
+definition, signature, tokens, highlights, symbols) share this behaviour.
 
 The one freshness cost is a **debounce**: as-you-type completion can be one idle
 cycle behind the last edit. That is invisible in practice because a member name
-growing after a dot does not change the enclosing declarations, and it is the
-price of removing the per-keystroke process. `tests/test_realworld.py` locks the
-spawn accounting, and `tests/test_spawn.py` waits for the flush before asserting
-an edit is reflected.
+growing after a dot does not change the enclosing declarations.
 
 Keeping bodies of a broken buffer usable is H5
 ([hacks.md](hacks.md#h5-lspkeeperroredbodies--keep-a-body-past-a-broken-statement)):
 `visitCompound` no longer discards the whole function on the first bad
 statement, so the real-text analysis keeps the function's scope. Neutralisation
-still exists and is still used by **signature help** (and `mapFixDiags` rewrites
-placeholder columns back): the request is analysed against a variant of the
-buffer where a partial member after a dot is replaced with `__dmd_lsp_ph()`
-plus an appended unconstrained UFCS template. Completion no longer uses it.
-
-The debounce itself refreshes the universe: re-parse the edited root in place
-(`serverAnalyzeIncremental`) when it is the live universe's root, otherwise warm
-the shared registry (`serverAnalyzeShared`, or a full `serverAnalyze` when a
-dependency changed). For the pool (`sharedRegistry: false`) the same logic runs
-against the worker's single universe.
+is still used by **signature help** (and `mapFixDiags` rewrites placeholder
+columns back): the request is analysed against a variant of the buffer where a
+partial member after a dot is replaced with `__dmd_lsp_ph()` plus an appended
+unconstrained UFCS template. A variant gets an overlay of its own.
 
 ## Request loop
 
@@ -174,7 +208,7 @@ keystrokes whose gap is *below* it, and a realistic typing cadence has
 The idle clock is restarted by `didChange` **only**, so a read-only request
 (hover, completion, inlay hints, token pulls) never postpones a pending
 analysis. The debounced analysis is the only thing that advances the semantic
-universe — and it publishes its result, so live diagnostics include semantic
+overlay — and it publishes its result, so live diagnostics include semantic
 errors, not just syntax. Completion reads the cache it leaves behind (see
 *Completion never analyses*). Each pending path is always unmarked by the
 flush, even on failure — a pending path that survives makes the idle loop retry
@@ -189,9 +223,9 @@ debounced build precomputes the new set before its
 
 ## Status
 
-Verified by `make check` (384 assertions across the LSP, semantic-token,
-completion-burst/prefix/scope, real-world session, broken-body, universe-cache,
-debounce, config and memory suites) plus stress runs against real dmd sources
+Verified by `make check` (413 assertions across the LSP, semantic-token,
+completion-burst/prefix/scope, real-world session, broken-body, cache,
+debounce, config, memory and crash-recovery suites) plus stress runs against real dmd sources
 (378 KB full frontend semantic, and the kdom game):
 
 - Diagnostics (compiler errors as you type, incl. broken code), unused
@@ -244,21 +278,19 @@ debounce, config and memory suites) plus stress runs against real dmd sources
   dump the whole file). Doc comment appended as Markdown.
 - Semantic survives parse-errored buffers (only import-load errors gate it),
   so mixin expansion, `auto` inference and visibility work while typing.
-- Universe cache: repeated requests ~free (13× on the stress file); edits
-  re-parse in place; RSS flat over dozens of rebuilds.
+- In-process memory levels: repeated requests free; an edit re-analyses the
+  overlay on warm dependencies; RSS flat over edits, root switches and
+  rebuilds; dmd failures recovered in-process.
 - `--check` batch mode for CI.
 
 ## Known limitations
 
-- Changed dependencies/config rebuild the whole universe: re-analysis
-  costs full dep semantic (~0.4 s on the stress file, ~10 ms on small files).
-  Deliberate: dmd interns canonical types by mangled deco, so re-parsing a
-  changed root in a live universe collides with its own previous
-  declarations, and template instantiations over root-local types would
-  reuse stale instances — module-level eviction is unsound without dmd-side
-  type-table support.
-- Hit requests still pipe the whole document (~380 KB here), ~20 ms of the
-  33 ms hit; hashing instead of shipping the text is a later optimisation.
+- A root in an import cycle re-analyses the whole cycle per edit (its
+  importers cannot live below it). For the dmd frontend itself that is
+  ~420 ms. A body-only edit could be spliced into the dependency level's
+  declarations instead — safe now that every mutation is rolled back — but that
+  fast path is not built.
+- Changed dependencies/config rebuild the dependency level (~0.1–0.5 s).
 - Whole-line import granularity (selective `import m : a, b` is
   used-if-any-bound-used); no unused-local lint yet.
 - Graceful degradations fall back to empty: UFCS candidates, dot-completion

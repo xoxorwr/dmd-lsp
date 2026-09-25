@@ -126,7 +126,7 @@ errf = open(ERR, 'w')
 proc = subprocess.Popen(
     [BIN, '--stdio', '--debounce-ms=250', '--import=' + SRC],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errf,
-    env=dict(os.environ, DMD_LSP_TRACE_SPAWN='1'))
+    env=dict(os.environ, DMD_LSP_TIMING='1'))
 
 fails = []
 def check(name, cond, extra=''):
@@ -162,9 +162,9 @@ def pump(mid, refresh=True):
         if m.get('id') == mid:
             return m
 
-def spawns():
+def analyses():
     errf.flush()
-    return open(ERR).read().count('spawn')
+    return open(ERR).read().count('] analyze')
 
 def request(method, params):
     global _id
@@ -197,8 +197,10 @@ while True:
         continue
     if m.get('method') == 'textDocument/publishDiagnostics':
         break
-open_spawns = spawns()
-check('open-no-subprocess', open_spawns == 0, 'spawns=%d' % open_spawns)
+open_analyses = analyses()
+check('open-one-analysis', open_analyses == 1, 'analyses=%d' % open_analyses)
+kids = subprocess.run(['pgrep', '-P', str(proc.pid)], capture_output=True, text=True).stdout.split()
+check('no-subprocess', not kids, str(kids))
 
 lines = MAIN.split('\n')
 dot_line = next(i for i, l in enumerate(lines) if l.strip() == 'w.assets.')
@@ -210,7 +212,7 @@ def with_member(m):
     return '\n'.join(l)
 
 # --- real typing: pipeline didChange + completion per key, cancelling prev ---
-before = spawns()
+before = analyses()
 prev = None
 cids = []
 for i, ch in enumerate('load'):
@@ -237,13 +239,13 @@ while len(typed_items) < len(cids):
     if m.get('id') in cids:
         r = m.get('result', {})
         typed_items[m['id']] = [i['label'] for i in r.get('items', [])]
-typing_spawns = spawns() - before
+typing_analyses = analyses() - before
 check('typing-completion-items', 'load' in typed_items.get(cids[-1], []),
       str(typed_items.get(cids[-1])))
-check('typing-bounded-builds', typing_spawns <= 2, 'extra_spawns=%d' % typing_spawns)
+check('typing-bounded-builds', typing_analyses <= 2, 'extra_analyses=%d' % typing_analyses)
 
 # --- deletes, same pipelined pattern ---
-before = spawns()
+before = analyses()
 prev = None
 dids = []
 for i, member in enumerate(['loa', 'lo', 'l', '']):
@@ -266,8 +268,8 @@ while len(dids):
         continue
     if m.get('id') in dids:
         dids.remove(m['id'])
-delete_spawns = spawns() - before
-check('delete-bounded-builds', delete_spawns <= 2, 'extra_spawns=%d' % delete_spawns)
+delete_analyses = analyses() - before
+check('delete-bounded-builds', delete_analyses <= 2, 'extra_analyses=%d' % delete_analyses)
 
 # --- hover + goto on a real symbol (a type use, stable in a broken buffer) ---
 wl = next(i for i, l in enumerate(lines) if l.strip() == 'World w;')
@@ -325,9 +327,9 @@ while True:
     if m.get('method') == 'textDocument/publishDiagnostics':
         break
 
-total = spawns()
+total = analyses()
 # open + world open + a couple of atext builds for the typing/deleting above.
-check('session-bounded-builds', total <= 8, 'total_spawns=%d' % total)
+check('session-bounded-builds', total <= 8, 'total_analyses=%d' % total)
 
 send({"jsonrpc": "2.0", "id": 9999, "method": "shutdown", "params": {}})
 read()

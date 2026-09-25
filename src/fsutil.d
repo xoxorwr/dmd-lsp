@@ -133,3 +133,40 @@ else version (Windows)
         while (FindNextFileA(h, &fd));
     }
 }
+
+// Size and modification time of `path` folded into one value, 0 when it
+// cannot be stat'ed. Cheap change detection for files dmd loaded from disk.
+ulong fileStamp(const(char)[] path) nothrow
+{
+    import core.stdc.stdlib : malloc, free;
+
+    auto z = cast(char*) malloc(path.length + 1);
+    if (z is null)
+        return 0;
+    scope (exit)
+        free(z);
+    z[0 .. path.length] = path[];
+    z[path.length] = 0;
+    version (Posix)
+    {
+        import core.sys.posix.sys.stat : stat, stat_t;
+
+        stat_t st;
+        if (stat(z, &st) != 0)
+            return 0;
+        return (cast(ulong) st.st_mtim.tv_sec * 1_000_000_007UL + st.st_mtim.tv_nsec)
+            ^ (cast(ulong) st.st_size << 1) | 1;
+    }
+    else version (Windows)
+    {
+        import core.sys.windows.winbase : GetFileAttributesExA, GET_FILEEX_INFO_LEVELS,
+            WIN32_FILE_ATTRIBUTE_DATA;
+
+        WIN32_FILE_ATTRIBUTE_DATA d;
+        if (!GetFileAttributesExA(z, GET_FILEEX_INFO_LEVELS.GetFileExInfoStandard, &d))
+            return 0;
+        ulong t = (cast(ulong) d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+        ulong n = (cast(ulong) d.nFileSizeHigh << 32) | d.nFileSizeLow;
+        return (t ^ (n << 1)) | 1;
+    }
+}

@@ -2411,7 +2411,7 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             }
             //printf("inferring type for %s with init %s\n", dsym.toChars(), dsym._init.toChars());
             dsym._init = dsym._init.inferInitializerType(sc, dsym.type, global.errorSink);
-            dsym.type = dsym._init.initializerToExpression(null, sc.inCfile).type;
+            dsym.type = dsym._init.initializerToExpression(sc, null, eSink).type;
 
             if (autoDollarDims.length)
             {
@@ -2627,7 +2627,7 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             }
             else
             {
-                Expression ie = dsym._init.initializerToExpression(tsa, sc.inCfile);
+                Expression ie = dsym._init.initializerToExpression(sc, tsa, eSink);
                 if (ie && ie.op != EXP.error)
                 {
                     // Infer from literal syntax first to avoid prematurely
@@ -2783,7 +2783,7 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
              * and add those.
              */
             size_t nelems = Parameter.dim(tt.arguments);
-            Expression ie = (dsym._init && !dsym._init.isVoidInitializer()) ? dsym._init.initializerToExpression(null, sc.inCfile) : null;
+            Expression ie = (dsym._init && !dsym._init.isVoidInitializer()) ? dsym._init.initializerToExpression(sc, null, eSink) : null;
             if (ie)
                 ie = ie.expressionSemantic(sc);
             if (nelems > 0 && ie)
@@ -3290,14 +3290,14 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
                         ArrayInitializer ai = dsym._init.isArrayInitializer();
                         Expression e;
                         if (ai && tb.ty == Taarray)
-                            e = ai.toAssocArrayLiteral(tb, global.errorSink);
+                            e = ai.toAssocArrayLiteral(sc, tb, global.errorSink);
                         else
-                            e = dsym._init.initializerToExpression(dsym.type, sc.inCfile);
+                            e = dsym._init.initializerToExpression(sc, dsym.type, eSink);
                         if (!e)
                         {
                             // Run semantic, but don't need to interpret
                             dsym._init = dsym._init.initializerSemantic(sc, dsym.type, INITnointerpret, global.errorSink);
-                            e = dsym._init.initializerToExpression(null, sc.inCfile);
+                            e = dsym._init.initializerToExpression(sc, null, eSink);
                             if (!e)
                             {
                                 eSink.error(dsym.loc, "%s `%s` is not a static and cannot have static initializer", dsym.kind, dsym.toPrettyChars);
@@ -5574,10 +5574,12 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             for (size_t i = 0; i < cldec.baseclasses.length;)
             {
                 auto b = (*cldec.baseclasses)[i];
-                // dmd-lsp (H2): keep the base-clause location before `type` is
-                // resolved into a loc-less symbolic type.
-                if (auto tq = cast(TypeQualified) b.type)
-                    b.loc = tq.loc;
+                // dmd-lsp H2 (docs/hacks.md): keep the base-clause location
+                // before `type` is resolved into a loc-less symbolic type.
+                // Checked by tag: extern(C++) casts are not checked.
+                if (b.type.ty == Tident || b.type.ty == Tinstance ||
+                    b.type.ty == Ttypeof || b.type.ty == Treturn)
+                    b.loc = (cast(TypeQualified) b.type).loc;
                 b.type = resolveBase(b.type.typeSemantic(cldec.loc, sc));
 
                 Type tb = b.type.toBasetype();
@@ -6226,9 +6228,10 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
             for (size_t i = 0; i < idec.baseclasses.length;)
             {
                 auto b = (*idec.baseclasses)[i];
-                // dmd-lsp (H2): see the class case above.
-                if (auto tq = cast(TypeQualified) b.type)
-                    b.loc = tq.loc;
+                // dmd-lsp H2 (docs/hacks.md): see the class case above.
+                if (b.type.ty == Tident || b.type.ty == Tinstance ||
+                    b.type.ty == Ttypeof || b.type.ty == Treturn)
+                    b.loc = (cast(TypeQualified) b.type).loc;
                 b.type = resolveBase(b.type.typeSemantic(idec.loc, sc));
 
                 Type tb = b.type.toBasetype();
@@ -7610,16 +7613,9 @@ bool determineFields(AggregateDeclaration ad)
  * Returns:
  *  Module of core.stdc.config, null if couldn't find it
  */
-private __gshared Module core_stdc_config;
-
-/// Reset the module's global state between analyses.
-void deinitialize() nothrow
-{
-    core_stdc_config = null;
-}
-
 Module loadCoreStdcConfig()
 {
+    __gshared Module core_stdc_config;
     auto pkgids = new Identifier[2];
     pkgids[0] = Id.core;
     pkgids[1] = Id.stdc;

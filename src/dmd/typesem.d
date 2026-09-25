@@ -3642,6 +3642,9 @@ Type typeSemantic(Type type, Loc loc, Scope* sc)
                 return error();
             }
 
+            __gshared FuncDeclaration feq = null;
+            __gshared FuncDeclaration fcmp = null;
+            __gshared FuncDeclaration fhash = null;
             if (!feq)
                 feq = search_function(ClassDeclaration.object, Id.opEquals).isFuncDeclaration();
             if (!fcmp)
@@ -3879,7 +3882,7 @@ Type typeSemantic(Type type, Loc loc, Scope* sc)
                 sc2.inDefaultArg = true;
                 Initializer iz = new ExpInitializer(e.loc, e);
                 iz = iz.initializerSemantic(sc2, fparam.type, INITnointerpret, eSink);
-                e = iz.initializerToExpression();
+                e = iz.initializerToExpression(sc2, null, eSink);
                 sc2.pop();
             }
             if (e.op == EXP.function_) // https://issues.dlang.org/show_bug.cgi?id=4820
@@ -4932,16 +4935,7 @@ Type merge2(Type type)
         assert(t.deco);
     }
     else
-    {
-        version (DMDLIB)
-        {
-            // Tooling may evict entries during re-analysis; merge anew instead.
-            t.deco = null;
-            return t.merge();
-        }
-        else
-            assert(0);
-    }
+        assert(0);
     return t;
 }
 
@@ -8014,27 +8008,13 @@ Type addStorageClass(Type type, STC stc)
  *      Complex!float, Complex!double, Complex!real or null for error
  */
 
-// Caches for getComplexLibraryType and the AA-key functions; hoisted so deinitialize can reset them.
-private __gshared Type complex_float;
-private __gshared Type complex_double;
-private __gshared Type complex_real;
-private __gshared FuncDeclaration feq = null;
-private __gshared FuncDeclaration fcmp = null;
-private __gshared FuncDeclaration fhash = null;
-
-/// Reset the module's global state between analyses.
-void deinitialize() nothrow
-{
-    complex_float = null;
-    complex_double = null;
-    complex_real = null;
-    feq = null;
-    fcmp = null;
-    fhash = null;
-}
-
 Type getComplexLibraryType(Loc loc, Scope* sc, TY ty)
 {
+    // singleton
+    __gshared Type complex_float;
+    __gshared Type complex_double;
+    __gshared Type complex_real;
+
     Type* pt;
     Identifier id;
     switch (ty)
@@ -8997,7 +8977,8 @@ Type substWildTo(Type type, uint mod)
         //printf("+Type.substWildTo this = %s, mod = x%x\n", toChars(), mod);
         Type t;
 
-        if (Type tn = type.nextOf())
+        Type tn = type.ty == Tenum ? null : type.nextOf();
+        if (tn)
         {
             // substitution has no effect on function pointer type.
             if (type.ty == Tpointer && tn.ty == Tfunction)

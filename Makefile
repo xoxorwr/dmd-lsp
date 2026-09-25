@@ -26,8 +26,9 @@ PLATFORM_EXTRA = root/strtold.d
 
 SRC = src/main.d src/arena.d src/lsp.d src/session.d \
       src/dmdwrap.d src/lexutil.d src/lint.d src/complete.d src/server.d \
-      src/semantic.d src/worker.d src/json.d src/pathutil.d src/symbols.d \
-      src/references.d src/fsutil.d src/timing.d src/log.d
+      src/semantic.d src/ops.d src/json.d src/pathutil.d src/symbols.d \
+      src/references.d src/fsutil.d src/timing.d src/log.d \
+      src/engine.d src/layers.d src/dmdglobals.d src/dmdmodules.d
 
 # Same versions as dmd's own `frontend` dub package, plus DMDLIB for the
 # tooling-oriented lexer API. -preview=dip1000 matches the dmd build.
@@ -67,21 +68,32 @@ $(VSCODE_DIR)/node_modules: $(VSCODE_DIR)/package.json $(VSCODE_DIR)/package-loc
 	cd $(VSCODE_DIR) && npm ci
 
 # Guard: our sources stay struct-only (vendored dmd is excluded). The only
-# exceptions are DMD interop adapters: classes deriving from a dmd `Visitor`
-# (the supported way to traverse the frontend's resolved AST) and `RegionGC`
-# (custom GC).
+# exceptions are interop adapters: classes deriving from a dmd `Visitor` (the
+# supported way to traverse the frontend's resolved AST), the dmd `ErrorSink`
+# that keeps messages off stdout, and `LayeredGC` (the druntime GC implementing
+# memory levels, src/layers.d).
 check-no-oop:
-	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'RegionGC' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
+	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'LayeredGC' | grep -v 'ErrorSink' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
 	@echo "struct-only check ok (interop adapters excepted)"
 
-# Source of the vendored frontend. Defaults to the sibling dev checkout; a
+# Guard: every mutable function-local static of dmd is in the memory-level
+# snapshot (src/dmdglobals.d). Reflection covers module and class statics.
+check-statics: $(BIN)
+	@tools/check-statics.sh ./$(BIN)
+
+# Memory-level probe: push/pop timing, dirty pages and RSS over repeated
+# analyses of one file (see tests/layers_probe.d for the arguments).
+probe: tests/layers_probe.d src/layers.d src/dmdglobals.d src/dmdmodules.d
+	$(DC) $(DFLAGS) tests/layers_probe.d src/layers.d src/dmdglobals.d src/dmdmodules.d -oflayers-probe
+
+# Source of the vendored frontend: stock upstream dmd (../dmd-stock); a
 # different tree or ref can be selected:
 #   make vendor                  # current working tree of $(DMD_DIR)
 #   make vendor DMD_DIR=~/dmd    # vendor from another checkout (absolute path)
 #   make vendor BRANCH=fork      # vendor a branch/ref of $(DMD_DIR)
 # A branch is materialised in a temporary git worktree (detached), so the
 # current checkout of $(DMD_DIR) is left untouched and removed afterwards.
-DMD_DIR ?= ../dmd
+DMD_DIR ?= ../dmd-stock
 BRANCH ?=
 
 # Refresh the vendored snapshot from the dmd dev tree.
@@ -98,11 +110,13 @@ vendor:
 	  -version=MARS -version=NoMain -version=GC -version=NoBackend \
 	  -version=CallbackAPI -version=DMDLIB -preview=dip1000 \
 	  -J"$$src/compiler/src/dmd/res" -J"$$src" -Jstringimp \
-	  $(SRC) -o- -deps >"$$deps" 2>/dev/null || true; \
+	  "$$src/compiler/src/dmd/frontend.d" -o- -deps >"$$deps" 2>/dev/null || true; \
 	if ! grep -q "$$src/" "$$deps"; then \
 	  echo "vendor: no dmd modules resolved from $$src (incompatible branch/ref?)" >&2; \
 	  exit 1; \
 	fi; \
+	rm -rf src/dmd; \
+	mkdir -p src/dmd; \
 	grep -oE "$$src/[^ )]+" "$$deps" | sort -u \
 	  | while read -r p; do \
 	      rel="$${p#"$$src/"}"; \
@@ -114,14 +128,24 @@ vendor:
 	  mkdir -p "src/dmd/$$(dirname $$f)"; \
 	  cp "$$src/compiler/src/dmd/$$f" "src/dmd/$$f"; \
 	done; \
-	echo "vendored $$(find src/dmd -type f | wc -l) files from $$src"
+	mkdir -p src/dmd/res; \
+	cp "$$src/compiler/src/dmd/res/default_ddoc_theme.ddoc" src/dmd/res/; \
+	cp "$$src/VERSION" src/dmd/VERSION; \
+	echo "vendored $$(find src/dmd -type f | wc -l) files from $$src"; \
+	for p in patches/*.patch; do \
+	  patch -s -d src/dmd -p1 --no-backup-if-mismatch < "$$p" \
+	    || { echo "vendor: $$p does not apply; refresh it (docs/vendoring.md)" >&2; exit 1; }; \
+	  echo "applied $$p"; \
+	done; \
+	DC=$(DC) tools/gen-dmdmodules.sh; \
+	echo "now run the docs/reclamation.md checklist"
 
 # Audit exactly which dmd modules got pulled in.
 deps:
 	@$(DC) $(DFLAGS) $(SRC) -of/dev/null -deps 2>/dev/null | sort -u | head -100
 
 # Regression: struct-only guard + batch checks + LSP loop tests.
-check: $(BIN) check-no-oop unittest
+check: $(BIN) check-no-oop check-statics unittest
 	./$(BIN) --check --import=tests tests/u1.d
 	./$(BIN) --check --import=tests tests/u2.d
 	./$(BIN) --check tests/ok.d || true
@@ -149,8 +173,10 @@ check: $(BIN) check-no-oop unittest
 	python3 tests/test_trivia.py
 	python3 tests/test_config.py
 	python3 tests/test_memory.py
+	python3 tests/test_crash.py
+	python3 tests/test_crash.py segv
+	python3 tests/test_editor_session.py
 	python3 tests/test_spawn.py
-	python3 tests/test_pool.py
 	python3 tests/test_index.py
 	python3 tests/test_mirror.py
 	python3 tests/test_sync.py
@@ -162,6 +188,6 @@ unittest: src/pathutil.d src/json.d src/arena.d
 	./$(BIN)-ut
 
 clean:
-	rm -f $(BIN) $(BIN)-ut *.o
+	rm -f $(BIN) $(BIN)-ut layers-probe *.o
 
-.PHONY: all clean check check-no-oop unittest deps vendor vscode vsix
+.PHONY: all clean check check-no-oop check-statics probe unittest deps vendor vscode vsix

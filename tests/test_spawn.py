@@ -1,12 +1,11 @@
 import json, subprocess, sys, time, os
 
-# Analysis runs in-process: the daemon keeps one warm universe and re-parses
-# the root in place on edits, so nothing is ever spawned. The regression
-# guarded here is a stale warm universe that ignores the edit.
+# Analysis runs in-process on memory levels (docs/design.md): an edit drops the
+# overlay and re-analyses the root on the warm levels below, so nothing is ever
+# spawned. The regression guarded here is a stale analysis that ignores the edit.
 
 BIN = './dmd-lsp'
 URI = 'file:///tmp/spawntest.d'
-TRACE = '/tmp/dmd_lsp_spawn_trace.txt'
 
 fails = []
 def check(name, cond, extra=''):
@@ -27,10 +26,8 @@ BUILTIN_PROPS = {
 def members_only(labels):
     return [l for l in labels if l not in BUILTIN_PROPS]
 
-errf = open(TRACE, 'w')
-env = dict(os.environ, DMD_LSP_TRACE_SPAWN='1')
 proc = subprocess.Popen([BIN, '--stdio', '--debounce-ms=150'], stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE, stderr=errf, env=env)
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 def send(obj):
@@ -39,12 +36,10 @@ def send(obj):
     proc.stdin.flush()
 
 
-def wpid():
-    # The worker is a direct child of the server (fork/spawn). A respawn
-    # replaces it, so the pid changing is the signal.
-    out = subprocess.run(['pgrep', '-P', str(proc.pid)],
-                         capture_output=True, text=True).stdout.split()
-    return out[0] if out else '-'
+def children():
+    # Everything runs in the server process: it must never have a child.
+    return subprocess.run(['pgrep', '-P', str(proc.pid)],
+                          capture_output=True, text=True).stdout.split()
 
 
 def read_msg():
@@ -80,14 +75,13 @@ v0b = v0.replace('void main()', '\nvoid main()')
 send({"jsonrpc": "2.0", "method": "textDocument/didSave",
       "params": {"textDocument": {"uri": URI}, "text": v0b}})
 time.sleep(0.4)
-w0 = wpid()
 send({"jsonrpc": "2.0", "id": 90, "method": "textDocument/completion",
       "params": {"textDocument": {"uri": URI}, "position": {"line": 6, "character": 5}}})
 while True:
     msg = read_msg()
     if msg.get('id') == 90:
         break
-check('trivia-save-no-respawn', wpid() == w0, 'pid %s -> %s' % (w0, wpid()))
+check('trivia-save-no-child', not children(), str(children()))
 
 # Version 1 (trailing dot): didChange only marks pending.
 v1 = 'module spawntest;\nstruct S { int x; int y; }\nvoid main()\n{\n    S s;\n    s.\n}\n'
@@ -138,16 +132,14 @@ while True:
 labels = [i['label'] for i in msg['result']['items']]
 check('edit-reflected', members_only(labels) == ['x', 'y', 'z'], str(labels))
 
+# No subprocess: everything runs in-process.
+check('no-subprocess', not children(), str(children()))
+
 send({"jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": {}})
 read_msg()
 send({"jsonrpc": "2.0", "method": "exit", "params": {}})
 proc.stdin.close()
 proc.wait(timeout=5)
-errf.close()
-
-spawns = sum(1 for line in open(TRACE) if 'spawn' in line)
-# No subprocess: everything runs in-process.
-check('no-subprocess', spawns == 0, 'spawns=%d' % spawns)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

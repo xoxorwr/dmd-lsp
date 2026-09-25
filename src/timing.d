@@ -6,7 +6,7 @@ module timing;
 // ad-hoc harnesses.
 
 import core.time : MonoTime;
-import core.stdc.stdio : fprintf, stderr;
+import core.stdc.stdio : fprintf, fflush, stderr;
 import core.stdc.stdlib : getenv;
 
 private int g_enabled = -1;
@@ -34,4 +34,5 @@ void traceMs(const(char)[] phase, ulong ms, const(char)[] extra = null) nothrow
     if (extra.length)
         fprintf(stderr, " (%.*s)", cast(int) extra.length, extra.ptr);
     fprintf(stderr, "\n");
+    fflush(stderr);
 }

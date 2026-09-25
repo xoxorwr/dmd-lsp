@@ -1,17 +1,16 @@
 import json, subprocess, sys, time, os
 
 # Verifies the semantic-token strategy: while an edit is still debounced, a
-# pull is answered from the last token set (no worker build); after the
-# debounced build lands, a workspace/semanticTokens/refresh asks the client
-# to re-pull and the fresh tokens show up. Also asserts the edit does not
-# spawn an extra worker.
+# pull is answered from the last token set (no analysis); after the debounced
+# analysis lands, a workspace/semanticTokens/refresh asks the client to re-pull
+# and the fresh tokens show up. Also asserts the stale pull did not analyse.
 
 BIN = './dmd-lsp'
 FILE = '/tmp/dmd-lsp-semantic.d'
 URI = 'file://' + FILE
 ERR = '/tmp/dmd-lsp-semantic.err'
 
-env = dict(os.environ, DMD_LSP_TRACE_SPAWN='1')
+env = dict(os.environ, DMD_LSP_TIMING='1')
 errf = open(ERR, 'w')
 proc = subprocess.Popen([BIN, '--stdio', '--debounce-ms=500', '--import=/tmp'],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -124,10 +123,10 @@ proc.stdin.close()
 time.sleep(0.2)
 errf.flush()
 errf.close()
-spawns = open(ERR).read().count('spawn')
-# didOpen build + one build for the debounced edit; the stale pull must not
-# have spawned a third worker.
-check('sem-no-per-keystroke-spawn', spawns <= 2, 'spawns=%d' % spawns)
+analyses = open(ERR).read().count('] analyze')
+# didOpen analysis + one for the debounced edit; the stale pull must not
+# have caused a third.
+check('sem-no-per-keystroke-analysis', analyses <= 2, 'analyses=%d' % analyses)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

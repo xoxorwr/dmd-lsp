@@ -14,7 +14,7 @@ ERR = '/tmp/dmd-lsp-burst.err'
 errf = open(ERR, 'w')
 proc = subprocess.Popen([BIN, '--stdio', '--debounce-ms=500', '--import=/tmp'],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=errf, env=dict(os.environ, DMD_LSP_TRACE_SPAWN='1'))
+                        stderr=errf, env=dict(os.environ, DMD_LSP_TIMING='1'))
 
 fails = []
 def check(name, cond, extra=''):
@@ -96,9 +96,9 @@ time.sleep(0.7)
 proc.stdin.close()
 time.sleep(0.2)
 errf.close()
-spawns = open(ERR).read().count('spawn')
+analyses = open(ERR).read().count('] analyze')
 # Bounded, not per-keystroke: didOpen + one atext build + one real build.
-check('burst-bounded-builds', spawns <= 3, 'spawns=%d' % spawns)
+check('burst-bounded-builds', analyses <= 3, 'analyses=%d' % analyses)
 
 print('FAILURES:', fails if fails else 'none')
 sys.exit(1 if fails else 0)

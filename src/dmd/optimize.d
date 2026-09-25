@@ -36,12 +36,9 @@ import dmd.tokens;
 import dmd.typesem;
 import dmd.visitor;
 
-// Tooling-only switch, set by dmd-lsp (see src/worker.d): when set, manifest
-// constants (enum members included) are not substituted by their initializer,
-// so a post-semantic walk still sees the `VarExp`. Off for normal compilation
-// and for diagnostics/completion; on only while resolving references/rename,
-// where the substitution would destroy the member identity. dmd-lsp imports
-// this symbol, so dropping the patch during `make vendor` is a compile error.
+// dmd-lsp H1 (docs/hacks.md): tooling-only switch. When set, manifest
+// constants are not substituted by their initializer, so a post-semantic walk
+// still sees the `VarExp` (references/rename). Off for normal compilation.
 __gshared bool lspNoManifestExpand;
 
 /*************************************

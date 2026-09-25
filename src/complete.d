@@ -3367,13 +3367,6 @@ void resolveSymbolsBatch(Module mod, const ref SynMod syn, const(char)[] text,
     }
 }
 
-// Public: the declaration symbol under the cursor, for references/rename.
-Dsymbol symbolAt(Module mod, const CompleteCtx* ctx, const(char)[] text,
-    const ref SynMod syn)
-{
-    return resolveSymbolAt(mod, syn, ctx.line, ctx.character, text);
-}
-
 // Build a jump target for an already-resolved symbol (dmd's own answer, from
 // `references.resolvedSymbolAt`) or from the text-chain resolver's result.
 void defLocOf(Arena* arena, Dsymbol sym, ref DefLoc out_)
@@ -3950,7 +3943,7 @@ private const(char)[] structInitializerType(const(char)[] text, uint line,
 }
 
 // Import-statement completion: emit caller-provided names (module names, or a
-// module's exported top-level members) directly. No analysis; the worker
+// module's exported top-level members) directly. No analysis; the ops layer
 // supplies the candidates.
 void addImportItems(Arena* arena, ref CompleteOut out_, const(string)[] names,
     const(ubyte)[] kinds, const(char)[] detail)

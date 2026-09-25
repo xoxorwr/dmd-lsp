@@ -239,26 +239,6 @@ struct CtfeGlobals
 
 __gshared CtfeGlobals ctfeGlobals;
 
-/// Re-initialise after the region holding ctfeGlobals' buffers was freed.
-/// Blit `.init`: assignment would run destructors over the freed memory.
-public void reinitAfterRegion() nothrow
-{
-    import core.stdc.string : memcpy;
-    CtfeGlobals z;
-    memcpy(&ctfeGlobals, &z, CtfeGlobals.sizeof);
-}
-
-/// Reset CTFE global state between analyses.
-public void deinitialize() nothrow
-{
-    ctfeGlobals.stack.resetGlobalValues();
-    ctfeGlobals.callDepth = 0;
-    ctfeGlobals.stackTraceCallsToSuppress = 0;
-    ctfeGlobals.maxCallDepth = 0;
-    ctfeGlobals.numArrayAllocs = 0;
-    ctfeGlobals.numAssignments = 0;
-}
-
 enum CTFEGoal : int
 {
     RValue,     /// Must return an Rvalue (== CTFE value)
@@ -302,7 +282,6 @@ private:
      * have to redo them. This saves a lot of time and memory.
      */
     Expressions globalValues;   // values of global constants
-    VarDeclarations savedGlobals; // corresponding declarations (for invalidation)
 
     size_t framepointer;        // current frame pointer
     size_t maxStackPointer;     // most stack we've ever used
@@ -422,16 +401,6 @@ public:
         assert(v._init && (v.isConst() || v.isImmutable() || v.storage_class & STC.manifest) && !v.isCTFE());
         v.ctfeAdrOnStack = cast(uint)globalValues.length;
         globalValues.push(copyRegionExp(e));
-        savedGlobals.push(v);
-    }
-
-    /// Drop the cached global constants and clear their stack indices.
-    void resetGlobalValues() nothrow
-    {
-        foreach (v; savedGlobals)
-            v.ctfeAdrOnStack = VarDeclaration.AdrOnStackNone;
-        savedGlobals.setDim(0);
-        globalValues.setDim(0);
     }
 }
 
@@ -2090,7 +2059,7 @@ public:
         }
     }
 
-    static Expression interpretInitializerExpression(VarDeclaration v)
+    Expression interpretInitializerExpression(VarDeclaration v)
     {
         // It is a bit strange that the interpreter has to deal with initializers
         // at all as they should have been converted to ConstructExp or similar
@@ -2100,7 +2069,7 @@ public:
         // is duplicated in ExpressionSemanticVisitor.visit(AssignExp exp). Until
         // initializer semantics are removed from the interpreter, it has been
         // moved here.
-        Expression iexp = v._init.initializerToExpression(v.type);
+        Expression iexp = v._init.initializerToExpression(null, v.type, eSink);
 
         Type tb = v.type.toBasetype();
         Expression e = (iexp.op == EXP.construct || iexp.op == EXP.blit) ? (cast(AssignExp)iexp).e2 : iexp;
@@ -2202,7 +2171,7 @@ public:
                         eSink.error(loc, "CTFE internal error: trying to access uninitialized var");
                         assert(0);
                     }
-                    e = v._init.initializerToExpression();
+                    e = v._init.initializerToExpression(null, null, eSink);
                 }
                 else
                     // Zero-length arrays don't have an initializer
@@ -4961,7 +4930,7 @@ public:
             }
             if (!getValue(v))
             {
-                Expression newval = v._init.initializerToExpression();
+                Expression newval = v._init.initializerToExpression(null, null, eSink);
                 // Bug 4027. Copy constructors are a weird case where the
                 // initializer is a void function (the variable is modified
                 // through a reference parameter instead).

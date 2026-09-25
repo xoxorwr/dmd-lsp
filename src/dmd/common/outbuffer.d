@@ -18,28 +18,46 @@ import core.stdc.stdlib;
 
 nothrow:
 
+// In theory these functions should also restore errno, but we don't care because
+// we abort application on error anyway.
 version (DMDLIB)
 {
-    // OutBuffer's store is transient; serve it from the scratch allocator so
-    // freed blocks are reused and the rest is reclaimed in one go on reset.
-    import dmd.root.scratch : scratch;
+    // A library host keeps the frontend alive across many analyses and needs
+    // every allocation that belongs to one to go through `Mem`, so it can be
+    // reclaimed with the rest of that analysis (with the GC enabled, `Mem` is
+    // the GC). `Mem` is not `@nogc`; these buffers never were GC-scanned, so
+    // treating the calls as `@nogc` is only a typing concession.
+    // `Mem`'s statics are extern(C++): the pointer types must say so.
+    extern (C++) private
+    {
+        alias MallocFn = void* function(size_t) pure nothrow @nogc;
+        alias ReallocFn = void* function(void*, size_t) pure nothrow @nogc;
+        alias FreeFn = void function(void*) pure nothrow @nogc;
+    }
 
-    private void* ossMalloc(size_t n) @system { return scratch.alloc(n); }
-    private void* ossRealloc(void* p, size_t n) @system { return scratch.realloc(p, n); }
-    private void ossFree(void* p) @system { scratch.free(p); }
+    private pure @system @nogc nothrow
+    {
+        void* pureMalloc(size_t size)
+        {
+            import dmd.root.rmem : Mem;
+            return (cast(MallocFn) &Mem.xmalloc_noscan)(size);
+        }
 
-    private alias PureMallocFn  = void* function(size_t) pure nothrow @nogc @system;
-    private alias PureReallocFn = void* function(void*, size_t) pure nothrow @nogc @system;
-    private alias PureFreeFn    = void  function(void*) pure nothrow @nogc @system;
+        void* pureRealloc(void* ptr, size_t size)
+        {
+            import dmd.root.rmem : Mem;
+            return (cast(ReallocFn) &Mem.xrealloc_noscan)(ptr, size);
+        }
 
-    private static immutable PureMallocFn  pureMalloc  = cast(PureMallocFn)  &ossMalloc;
-    private static immutable PureReallocFn pureRealloc = cast(PureReallocFn) &ossRealloc;
-    private static immutable PureFreeFn    pureFree    = cast(PureFreeFn)    &ossFree;
+        void pureFree(void* ptr)
+        {
+            import dmd.root.rmem : Mem;
+            (cast(FreeFn) &Mem.xfree)(ptr);
+        }
+    }
 }
 else
 {
-    // In theory these functions should also restore errno, but we don't care
-    // because we abort application on error anyway.
     extern (C) private pure @system @nogc nothrow
     {
         pragma(mangle, "malloc") void* pureMalloc(size_t);
@@ -97,7 +115,7 @@ struct OutBuffer
     @trusted this(const(char)* filename)
     {
         FileMapping!ubyte model;
-        fileMapping = cast(FileMapping!ubyte*) pureMalloc(model.sizeof);
+        fileMapping = cast(FileMapping!ubyte*) malloc(model.sizeof);
         memcpy(fileMapping, &model, model.sizeof);
         fileMapping.__ctor(filename);
         //fileMapping = new FileMapping!ubyte(filename);

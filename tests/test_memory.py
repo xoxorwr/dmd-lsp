@@ -1,13 +1,14 @@
 import json, os, select, subprocess, sys, tempfile, time
 
-# Memory regression. Two invariants:
-#  * acyclic editing (the root is imported by nothing) stays on the flat
-#    in-place path — no respawn, RSS roughly flat;
-#  * cyclic editing (the root has a resident importer) must reclaim at the
-#    process boundary — the worker is respawned and RSS stays bounded instead
-#    of pinning one replaced universe per edit.
-# The pool (one worker per root) is the default; `rss` sums the worker
-# processes, not the thin server.
+# Memory regression for the in-process engine (docs/design.md, "Memory
+# levels"). Everything runs in the server process; there are no workers. The
+# invariants:
+#  * the server never spawns a process;
+#  * acyclic editing (the root is imported by nothing) stays flat;
+#  * cyclic editing (the root's importer is re-analysed with it) stays flat;
+#  * switching between roots stays flat: a superseded analysis is unmapped
+#    with its level, whatever still pointed into it.
+# RSS is the server's own.
 BIN = './dmd-lsp'
 
 WORK = tempfile.mkdtemp(prefix='dmd-lsp-mem-')
@@ -45,31 +46,22 @@ def read_msg(timeout=120):
         data += proc.stdout.read(n - len(data))
     return json.loads(data)
 
-def worker_pids():
-    out = []
+def children():
     try:
-        kids = subprocess.run(['pgrep', '-P', str(proc.pid)],
+        return subprocess.run(['pgrep', '-P', str(proc.pid)],
                               capture_output=True, text=True).stdout.split()
-        for k in kids:
-            out.append(k)
-            out += subprocess.run(['pgrep', '-P', k],
-                                  capture_output=True, text=True).stdout.split()
     except Exception:
-        pass
-    return set(out)
+        return []
 
-def rss_kb(pid):
+def rss_kb():
     try:
-        with open('/proc/%s/status' % pid) as f:
+        with open('/proc/%d/status' % proc.pid) as f:
             for l in f:
                 if l.startswith('VmRSS'):
                     return int(l.split()[1])
     except Exception:
         pass
     return 0
-
-def total_rss():
-    return sum(rss_kb(p) for p in worker_pids())
 
 fails = []
 def check(name, cond, extra=''):
@@ -89,20 +81,26 @@ send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
                                  "version": 1, "text": text}}})
 read_msg()
 time.sleep(0.5)
-base = total_rss()
-pids0 = worker_pids()
+# Warm up (first overlays, first collections), then measure.
 bad = text
-for i in range(30):
+for i in range(5):
+    bad = bad.replace('int fn0(int x)', 'int fn0_w%d(int x)' % i, 1)
+    send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+          "params": {"textDocument": {"uri": URI, "version": 100 + i},
+                     "contentChanges": [{"text": bad}]}})
+    read_msg()
+base = rss_kb()
+for i in range(60):
     bad = bad.replace('int fn0(int x)', 'int fn0_%d(int x)' % i, 1)
     send({"jsonrpc": "2.0", "method": "textDocument/didChange",
           "params": {"textDocument": {"uri": URI, "version": 2 + i},
                      "contentChanges": [{"text": bad}]}})
     read_msg()
-peak = total_rss()
+peak = rss_kb()
 growth = peak - base
 print('acyclic base=%d kB peak=%d kB growth=%d kB' % (base, peak, growth))
-check('memory-bounded-acyclic', growth < 30 * 1024, 'growth=%d kB' % growth)
-check('acyclic-no-respawn', worker_pids() == pids0, str(worker_pids() ^ pids0))
+check('memory-flat-acyclic', growth < 8 * 1024, 'growth=%d kB' % growth)
+check('acyclic-in-process', not children(), str(children()))
 check('alive', proc.poll() is None, '')
 
 # ---- cyclic: a imports b and b imports a, so a's root has a resident importer ----
@@ -120,26 +118,46 @@ send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
                                  "version": 1, "text": bbase}}})
 read_msg()
 time.sleep(0.5)
-cbase = total_rss()
-initial = worker_pids()
-seen = set(initial)
-worst = cbase
 cur = abase
-for i in range(40):
+for i in range(5):
+    cur = cur.replace('int aFn()', 'int aFn_w%d()' % i, 1)
+    send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+          "params": {"textDocument": {"uri": 'file://' + ca, "version": 100 + i},
+                     "contentChanges": [{"text": cur}]}})
+    read_msg()
+cbase = rss_kb()
+worst = cbase
+for i in range(60):
     cur = cur.replace('int aFn()', 'int aFn_%d()' % i, 1)
     send({"jsonrpc": "2.0", "method": "textDocument/didChange",
           "params": {"textDocument": {"uri": 'file://' + ca, "version": 2 + i},
                      "contentChanges": [{"text": cur}]}})
     read_msg()
-    time.sleep(0.05)
-    seen |= worker_pids()
-    worst = max(worst, total_rss())
+    worst = max(worst, rss_kb())
 cgrowth = worst - cbase
 print('cyclic base=%d kB worst=%d kB growth=%d kB' % (cbase, worst, cgrowth))
-check('memory-bounded-cyclic', cgrowth < 60 * 1024, 'growth=%d kB' % cgrowth)
-check('cyclic-respawned', len(seen) > len(initial),
-      'distinct workers seen=%d initial=%d' % (len(seen), len(initial)))
+check('memory-flat-cyclic', cgrowth < 8 * 1024, 'growth=%d kB' % cgrowth)
 check('alive2', proc.poll() is None, '')
+
+# ---- root switching: alternate between the documents, editing each ----
+def edit(uri, text, v):
+    send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+          "params": {"textDocument": {"uri": uri, "version": v},
+                     "contentChanges": [{"text": text}]}})
+    read_msg()
+
+sbase = rss_kb()
+sworst = sbase
+for i in range(40):
+    edit(URI, bad + '\n// %d\n' % i, 1000 + i)
+    edit('file://' + cb, bbase + '\n// %d\n' % i, 1000 + i)
+    edit('file://' + ca, cur + '\n// %d\n' % i, 1000 + i)
+    sworst = max(sworst, rss_kb())
+sgrowth = sworst - sbase
+print('switch base=%d kB worst=%d kB growth=%d kB' % (sbase, sworst, sgrowth))
+check('memory-flat-switching', sgrowth < 12 * 1024, 'growth=%d kB' % sgrowth)
+check('never-spawned', not children(), str(children()))
+check('alive3', proc.poll() is None, '')
 
 proc.stdin.close()
 try:

@@ -1,0 +1,40 @@
+--- a/dclass.d
++++ b/dclass.d
+@@ -46,6 +46,11 @@
+     // are a copy of the InterfaceDeclaration.interfaces
+     BaseClass[] baseInterfaces;
+ 
++    // dmd-lsp H2 (docs/hacks.md): source location of this base's type usage.
++    // `type` is overwritten with the resolved type during semantic (losing the
++    // only Loc), so keep it here for the language server.
++    Loc loc;
++
+     extern (D) this(Type type)
+     {
+         //printf("BaseClass(this = %p, '%s')\n", this, type.toChars());
+--- a/dsymbolsem.d
++++ b/dsymbolsem.d
+@@ -5574,6 +5574,12 @@
+             for (size_t i = 0; i < cldec.baseclasses.length;)
+             {
+                 auto b = (*cldec.baseclasses)[i];
++                // dmd-lsp H2 (docs/hacks.md): keep the base-clause location
++                // before `type` is resolved into a loc-less symbolic type.
++                // Checked by tag: extern(C++) casts are not checked.
++                if (b.type.ty == Tident || b.type.ty == Tinstance ||
++                    b.type.ty == Ttypeof || b.type.ty == Treturn)
++                    b.loc = (cast(TypeQualified) b.type).loc;
+                 b.type = resolveBase(b.type.typeSemantic(cldec.loc, sc));
+ 
+                 Type tb = b.type.toBasetype();
+@@ -6222,6 +6228,10 @@
+             for (size_t i = 0; i < idec.baseclasses.length;)
+             {
+                 auto b = (*idec.baseclasses)[i];
++                // dmd-lsp H2 (docs/hacks.md): see the class case above.
++                if (b.type.ty == Tident || b.type.ty == Tinstance ||
++                    b.type.ty == Ttypeof || b.type.ty == Treturn)
++                    b.loc = (cast(TypeQualified) b.type).loc;
+                 b.type = resolveBase(b.type.typeSemantic(idec.loc, sc));
+ 
+                 Type tb = b.type.toBasetype();

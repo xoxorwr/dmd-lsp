@@ -261,9 +261,8 @@ check('rename-refused-outside-project', 'error' in r, str(r)[:200])
 d.close()
 
 # Two renames in a row with the client applying and saving the first: the
-# re-analysis after the save can respawn the worker, which starts with no
-# workspace index. A stale "index built" flag made the second rename fail with
-# "declaring module not indexed".
+# saved files change on disk under the workspace index. A stale "index built"
+# flag once made the second rename fail with "declaring module not indexed".
 L2 = 'module lib2;\nint gcount;\n'
 A2 = 'module app2;\nimport lib2;\nvoid f()\n{\n    gcount = gcount + 1;\n}\n'
 l2 = os.path.join(root, 'lib2.d')
@@ -286,7 +285,7 @@ if 'result' in r:
     d.change_doc(a2, new[a2], 2)
     d.save_doc(l2, new[l2])
     d.save_doc(a2, new[a2])
-    d.drain(2.5)  # let the debounced re-analysis (possibly respawning) settle
+    d.drain(2.5)  # let the debounced re-analysis settle
     r2 = d.rename(l2, 1, 4, 'count')
     check('rename-twice-second-ok', 'result' in r2, str(r2)[:200])
 else:

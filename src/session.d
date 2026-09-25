@@ -2,7 +2,7 @@ module session;
 
 // Per-open-document cache + dirty set. Struct-only.
 // Doc text is malloc-managed and replaced on update, so memory does not
-// grow with edits (the region GC never frees, so docs must live outside it).
+// grow with edits and never lives on a dmd memory level.
 
 import arena;
 import core.stdc.stdlib : malloc, free;
@@ -206,30 +206,4 @@ ulong fnv1a64(const(ubyte)[] data, ulong h = 14695981039346656037UL) pure nothro
         h *= 1099511628211UL;
     }
     return h;
-}
-
-bool hashFileDisk(const(char)[] path, out ulong h)
-{
-    import core.stdc.stdio : fopen, fread, fclose;
-
-    if (path.length + 1 >= 4096)
-        return false;
-    char[4096] zpath;
-    zpath[0 .. path.length] = path[];
-    zpath[path.length] = 0;
-    auto f = fopen(zpath.ptr, "rb");
-    if (!f)
-        return false;
-    scope (exit)
-        fclose(f);
-    h = 14695981039346656037UL;
-    ubyte[65536] chunk = void;
-    for (;;)
-    {
-        auto k = fread(chunk.ptr, 1, chunk.length, f);
-        if (k == 0)
-            break;
-        h = fnv1a64(chunk[0 .. k], h);
-    }
-    return true;
 }

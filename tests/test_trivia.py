@@ -1,10 +1,10 @@
 import json, os, select, subprocess, sys, tempfile
 
-# Regression: a trivia-only save (e.g. adding a blank line) must not re-analyse.
-# In a cyclic project the in-place root re-parse left importers holding stale
-# symbols, so a blank line made a valid call report "not callable". Trivia is
-# detected with a significant-token fingerprint (comments/whitespace are not
-# tokens; literal contents are), so a real edit still analyzes.
+# Regression: in a cyclic project a trivia-only save (e.g. adding a blank line)
+# once made a valid call report "not callable" (an in-place root re-parse left
+# importers holding stale symbols). Every analysis now starts from untouched
+# dependency levels, so a trivia save re-analyses and stays clean, and a real
+# edit reports its error.
 BIN = './dmd-lsp'
 WORK = tempfile.mkdtemp(prefix='dmd-lsp-trivia-')
 
@@ -63,9 +63,11 @@ send({"jsonrpc": "2.0", "method": "textDocument/didOpen",
                                  "version": 1, "text": GOOD}}})
 check('trivia-open-clean', read_msg()['params']['diagnostics'] == [], '')
 
-# add a blank line + save: no re-analysis, so no diagnostics are published
+# add a blank line + save: still clean
 save(GOOD + '\n')
-check('trivia-blankline-silent', not ready(1.0), '')
+check('trivia-blankline-arrives', ready(5), '')
+d = read_msg()['params']['diagnostics']
+check('trivia-blankline-clean', d == [], str(d))
 
 # remove it + save, then a real semantic edit: diagnostics flow again
 save(GOOD)

@@ -1,0 +1,36 @@
+--- a/optimize.d
++++ b/optimize.d
+@@ -36,6 +36,11 @@
+ import dmd.typesem;
+ import dmd.visitor;
+ 
++// dmd-lsp H1 (docs/hacks.md): tooling-only switch. When set, manifest
++// constants are not substituted by their initializer, so a post-semantic walk
++// still sees the `VarExp` (references/rename). Off for normal compilation.
++__gshared bool lspNoManifestExpand;
++
+ /*************************************
+  * If variable has a const initializer,
+  * return that initializer.
+@@ -184,6 +189,8 @@
+ {
+     //printf("fromConstInitializer(result = %x, %s)\n", result, e1.toChars());
+     //static int xx; if (xx++ == 10) assert(0);
++    if (lspNoManifestExpand)
++        return e1;
+     auto ve = e1.isVarExp();
+     if (!ve)
+         return e1;
+--- a/initsem.d
++++ b/initsem.d
+@@ -362,6 +362,10 @@
+     Initializer visitExp(ExpInitializer i)
+     {
+         //printf("ExpInitializer::semantic(%s), type = %s\n", i.exp.toChars(), t.toChars());
++        // dmd-lsp H1 (docs/hacks.md): keep manifest constants unfolded.
++        import dmd.optimize : lspNoManifestExpand;
++        if (needInterpret && lspNoManifestExpand)
++            needInterpret = NeedInterpret.INITnointerpret;
+         if (needInterpret)
+             sc = sc.startCTFE();
+         i.exp = i.exp.expressionSemantic(sc);

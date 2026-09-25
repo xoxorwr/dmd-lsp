@@ -7,7 +7,7 @@ pragma(mangle, "dmd_lsp_log")
 extern (C) pragma(printf)
 void log(const(char)* fmt, ...)
 {
-    import core.stdc.stdio : fputs, fputc, vfprintf, stderr;
+    import core.stdc.stdio : fputs, fputc, vfprintf, fflush, stderr;
     import core.stdc.stdarg : va_list, va_start, va_end;
 
     fputs("dmd-lsp: ", stderr);
@@ -16,4 +16,7 @@ void log(const(char)* fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    // A redirected stderr may be fully buffered (Windows CRT): a line that
+    // only shows up at exit is useless for diagnosing a hang.
+    fflush(stderr);
 }

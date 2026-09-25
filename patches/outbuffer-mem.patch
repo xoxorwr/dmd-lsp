@@ -1,0 +1,57 @@
+--- a/common/outbuffer.d
++++ b/common/outbuffer.d
+@@ -20,11 +20,50 @@
+ 
+ // In theory these functions should also restore errno, but we don't care because
+ // we abort application on error anyway.
+-extern (C) private pure @system @nogc nothrow
++version (DMDLIB)
+ {
+-    pragma(mangle, "malloc") void* pureMalloc(size_t);
+-    pragma(mangle, "realloc") void* pureRealloc(void* ptr, size_t size);
+-    pragma(mangle, "free") void pureFree(void* ptr);
++    // A library host keeps the frontend alive across many analyses and needs
++    // every allocation that belongs to one to go through `Mem`, so it can be
++    // reclaimed with the rest of that analysis (with the GC enabled, `Mem` is
++    // the GC). `Mem` is not `@nogc`; these buffers never were GC-scanned, so
++    // treating the calls as `@nogc` is only a typing concession.
++    // `Mem`'s statics are extern(C++): the pointer types must say so.
++    extern (C++) private
++    {
++        alias MallocFn = void* function(size_t) pure nothrow @nogc;
++        alias ReallocFn = void* function(void*, size_t) pure nothrow @nogc;
++        alias FreeFn = void function(void*) pure nothrow @nogc;
++    }
++
++    private pure @system @nogc nothrow
++    {
++        void* pureMalloc(size_t size)
++        {
++            import dmd.root.rmem : Mem;
++            return (cast(MallocFn) &Mem.xmalloc_noscan)(size);
++        }
++
++        void* pureRealloc(void* ptr, size_t size)
++        {
++            import dmd.root.rmem : Mem;
++            return (cast(ReallocFn) &Mem.xrealloc_noscan)(ptr, size);
++        }
++
++        void pureFree(void* ptr)
++        {
++            import dmd.root.rmem : Mem;
++            (cast(FreeFn) &Mem.xfree)(ptr);
++        }
++    }
++}
++else
++{
++    extern (C) private pure @system @nogc nothrow
++    {
++        pragma(mangle, "malloc") void* pureMalloc(size_t);
++        pragma(mangle, "realloc") void* pureRealloc(void* ptr, size_t size);
++        pragma(mangle, "free") void pureFree(void* ptr);
++    }
+ }
+ 
+ debug

@@ -322,22 +322,4 @@ nothrow:
         auto val = files.insert(filename.toString, buffer);
         return val == null ? null : val.value;
     }
-
-    // Hack H4 (docs/hacks.md): insert or replace cached contents. `add` cannot
-    // update (`insert` returns null when the key exists), which the LSP's
-    // open-document mirror needs to reflect unsaved edits.
-    void setFileContents(FileName filename, const(ubyte)[] buffer)
-    {
-        files.update(filename.toString).value = buffer;
-    }
-
-    // Hack H4: evict a cached file so the next `getFileContents` reads disk
-    // (used when a mirrored document is closed).
-    void removeFileContents(FileName filename)
-    {
-        const name = filename.toString;
-        files.removeWhere((sv) =>
-            sv.toDchars()[0 .. name.length] == name &&
-            sv.toDchars()[name.length] == 0);
-    }
 }

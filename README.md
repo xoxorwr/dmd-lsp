@@ -110,9 +110,7 @@ Precedence: editor settings → CLI → `dls.json` → builtin stdlib defaults.
 
   // Optional features — all off unless you opt in:
   "inlayHints": false,               // default: false
-  "autoImports": false,              // default: false
-
-  "sharedRegistry": false            // default: false (see below)
+  "autoImports": false               // default: false
 }
 ```
 
@@ -128,8 +126,6 @@ loads at `initialize` and on save.
 | `inlayHints` | `false` | Show inferred `auto` types and call parameter names (requires a client that supports inlay hints). |
 | `autoImports` | `false` | Include symbols from other project modules in completion, with the `import` added as an edit. The explicit **Import `<name>` from `<module>`** code action is always available regardless. |
 | `fullTypeHover` | `true` | Show the full declaration body (with the name qualified, e.g. `struct pkg.Name { … }`) in hover for structs/classes/unions/enums. Set `false` for just the short qualified name (`struct pkg.Name`). |
-| `sharedRegistry` | `false` | **Opt-in / experimental.** `true` keeps one worker serving **every** file (one shared module registry, no per-file workers). It is not the default because mutating that shared universe in place is unsafe: re-parsing a root that another resident file imports leaves the importer holding stale symbols that dmd's conservative GC cannot reclaim, so editing several inter-dependent files grows RSS without bound. The default (`false`) uses the per-file worker pool, where each root is rebuilt at the process boundary when needed. |
-| `maxModules` | `2048` | Only used when `sharedRegistry` is `true`: cap on resident modules. When exceeded the worker restarts (there is no partial eviction), so a full rebuild follows. |
 
 > **dub** projects (`dub.json`/`dub.sdl`) aren't auto-configured yet — list the
 > dependency import paths in `dls.json` for now; `dub describe` support is
@@ -137,19 +133,31 @@ loads at `initialize` and on save.
 
 ## How it works
 
-`dmd-lsp` runs the real dmd frontend in a worker process. By default it keeps a
-small pool of per-file workers (least-recently-used evicted): each root is
-rebuilt at the process boundary when its text or a dependency changes, so
-memory stays bounded. Analysis is **debounce-only** — a keystroke never builds;
-the worker caches each file's last analysis and completion, hover and the other
-read-only requests answer from that warm cache, so as-you-type completion costs
-no process and no re-parse. A root with no resident importer is re-parsed in
-place; one whose importer is also resident is rebuilt at the process boundary
-(dmd's conservative GC cannot reclaim a replaced AST that importers still
-reference). With `sharedRegistry: true` a single worker keeps every loaded
-module resident instead (opt-in; see the table above).
+`dmd-lsp` runs the real dmd frontend **in the server process**, on *memory
+levels* ([design.md](docs/design.md#memory-levels)):
 
-Details: [docs/design.md](docs/design.md).
+1. **dmd** — the frontend, configured (import paths, flags);
+2. **dependencies** — every module the open roots import, analysed once;
+3. **warm** — a renamed copy of the file being edited, analysed once, so the
+   template instances it needs from libraries are already there;
+4. **overlay** — the file(s) being edited, analysed from the editor buffer.
+
+Each level has its own heap (a private druntime GC instance). While a level is
+on top, the levels below are write-protected; the first write dmd makes to one
+of their pages saves a copy of the page. Popping the overlay copies those pages
+back, restores dmd's globals and unmaps the overlay's heap, so the dependency
+level is byte for byte what it was before the edit — no matter what dmd cached
+along the way (template instances, interned types, lazily analysed functions).
+An edit re-analyses only the overlay on the warm dependencies; memory is flat
+over any number of edits, root switches and rebuilds, with no worker process.
+It is `fork()` done in-process and scoped to dmd, and works the same on Linux,
+macOS and Windows (page protection via `mprotect`/`VirtualProtect`).
+
+Analysis is **debounce-only**: a keystroke never builds. Completion, hover and
+the other read-only requests answer from the last analysis until the debounced
+pass replaces it. A failure inside dmd (an assert, or a segfault on broken
+code) fails that one request: the levels are dropped, which restores a clean
+frontend, and the server keeps going.
 
 ## Docs
 
@@ -157,5 +165,5 @@ Details: [docs/design.md](docs/design.md).
 - [vendoring.md](docs/vendoring.md) — vendored dmd sources, Makefile
 - [releases.md](docs/releases.md) — nightly CI, VS Code extension
 - [upstream.md](docs/upstream.md) — patches in `../dmd`, roadmap
-- [findings.md](docs/findings.md) — memory/GC investigation
-- [reclamation.md](docs/reclamation.md) — reclamation boundary + vendor-update checklist
+- [findings.md](docs/findings.md) — memory/GC investigation, and how it ended
+- [reclamation.md](docs/reclamation.md) — the memory-level invariants + vendor-update checklist

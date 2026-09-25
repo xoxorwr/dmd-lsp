@@ -1,20 +1,12 @@
-module worker;
+module ops;
 
-// Cross-platform analysis worker.
-//
-// One child process builds a full dmd universe (dependency closure + root) and
-// keeps it warm; a root-text edit is re-parsed in place on the warm closure
-// (serverAnalyzeIncremental -> dmdReparseModule). A dependency/config/root
-// change respawns the child, so the OS reclaims the discarded universe. The
-// parent (LSP front end) holds only documents/config.
-//
-// Transport: two pipes with length-prefixed frames, so the same code runs on
-// POSIX and Windows.
-//   * POSIX:   fork(); the child dups the pipes onto stdin/stdout and runs
-//              workerMain().
-//   * Windows: CreateProcess of this executable with `--worker`; main.d calls
-//              workerMain(), which speaks over the inherited std handles.
+// The LSP operations over the analysis engine (server.d / engine.d), in
+// process. Each request is a JSON object with an "op" field; the reply is one
+// JSON object. The JSON boundary is also where results leave dmd's memory
+// levels: everything a reply needs is serialised before the next analysis can
+// pop the overlay it points into (see engine.d).
 // Struct-only, no phobos.
+
 
 import arena;
 import log : log;
@@ -34,11 +26,8 @@ import references : DeclKey, RefLoc, findReferences, isLocalDsymbol,
 import lint;
 import lexutil : LexCache, lexSet, lexOver;
 import semantic : SemTok, semanticTokens;
-import dmdwrap : dmdRootHasImporters, dmdTokenHash, dmdResetRequest, dmdParseOnly,
-    dmdModuleResident, universeDepsChanged,
-    dmdParseNoRegister, dmdLocCheckpoint, dmdLocRollback,
-    dmdSetDoc, dmdRemoveDoc,
-    dmdHasUnloadedImport, dmdIsPlainIdentifier, dmdHasHiddenRefRisk;
+import dmdwrap : dmdParseNoRegister, dmdHasUnloadedImport, dmdIsPlainIdentifier,
+    dmdHasHiddenRefRisk;
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
@@ -46,39 +35,31 @@ import dmd.func : FuncDeclaration;
 import dmd.dclass : ClassDeclaration;
 import dmd.tokens : Token;
 
-version (Posix)
+
+
+// ---------- replies ----------
+
+// An op writes its reply here (exactly once); `serveRequest` hands it over.
+private struct Chan
 {
-    import core.sys.posix.unistd : read, write, close, fork, dup2, pipe, pid_t, _exit;
-    import core.stdc.errno : errno, EINTR;
-    import core.sys.posix.sys.wait : waitpid, WIFSIGNALED, WTERMSIG, WIFEXITED,
-        WEXITSTATUS;
+    char[] buf;
+    bool written;
 }
 
-version (Windows)
+private __gshared Chan outChan;
+private __gshared Arena jops; // JSON arena of the op being served
+
+private bool writeFrame(ref Chan c, const(char)[] s) nothrow
 {
-    import core.sys.windows.winbase;
-    import core.sys.windows.windef;
-    import core.sys.windows.winnt;
+    import core.stdc.stdlib : realloc;
+
+    if (c.buf.length < s.length)
+        c.buf = (cast(char*) realloc(c.buf.ptr, s.length))[0 .. s.length];
+    c.buf[0 .. s.length] = s[];
+    c.buf = c.buf.ptr[0 .. s.length];
+    c.written = true;
+    return true;
 }
-
-// ---------- framing ----------
-
-struct Chan
-{
-    version (Posix)
-        int fd = -1;
-    version (Windows)
-    {
-        void* h = null;
-        // An inherited standard handle: resolve it via GetStdHandle on every
-        // call instead of caching (see chanRead/chanWrite). Only the worker's
-        // inChan/outChan set this; pipe handles keep a stable `h`.
-        bool stdHandle = false;
-    }
-}
-
-private __gshared Chan inChan;   // child: requests
-private __gshared Chan outChan;  // child: responses
 
 // Workspace symbol index (worker process). Parse-only declarations collected
 // from the parent's file discovery. Built lazily, invalidated on watched
@@ -106,99 +87,15 @@ struct WFileInfo
 }
 private WFileInfo[] g_files;
 
-// Set when a child could not write a response. The worker loop checks it and
-// exits, so a lost reply can't leave the parent blocked in readFrame forever.
-// Single-threaded: only the worker's main loop writes, and it never resets the
-// flag because the process exits (the parent always respawns, never reuses).
-__gshared bool g_writeFailed = false;
-
-private bool chanWrite(ref Chan c, const(ubyte)[] data) nothrow
-{
-    size_t off = 0;
-    while (off < data.length)
-    {
-        version (Posix)
-        {
-            auto n = write(c.fd, data.ptr + off, data.length - off);
-            if (n < 0 && errno == EINTR)
-                continue; // interrupted before writing anything: retry
-            if (n <= 0)
-            {
-                g_writeFailed = true;
-                return false;
-            }
-            off += cast(size_t)n;
-        }
-        version (Windows)
-        {
-            // A std handle must be re-resolved here instead of caching: it is
-            // not stable for the process lifetime.
-            auto h = c.h;
-            if (c.stdHandle)
-                h = GetStdHandle(STD_OUTPUT_HANDLE);
-            DWORD n = 0;
-            if (!WriteFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
-            {
-                g_writeFailed = true;
-                return false;
-            }
-            off += n;
-        }
-    }
-    return true;
-}
-
-private bool chanRead(ref Chan c, ubyte[] data) nothrow
-{
-    size_t off = 0;
-    while (off < data.length)
-    {
-        version (Posix)
-        {
-            auto n = read(c.fd, data.ptr + off, data.length - off);
-            if (n < 0 && errno == EINTR)
-                continue; // interrupted before reading anything: retry
-            if (n <= 0)
-                return false;
-            off += cast(size_t)n;
-        }
-        version (Windows)
-        {
-            auto h = c.h;
-            if (c.stdHandle)
-                h = GetStdHandle(STD_INPUT_HANDLE);
-            DWORD n = 0;
-            if (!ReadFile(h, data.ptr + off, cast(DWORD)(data.length - off), &n, null) || n == 0)
-                return false;
-            off += n;
-        }
-    }
-    return true;
-}
-
-private bool writeFrame(ref Chan c, const(char)[] s) nothrow
-{
-    uint len = cast(uint)s.length;
-    ubyte[4] hdr = [cast(ubyte)(len & 0xff), cast(ubyte)((len >> 8) & 0xff),
-        cast(ubyte)((len >> 16) & 0xff), cast(ubyte)((len >> 24) & 0xff)];
-    return chanWrite(c, hdr[]) && chanWrite(c, cast(const(ubyte)[])s);
-}
-
-private bool readFrame(ref Chan c, ref char[] out_) nothrow
-{
-    ubyte[4] hdr;
-    if (!chanRead(c, hdr[]))
-        return false;
-    uint len = cast(uint)hdr[0] | (cast(uint)hdr[1] << 8) |
-        (cast(uint)hdr[2] << 16) | (cast(uint)hdr[3] << 24);
-    if (len > 64 * 1024 * 1024)
-        return false;
-    out_.length = len;
-    return chanRead(c, cast(ubyte[])out_);
-}
-
+// Request parameters are copied to level 0: an op runs in dmd mode, and its
+// analysis may replace the overlay these would otherwise be allocated in.
 private string dupOrEmpty(const(char)[] s)
 {
+    import layers : levelSuspend, levelResume;
+
+    auto t = levelSuspend();
+    scope (exit)
+        levelResume(t);
     return s is null ? "" : s.idup;
 }
 
@@ -210,65 +107,36 @@ private void addStrOpt(Json js, JsonNode* o, const(char)* k, const(char)[] v)
         js.add_null_to_object(o, k);
 }
 
-// ---------- worker (child) side ----------
-    // The warm per-root analysis for `path` (kept fresh by the idle debounce; see
-// `complete`/`hover`). Read-only ops read this instead of forking a re-parse.
-// Analysis is debounce-only, so these requests never fork or respawn.
+// ---------- op helpers ----------
+
+// The analysis of `path` the overlay holds, or a fresh one of the document's
+// current text (open buffer, else disk). Read-only requests use this: after
+// an edit they keep answering from the previous analysis until the debounced
+// pass replaces it, so typing never waits on dmd.
 private Analysis cachedAnalysis(ref ServerState s, const(char)[] path)
 {
-    if (auto c = path.idup in s.roots)
-        return *c;
-    return Analysis.init;
+    foreach (ref r; engineRoots(s.engine))
+        if (r.path == path)
+            return cast() r.a;
+    const(char)[] text = s.engine.docs.open !is null ? s.engine.docs.open(path) : null;
+    if (text is null)
+        text = sessionReadDisk(path);
+    if (text is null)
+        return Analysis.init;
+    return serverAnalyze(s, path, text);
 }
 
-// The one place that decides whether an in-place re-parse is safe. It is only
-// safe when no resident module imports the root: importers retain symbols from
-// the replaced AST, and dmd's conservative GC cannot reclaim them
-// (`dmdRootHasImporters`). A pool worker's closure can still contain an
-// importer of its root, so "one root per worker" is not sufficient.
-private bool canIncrementalReparse(ref ServerState s, bool built, UniState st)
-{
-    if (!built || st != UniState.incremental)
-        return false;
-    return !dmdRootHasImporters(s.uni.analysis.module_);
-}
-
-// Like `cachedAnalysis`, but falls back to the on-demand analyse path when a
-// root was never opened/debounced — call/type hierarchy items can point at
-// files the user never opened.
-private Analysis warmOrAnalyze(ref ServerState s, ref bool built,
+// Like `cachedAnalysis`, for requests that come with the text to analyse
+// (`atext`, possibly a placeholder variant of the document `orig`).
+private Analysis warmOrAnalyze(ref ServerState s,
     const(char)[] path, const(char)[] atext, const(char)[] orig)
 {
-    if (auto c = path.idup in s.roots)
-        return *c;
-    if (auto c = path.idup in s.roots)
-    {
-        // A dependency edited unsaved (mirror) or on disk invalidates this
-        // root's cache even though the root text is unchanged.
-        if (!universeDepsChanged(s.uni.deps))
-            return *c;
-    }
-    auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-    Analysis a;
-    if (built && st == UniState.reuse)
-        a = s.uni.analysis;
-    else if (canIncrementalReparse(s, built, st))
-        a = serverAnalyzeIncremental(s, path, atext, orig);
-    else if (s.sharedReg)
-        a = serverAnalyzeShared(s, path, atext, orig);
-    else
-        a = serverAnalyze(s, path, atext, orig);
-    built = true;
-    return a;
+    foreach (ref r; engineRoots(s.engine))
+        if (r.path == path)
+            return cast() r.a;
+    return serverAnalyze(s, path, atext, orig);
 }
 
-private void sendNeedRespawn()
-    {
-        auto js = jmake();
-        auto root = js.create_object();
-        js.add_bool_to_object(root, "needRespawn", true);
-        writeFrame(outChan, printJsonStr(root));
-    }
 
     private void addDiags(Json js, JsonNode* root, const ref Analysis a)
     {
@@ -309,16 +177,13 @@ private void sendNeedRespawn()
         js.add_item_to_object(root, key, o);
     }
 
-    private void sendAnalyze(const ref Analysis a, bool unchanged = false)
+    private void sendAnalyze(const ref Analysis a)
     {
         auto js = jmake();
         auto root = js.create_object();
         addDiags(js, root, a);
         addLint(js, root, "lintImports", a.lintImports);
         addLint(js, root, "lintParams", a.lintParams);
-        js.add_bool_to_object(root, "needRespawn", false);
-        if (unchanged)
-            js.add_bool_to_object(root, "unchanged", true);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -341,7 +206,6 @@ private void sendNeedRespawn()
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "items", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -367,7 +231,6 @@ private void sendNeedRespawn()
             }
             js.add_item_to_object(root, "parameters", arr);
         }
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -383,7 +246,6 @@ private void sendNeedRespawn()
             js.add_number_to_object(root, "col", def.col);
             js.add_number_to_object(root, "len", cast(double)def.len);
         }
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -402,7 +264,6 @@ private void sendNeedRespawn()
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "locs", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -422,7 +283,6 @@ private void sendNeedRespawn()
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "hints", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -440,7 +300,6 @@ private void sendNeedRespawn()
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "folds", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -491,7 +350,6 @@ private void sendNeedRespawn()
         foreach (ref d; syms)
             addDocSymbol(js, arr, d);
         js.add_item_to_object(root, "result", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -514,7 +372,6 @@ private void sendNeedRespawn()
         js.add_bool_to_object(root, "complete", complete);
         if (reason.length)
             js.add_string_to_object(root, "reason", zstr(reason));
-        js.add_bool_to_object(root, "needRespawn", false);
         import core.stdc.stdlib : getenv;
         if (getenv("DMD_LSP_TRACE_REFS"))
         {
@@ -541,7 +398,6 @@ private void sendNeedRespawn()
             js.add_item_to_array(arr, o);
         }
         js.add_item_to_object(root, "tokens", arr);
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -555,49 +411,11 @@ private void sendNeedRespawn()
             addStrOpt(js, root, "detail", h.detail);
             addStrOpt(js, root, "doc", h.doc);
         }
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
-    // Run `work` in a fork child over the inherited (copy-on-write) universe:
-    // the child answers on `fd` and exits, so its mutations and any leak from
-    // the incremental re-analysis die with it and the warm universe in this
-    // process is never touched. Returns true only if the child exited 0 (i.e.
-    // it produced its response); false means the caller must respawn.
-    private bool forkRun(scope void delegate() work)
-    {
-        version (Posix)
-        {
-            auto pid = fork();
-            if (pid < 0)
-                return false;
-            if (pid == 0)
-            {
-                try
-                    work();
-                catch (Throwable)
-                    _exit(1);
-                _exit(0);
-            }
-            int status = 0;
-            if (waitpid(pid, &status, 0) < 0)
-                return false;
-            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        }
-        else
-        {
-            // No fork on Windows: run inline in the worker. The worker is
-            // replaced on a rebuild anyway, so the leak is bounded by respawn.
-            try
-                work();
-            catch (Throwable)
-                return false;
-            return true;
-        }
-    }
 
-    // Per-op tail shared by the in-process (hit/first-build) path and the
-    // fork-child (incremental) path.
+    // Completion over an analysis: items, serialised as the reply.
     private void completeAndSend(ref ServerState s, const ref Analysis a,
         const(char)[] orig, uint line, uint col, const(char)[] prefix)
     {
@@ -721,7 +539,6 @@ private void sendNeedRespawn()
             }
             js.add_item_to_object(root, "calls", arr);
         }
-        js.add_bool_to_object(root, "needRespawn", false);
         writeFrame(outChan, printJsonStr(root));
     }
 
@@ -933,10 +750,9 @@ private void flattenIndex(const(DocSymbol)[] syms, const(char)[] file,
     }
 }
 
-// Parse-only index build via the registration-free parse (H3), so the live
-// universe is not evicted by the parse.
-// Fully-qualified module name from a registration-free parse (H3): no package
-// parent exists, so rebuild it from the module declaration.
+// Fully-qualified module name from a registration-free parse
+// (`dmdParseNoRegister`): no package parent exists, so rebuild it from the
+// module declaration.
 private string indexModuleName(Module mod)
 {
     string name;
@@ -954,53 +770,72 @@ private string indexModuleName(Module mod)
 private void buildIndexNow(ref ServerState s, string[] files)
 {
     import timing : nowMs, traceMs;
+    import layers : levelSuspend, levelResume;
 
     ulong t0 = nowMs();
     g_index = null;
     g_files = null;
-    // H3: parse each file without registering it, so the live semantic
-    // universe survives (no `dmdResetRequest`). Roll back the Loc entries the
-    // parses append, like the in-place re-parse path.
-    size_t locTableLen;
-    uint locIndex;
-    dmdLocCheckpoint(locTableLen, locIndex);
-    scope (exit)
-        dmdLocRollback(locTableLen, locIndex);
-    foreach (f; files)
-    {
-        auto text = sessionReadDisk(f);
-        if (!text)
-            continue;
-        auto pr = dmdParseNoRegister(f, text);
-        if (!pr.ok || !pr.module_)
-            continue;
-        auto mod = cast(Module)pr.module_;
-        string moduleName = indexModuleName(mod);
-        size_t before = g_index.length;
-        flattenIndex(documentSymbols(mod, text), f, null, g_index);
-        foreach (i; before .. g_index.length)
-            g_index[i].moduleName = moduleName;
-        WFileInfo fi;
-        fi.file = f.idup;
-        fi.moduleName = moduleName;
-        if (mod.members)
-            foreach (i; 0 .. (*mod.members).length)
-            {
-                auto imp = (*mod.members)[i].isImport();
-                if (!imp || !imp.id)
-                    continue;
-                string name;
-                foreach (p; imp.packages)
+    // Parse-only, on a scratch level: nothing of these parses survives, the
+    // index is copied to level 0 at the end.
+    engineScratch(s.engine, () {
+        WIndexSym[] idx;
+        WFileInfo[] infos;
+        foreach (f; files)
+        {
+            auto text = sessionReadDisk(f);
+            if (!text)
+                continue;
+            auto pr = dmdParseNoRegister(f, text);
+            if (!pr.ok || !pr.module_)
+                continue;
+            auto mod = cast(Module)pr.module_;
+            string moduleName = indexModuleName(mod);
+            size_t before = idx.length;
+            flattenIndex(documentSymbols(mod, text), f, null, idx);
+            foreach (i; before .. idx.length)
+                idx[i].moduleName = moduleName;
+            WFileInfo fi;
+            fi.file = f.idup;
+            fi.moduleName = moduleName;
+            if (mod.members)
+                foreach (i; 0 .. (*mod.members).length)
                 {
-                    name ~= p.toString();
-                    name ~= ".";
+                    auto imp = (*mod.members)[i].isImport();
+                    if (!imp || !imp.id)
+                        continue;
+                    string name;
+                    foreach (p; imp.packages)
+                    {
+                        name ~= p.toString();
+                        name ~= ".";
+                    }
+                    name ~= imp.id.toString();
+                    if (name.length)
+                        fi.imports ~= name;
                 }
-                name ~= imp.id.toString();
-                if (name.length)
-                    fi.imports ~= name.idup;
-            }
-        g_files ~= fi;
-    }
+            infos ~= fi;
+        }
+        auto t = levelSuspend();
+        scope (exit)
+            levelResume(t);
+        foreach (e; idx)
+        {
+            e.name = e.name.idup;
+            e.file = e.file.idup;
+            e.container = e.container.idup;
+            e.moduleName = e.moduleName.idup;
+            g_index ~= e;
+        }
+        foreach (fi; infos)
+        {
+            WFileInfo c;
+            c.file = fi.file.idup;
+            c.moduleName = fi.moduleName.idup;
+            foreach (i; fi.imports)
+                c.imports ~= i.idup;
+            g_files ~= c;
+        }
+    });
     g_indexBuilt = true;
     traceMs("index.build", nowMs() - t0);
 }
@@ -1120,7 +955,6 @@ private void sendIndexBuilt(size_t count)
     auto root = js.create_object();
     js.add_bool_to_object(root, "ok", true);
     js.add_number_to_object(root, "count", count);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -1142,7 +976,6 @@ private void sendWorkspaceSymbols(const(WIndexSym)[] syms)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "syms", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -1190,7 +1023,6 @@ private void sendImportCandidates(const(WIndexSym)[] cands)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "cands", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -1311,7 +1143,6 @@ private void sendImplementStubs(const(WStub)[] stubs)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "stubs", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -1502,7 +1333,6 @@ private void sendTypeItems(const(WTypeItem)[] items)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "items", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -1772,7 +1602,13 @@ private string[] allModuleNames(ref ServerState s)
     if (!g_stdModules.length)
     {
         import fsutil : findDFiles;
-        foreach (dir; s.dmd.importPaths)
+        import layers : levelSuspend, levelResume;
+
+        // Cached across requests: level 0.
+        auto lt = levelSuspend();
+        scope (exit)
+            levelResume(lt);
+        foreach (dir; s.engine.cfg.importPaths)
             foreach (f; findDFiles(dir))
             {
                 auto mn = moduleNameOfFile(dir, f);
@@ -1831,7 +1667,6 @@ private bool completeImportAndSend(ref ServerState s, const(char)[] text,
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "items", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
     return true;
 }
@@ -2027,7 +1862,6 @@ private void sendDocumentLinks(const(WLink)[] links)
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "links", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -2048,7 +1882,7 @@ private void referencesAndSend(ref ServerState s, const ref Analysis a,
 // analysed as its own root (isolating failures) and uses are matched by
 // declaration key, so no synthetic combined universe is needed. Completeness
 // is tracked per candidate and reported alongside the locations (it gates
-// rename). Must run in a fork: every `serverAnalyze` resets dmd state.
+// rename). The candidates become extra roots of one overlay.
 
 private bool isIdChar(char c) pure nothrow @nogc @safe
 {
@@ -2118,9 +1952,31 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
         return r;
     }
 
-    // The target identity must be copied before any reset invalidates the
-    // request universe; matching below is by key only.
+    // The target identity must be copied (to level 0) before the overlay it
+    // points into is dropped below; matching is by key only.
     auto key = declKey(target);
+
+    // From here on, everything this function returns or keeps across the
+    // overlay reset below is built on level 0. dmd itself is only called in
+    // dmd mode (`inDmd`).
+    import layers : levelSuspend, levelResume;
+
+    auto lt = levelSuspend();
+    scope (exit)
+        levelResume(lt);
+    void inDmd(scope void delegate() fn)
+    {
+        levelResume(lt);
+        scope (exit)
+            lt = levelSuspend();
+        fn();
+    }
+
+    key.moduleFQN = key.moduleFQN.idup;
+    key.parentFQN = key.parentFQN.idup;
+    key.name = key.name.idup;
+    r.oldName = r.oldName.idup;
+    r.declFile = r.declFile.idup;
 
     string declName = r.declFile.length ? indexModuleOfFile(r.declFile) : null;
     if (!declName.length)
@@ -2166,7 +2022,7 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
 
     // Analyse each candidate as its own root and match by declaration key.
     // A module that fails to load marks the result incomplete but cannot hide
-    // its siblings. Runs in a fork: each `serverAnalyze` resets dmd state.
+    // its siblings.
     RefLoc[] out_;
     ulong tAnalyze0 = nowMs();
     // Resolving a reference to a manifest constant requires the *unfolded* AST:
@@ -2176,11 +2032,18 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     // re-analysed unfolded too. `lspNoManifestExpand` is imported from the
     // vendored frontend on purpose: a `make vendor` that drops the patch fails
     // to compile here instead of silently regressing.
+    // The flag changes what dmd produces, so the candidates are analysed on
+    // levels of their own, dependencies included (a candidate may be one of
+    // them), and those are dropped again afterwards so later requests see
+    // folded ASTs. `a` is invalid from here on.
     import dmd.optimize : lspNoManifestExpand;
+    engineReset(s.engine, true);
     lspNoManifestExpand = true;
-    s.uni.valid = false;
     scope (exit)
+    {
+        engineReset(s.engine, true);
         lspNoManifestExpand = false;
+    }
     foreach (mn, _; want)
     {
         auto f = indexFileOf(mn);
@@ -2208,7 +2071,13 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
                 reason = "parse failed " ~ mn;
             continue;
         }
-        bool unloaded = dmdHasUnloadedImport(ca.module_);
+        bool unloaded, hidden;
+        RefLoc[] found;
+        inDmd(() {
+            unloaded = dmdHasUnloadedImport(ca.module_);
+            hidden = riskyMatters && dmdHasHiddenRefRisk(text, ident);
+            found = referencesForKey([cast(Module) ca.module_], key, includeDecl, f, text);
+        });
         if (unloaded)
         {
             complete = false;
@@ -2223,14 +2092,14 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
             if (!reason.length)
                 reason = "semantic errors in " ~ mn;
         }
-        if (riskyMatters && dmdHasHiddenRefRisk(text, ident))
+        if (hidden)
         {
             complete = false;
             if (!reason.length)
                 reason = "__traits in " ~ mn;
         }
-        out_ ~= referencesForKey([cast(Module) ca.module_], key, includeDecl,
-            f, text);
+        foreach (x; found)
+            out_ ~= RefLoc(x.file.idup, x.line, x.col, x.len);
     }
     traceMs("refs.wide.analyze", nowMs() - tAnalyze0, "modules");
     traceMs("refs.wide.total", nowMs() - tComputeStart);
@@ -2271,7 +2140,6 @@ private void sendRename(bool ok, const(char)[] reason, const(char)[] declFile,
         js.add_item_to_array(arr, o);
     }
     js.add_item_to_object(root, "edits", arr);
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -2291,7 +2159,6 @@ private void sendPrepareRename(bool ok, uint line, uint col, uint len,
     }
     if (reason.length)
         js.add_string_to_object(root, "reason", zstr(reason));
-    js.add_bool_to_object(root, "needRespawn", false);
     writeFrame(outChan, printJsonStr(root));
 }
 
@@ -2368,833 +2235,458 @@ private void renameAndSend(ref ServerState s, const ref Analysis a,
     sendRename(true, null, r.declFile, r.refs);
 }
 
-    void workerMain()
+// Serve one request against `s`; the reply is left in `outChan`.
+private void serveRequest(ref ServerState s, const(char)[] req)
+{
+    do
     {
-        version (Posix) { inChan.fd = 0; outChan.fd = 1; }
-        version (Windows)
+        // This op's JSON lives in its own arena (see lsp.jcur).
+        auto savedArena = jcur;
+        jcur = &jops;
+        jops.reset();
+        scope (exit)
+            jcur = savedArena;
+        // Ops call into dmd (lexer, lookups, lazy semantic) everywhere:
+        // run them in dmd mode so whatever dmd allocates or relocates
+        // lands on a dmd level, never on level 0, where its later
+        // mutations would escape the page protection. Op-local garbage
+        // goes with the overlay; level-0 copies are explicit.
+        import layers : levelEnter, levelLeave;
+
+        levelEnter();
+        scope (exit)
+            levelLeave();
+        engineCheckIdentifiers("op start");
+        scope (exit)
+            engineCheckIdentifiers("op end");
+        // The request scratch arena is per-request: reset it before every op
+        // so read-only ops (completion, hover, references, ...) do not
+        // accumulate their transient output across requests.
+        s.scratch.reset();
+        auto p = jparse(req);
+        auto ops = p ? jstr(jget(p, "op")) : null;
+        import timing : nowMs, traceMs;
+
+        immutable opStart = nowMs();
+        scope (exit)
+            traceMs(outChan.written ? "op" : "op (no reply)", nowMs() - opStart, ops);
+        // Crash guard: an uncaught Error (e.g. a frontend assert) is
+        // logged with its stack, and every dmd level is dropped: popping
+        // restores the state from before the failed analysis, so the
+        // server keeps going with a clean frontend.
+        const(char)[] crashedOp = ops;
+        try
         {
-            // Resolve the inherited std handles on each call (chanRead/chanWrite).
-            inChan.stdHandle = true;
-            outChan.stdHandle = true;
+        if (ops == "shutdown")
+            break;
+        if (ops == "analyze")
+        {
+            // Open/save and the debounced idle pass: analyse the document
+            // as it is now and publish. The overlay answers repeats of the
+            // same text; anything else is a fresh overlay on warm deps.
+            // Test hook: force an uncaught Error so the crash guard can be
+            // exercised (tests/test_crash.py).
+            import core.stdc.stdlib : getenv;
+            __gshared bool crashTested;
+            if (!crashTested)
+                if (auto mode = getenv("DMD_LSP_CRASH_TEST"))
+                {
+                    import core.stdc.string : strcmp;
+
+                    crashTested = true; // once: the test then checks recovery
+                    if (strcmp(mode, "segv") == 0)
+                    {
+                        // A fault in dmd code (dmd mode is on here).
+                        __gshared int* nowhere;
+                        *nowhere = 1;
+                    }
+                    throw new Error("intentional crash test");
+                }
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto text = jstr(jget(p, "text"));
+            if (text is null)
+                text = "";
+            auto a = serverAnalyze(s, path, text);
+            sendAnalyze(a);
+            continue;
         }
-        ServerState s;
-        bool built = false;
-        for (;;)
+        if (ops == "complete")
         {
-            // A response we could not deliver already wedged the parent; exit
-            // so it sees EOF and respawns instead of waiting forever.
-            if (g_writeFailed)
-                break;
-            char[] req;
-            if (!readFrame(inChan, req))
-                break;
-            jtmp.reset();
-            auto p = jparse(req);
-            auto ops = p ? jstr(jget(p, "op")) : null;
-            // Registry cap hit on a previous op: force a respawn so the OS
-            // reclaims the accumulated universe before doing more work.
-            if (s.overCap && ops != "shutdown" && ops != "init")
-            {
-                sendNeedRespawn();
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto prefix = jstr(jget(p, "prefix"));
+            if (prefix is null)
+                prefix = "";
+            // Import-statement completion is textual: module names, or a
+            // module's members after `import m : `.
+            if (completeImportAndSend(s, orig, line, col))
                 continue;
-            }
-            if (ops == "shutdown")
-                break;
-            if (ops == "init")
-            {
-                string[] imports;
-                string[] strings;
-                if (auto ip = jget(p, "importPaths"))
-                    if ((ip.type & 0xFF) == JsonArray)
-                        for (auto c = ip.child; c; c = c.next)
-                        {
-                            auto v = jstr(c);
-                            if (v.length)
-                                imports ~= v.idup;
-                        }
-                if (auto sp = jget(p, "stringPaths"))
-                    if ((sp.type & 0xFF) == JsonArray)
-                        for (auto c = sp.child; c; c = c.next)
-                        {
-                            auto v = jstr(c);
-                            if (v.length)
-                                strings ~= v.idup;
-                        }
-                string[] flags;
-                if (auto fp = jget(p, "flags"))
-                    if ((fp.type & 0xFF) == JsonArray)
-                        for (auto c = fp.child; c; c = c.next)
-                        {
-                            auto v = jstr(c);
-                            if (v.length)
-                                flags ~= v.idup;
-                        }
-                bool sharedReg = jbool(jget(p, "shared"), false);
-                size_t maxModules = cast(size_t) jint(jget(p, "maxModules"));
-                if (maxModules == 0)
-                    maxModules = 512;
-                serverInit(s, imports, strings, flags, sharedReg, maxModules);
-                auto js = jmake();
-                auto root = js.create_object();
-                js.add_bool_to_object(root, "ok", true);
-                writeFrame(outChan, printJsonStr(root));
+            if (completeVersionAndSend(s, orig, line, col))
                 continue;
-            }
-            if (ops == "analyze")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                // Diagnostics must never come from a completion-neutralized
-                // universe, and open/save must not use the in-place re-parse:
-                // for an edited root it leaves modules that import the root
-                // holding stale symbols (false "not callable" in cyclic
-                // projects). Reuse only an exact-text universe, else rebuild.
-                auto st = built ? serverUniState(s, path, null, text) : UniState.miss;
-                // Trivia-only edit (same significant tokens): diagnostics are
-                // unchanged, so report them as-is. Leave the universe valid
-                // with its old text hashes: the next semantic request then
-                // re-analyses in place (incremental) instead of being forced
-                // into a respawn. The cached analysis has stale positions, but
-                // the edited text never matches its hashes, so it is never
-                // reused.
-                if (built && st == UniState.incremental &&
-                    dmdTokenHash(text) == s.uni.tokenHash)
-                {
-                    Analysis none;
-                    sendAnalyze(none, true);
-                    continue;
-                }
-                // Narrowed to cyclic roots: only an in-place re-parse of a
-                // root that some loaded module imports is unsafe (stale
-                // symbols). Any other root keeps the cheap incremental path.
-                if (st == UniState.incremental && built &&
-                    !canIncrementalReparse(s, built, st))
-                    st = UniState.miss;
-                // Only the root text changed: re-analyze it in a fork child on
-                // the warm dependency closure. A root switch, dependency edit
-                // or config change needs a fresh universe.
-                if (built && st == UniState.incremental && forkRun(() {
-                    auto a = serverAnalyzeIncremental(s, path, text, null);
-                    sendAnalyze(a);
-                }))
-                    continue;
-                if (built && st != UniState.reuse)
-                {
-                    if (s.sharedReg)
+            // Completion answers from the analysis the overlay holds (the
+            // last debounced/open/save pass), so typing never re-analyses.
+            auto a = warmOrAnalyze(s, path, atext, orig);
+            completeAndSend(s, a, orig, line, col, prefix);
+            continue;
+        }
+        if (ops == "signature")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto a = cachedAnalysis(s, path);
+            signatureAndSend(s, a, orig, line, col);
+            continue;
+        }
+        if (ops == "definition")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            bool typeDef = jbool(jget(p, "type"), false);
+            auto a = cachedAnalysis(s, path);
+            definitionAndSend(s, a, orig, line, col, typeDef);
+            continue;
+        }
+        if (ops == "implementStubs")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto a = cachedAnalysis(s, path);
+            implementStubsAndSend(s, a, orig, line, col);
+            continue;
+        }
+        if (ops == "inlayHint")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            auto a = cachedAnalysis(s, path);
+            inlayHintsAndSend(s, a, orig);
+            continue;
+        }
+        if (ops == "foldingRange")
+        {
+            auto text = jstr(jget(p, "text"));
+            if (text is null)
+                text = "";
+            sendFolds(foldingRanges(text));
+            continue;
+        }
+        if (ops == "documentLink")
+        {
+            auto text = jstr(jget(p, "text"));
+            if (text is null)
+                text = "";
+            string[] dirs;
+            if (auto da = jget(p, "dirs"))
+                if ((da.type & 0xFF) == JsonArray)
+                    for (auto c = da.child; c; c = c.next)
                     {
-                        // Diagnostics must be exact. A root already resident has
-                        // had its semantic skipped, so re-emit its errors with a
-                        // full analysis:
-                        //  - POSIX: in a fork child (parent registry intact);
-                        //  - Windows: no fork, so respawn the worker (the retry
-                        //    then sees a fresh, non-resident root).
-                        // A non-resident root is analyzed in the parent — exact,
-                        // and it enters the registry so the next navigation
-                        // reuses it instead of re-parsing.
-                        if (dmdModuleResident(path))
-                        {
-                            version (Posix)
-                            {
-                                if (forkRun(() {
-                                    auto a = serverAnalyze(s, path, text);
-                                    sendAnalyze(a);
-                                }))
-                                    continue;
-                            }
-                            sendNeedRespawn();
-                            continue;
-                        }
-                        auto a = serverAnalyzeShared(s, path, text);
-                        sendAnalyze(a);
-                        built = true;
-                        continue;
+                        auto v = jstr(c);
+                        if (v.length)
+                            dirs ~= v.idup;
                     }
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = built ? s.uni.analysis : serverAnalyze(s, path, text);
-                if (built)
-                    s.scratch.rewind(s.uni.mark);
-                sendAnalyze(a);
-                built = true;
+            sendDocumentLinks(documentLinks(s.lex, text, dirs));
+            continue;
+        }
+        if (ops == "documentHighlight")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto a = cachedAnalysis(s, path);
+            documentHighlightAndSend(s, a, path, orig, line, col);
+            continue;
+        }
+        if (ops == "callHierarchy")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto mode = dupOrEmpty(jstr(jget(p, "mode")));
+            auto a = warmOrAnalyze(s, path, atext, orig);
+            callAndSend(s, a, path, orig, line, col, mode);
+            continue;
+        }
+        if (ops == "typeHierarchy")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto mode = dupOrEmpty(jstr(jget(p, "mode")));
+            auto a = warmOrAnalyze(s, path, atext, orig);
+            typeHierarchyAndSend(s, a, path, orig, line, col, mode);
+            continue;
+        }
+        if (ops == "implementation")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto a = warmOrAnalyze(s, path, atext, orig);
+            implementationAndSend(s, a, path, orig, line, col);
+            continue;
+        }
+        if (ops == "references")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            bool includeDecl = jbool(jget(p, "includeDeclaration"), true);
+            if (g_indexBuilt)
+            {
+                // Workspace-wide: the importers found by the index are
+                // analysed as further roots (see computeRefs).
+                auto a0 = cachedAnalysis(s, path);
+                wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
                 continue;
             }
-            if (ops == "lint")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                // Idle (debounced) analyse. Completion never re-analyzes, so
-                // this is the one pass that refreshes the warm universe — and
-                // it now publishes that result, so live diagnostics include
-                // semantic errors, not just syntax. Cost is unchanged: one
-                // analysis per idle, none per keystroke.
-                auto st = built ? serverUniState(s, path, text, null) : UniState.miss;
-                if (canIncrementalReparse(s, built, st))
-                {
-                    auto a = serverAnalyzeIncremental(s, path, text, null);
-                    sendAnalyze(a);
-                }
-                else if (st != UniState.reuse)
-                {
-                    // Anything that is not a safe in-place root re-parse must
-                    // be rebuilt. The shared registry rebuilds in place
-                    // (opt-in); the pool reclaims at the process boundary,
-                    // because an in-process full reset does not free the
-                    // previous universe (dmd's conservative GC keeps it
-                    // reachable). A *fresh* pool worker has no previous
-                    // universe to reclaim, so it builds once; only a warm one
-                    // is retired.
-                    if (s.sharedReg)
+            auto a = cachedAnalysis(s, path);
+            referencesAndSend(s, a, path, orig, line, col, includeDecl);
+            continue;
+        }
+        if (ops == "prepareRename")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto a = cachedAnalysis(s, path);
+            auto occ = occurrenceAt(cast(Module)a.module_, line, col, orig);
+            if (!occ.sym || !isRenameable(occ.sym))
+                sendPrepareRename(false, 0, 0, 0, null, "not renameable");
+            else
+                sendPrepareRename(true, occ.line, occ.col, occ.len,
+                    occ.sym.ident.toString(), null);
+            continue;
+        }
+        if (ops == "rename")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            auto newName = jstr(jget(p, "newName"));
+            if (newName is null)
+                newName = "";
+            auto a0 = warmOrAnalyze(s, path, atext, orig);
+            renameAndSend(s, a0, path, orig, line, col, newName);
+            continue;
+        }
+        if (ops == "hover")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto atext = jstr(jget(p, "atext"));
+            if (atext is null)
+                atext = "";
+            auto orig = jstr(jget(p, "origText"));
+            if (orig is null)
+                orig = "";
+            uint line = cast(uint)jint(jget(p, "line"));
+            uint col = cast(uint)jint(jget(p, "col"));
+            bool fullDecl = jbool(jget(p, "fullDecl"), false);
+            // Hover answers from the overlay's analysis (see `complete`).
+            auto a = warmOrAnalyze(s, path, atext, orig);
+            hoverAndSend(s, a, orig, line, col, fullDecl);
+            continue;
+        }
+        if (ops == "documentSymbol")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto text = jstr(jget(p, "text"));
+            if (text is null)
+                text = "";
+            auto a = cachedAnalysis(s, path);
+            sendDocumentSymbol(a, text);
+            continue;
+        }
+        if (ops == "buildIndex")
+        {
+            string[] files;
+            if (auto a = jget(p, "files"))
+                if ((a.type & 0xFF) == JsonArray)
+                    for (auto c = a.child; c; c = c.next)
                     {
-                        auto a = serverAnalyzeShared(s, path, text);
-                        // A root that was already resident reuses its
-                        // semanticised module and does not re-emit errors, so
-                        // keep this warm out of the save/open hit cache.
-                        s.uni.valid = false;
-                        sendAnalyze(a);
+                        auto v = jstr(c);
+                        if (v.length)
+                            files ~= v.idup;
                     }
-                    else if (built)
-                    {
-                        sendNeedRespawn();
-                        continue;
-                    }
-                    else
-                    {
-                        auto a = serverAnalyze(s, path, text);
-                        sendAnalyze(a);
-                    }
-                }
-                else
-                    sendAnalyze(s.uni.analysis);
-                built = true;
-                continue;
-            }
-            if (ops == "complete")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto prefix = jstr(jget(p, "prefix"));
-                if (prefix is null)
-                    prefix = "";
-                // Import-statement completion is textual: module names, or a
-                // module's members after `import m : `.
-                if (completeImportAndSend(s, orig, line, col))
-                    continue;
-                if (completeVersionAndSend(s, orig, line, col))
-                    continue;
-                // Completion answers from the warm per-root cache (the last
-                // debounced/open/save analysis), so typing never re-analyses.
-                // A dependency edit invalidates the cache; the pool rebuilds at
-                // the process boundary (an in-process reset would not
-                // reclaim), the shared registry in place.
-                if (!s.sharedReg && built && path.idup in s.roots &&
-                    universeDepsChanged(s.uni.deps))
-                {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = warmOrAnalyze(s, built, path, atext, orig);
-                completeAndSend(s, a, orig, line, col, prefix);
-                continue;
-            }
-            if (ops == "signature")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto a = cachedAnalysis(s, path);
-                signatureAndSend(s, a, orig, line, col);
-                continue;
-            }
-            if (ops == "definition")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                bool typeDef = jbool(jget(p, "type"), false);
-                auto a = cachedAnalysis(s, path);
-                definitionAndSend(s, a, orig, line, col, typeDef);
-                continue;
-            }
-            if (ops == "implementStubs")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto a = cachedAnalysis(s, path);
-                implementStubsAndSend(s, a, orig, line, col);
-                continue;
-            }
-            if (ops == "inlayHint")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                auto a = cachedAnalysis(s, path);
-                inlayHintsAndSend(s, a, orig);
-                continue;
-            }
-            if (ops == "foldingRange")
-            {
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                sendFolds(foldingRanges(text));
-                continue;
-            }
-            if (ops == "documentLink")
-            {
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                string[] dirs;
-                if (auto da = jget(p, "dirs"))
-                    if ((da.type & 0xFF) == JsonArray)
-                        for (auto c = da.child; c; c = c.next)
-                        {
-                            auto v = jstr(c);
-                            if (v.length)
-                                dirs ~= v.idup;
-                        }
-                sendDocumentLinks(documentLinks(s.lex, text, dirs));
-                continue;
-            }
-            if (ops == "documentHighlight")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto a = cachedAnalysis(s, path);
-                documentHighlightAndSend(s, a, path, orig, line, col);
-                continue;
-            }
-            if (ops == "callHierarchy")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto mode = dupOrEmpty(jstr(jget(p, "mode")));
-                auto a = warmOrAnalyze(s, built, path, atext, orig);
-                if (forkRun(() {
-                    callAndSend(s, a, path, orig, line, col, mode);
-                }))
-                    continue;
-                sendCalls(mode, null, null);
-                built = true;
-                continue;
-            }
-            if (ops == "typeHierarchy")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto mode = dupOrEmpty(jstr(jget(p, "mode")));
-                auto a = warmOrAnalyze(s, built, path, atext, orig);
-                if (forkRun(() {
-                    typeHierarchyAndSend(s, a, path, orig, line, col, mode);
-                }))
-                    continue;
-                WTypeItem[] none;
-                sendTypeItems(none);
-                built = true;
-                continue;
-            }
-            if (ops == "implementation")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto a = warmOrAnalyze(s, built, path, atext, orig);
-                if (forkRun(() {
-                    implementationAndSend(s, a, path, orig, line, col);
-                }))
-                    continue;
-                sendLocs(null);
-                built = true;
-                continue;
-            }
-            if (ops == "references")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                bool includeDecl = jbool(jget(p, "includeDeclaration"), true);
-                if (g_indexBuilt)
-                {
-                    // Workspace-wide: ensure the request universe, then fork
-                    // (the per-candidate re-analysis clobbers the warm
-                    // universe). Without a fork, fall back to the
-                    // in-universe result rather than risk clobbering.
-                    auto a0 = cachedAnalysis(s, path);
-                    if (forkRun(() {
-                        wideReferencesAndSend(s, a0, path, orig, line, col, includeDecl);
-                    }))
-                        continue;
-                    referencesAndSend(s, a0, path, orig, line, col, includeDecl);
-                    continue;
-                }
-                auto a = cachedAnalysis(s, path);
-                referencesAndSend(s, a, path, orig, line, col, includeDecl);
-                continue;
-            }
-            if (ops == "prepareRename")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto a = cachedAnalysis(s, path);
-                auto occ = occurrenceAt(cast(Module)a.module_, line, col, orig);
-                if (!occ.sym || !isRenameable(occ.sym))
-                    sendPrepareRename(false, 0, 0, 0, null, "not renameable");
-                else
-                    sendPrepareRename(true, occ.line, occ.col, occ.len,
-                        occ.sym.ident.toString(), null);
-                continue;
-            }
-            if (ops == "rename")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                auto newName = jstr(jget(p, "newName"));
-                if (newName is null)
-                    newName = "";
-                auto st = built ? serverUniState(s, path, orig, null) : UniState.miss;
-                Analysis a0;
-                if (built && st == UniState.reuse)
-                    a0 = s.uni.analysis;
-                else
-                {
-                    a0 = serverAnalyze(s, path, atext, orig);
-                    built = true;
-                }
-                if (forkRun(() {
-                    renameAndSend(s, a0, path, orig, line, col, newName);
-                }))
-                    continue;
-                // No fork (Windows) or child failed: run inline and drop the
-                // warm universe (per-candidate analysis resets it).
-                renameAndSend(s, a0, path, orig, line, col, newName);
-                built = false;
-                continue;
-            }
-            if (ops == "hover")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto atext = jstr(jget(p, "atext"));
-                if (atext is null)
-                    atext = "";
-                auto orig = jstr(jget(p, "origText"));
-                if (orig is null)
-                    orig = "";
-                uint line = cast(uint)jint(jget(p, "line"));
-                uint col = cast(uint)jint(jget(p, "col"));
-                bool fullDecl = jbool(jget(p, "fullDecl"), false);
-                // Hover answers from the warm per-root cache (see `complete`),
-                // rebuilding at the process boundary (pool) when a dependency
-                // edit invalidated it.
-                if (!s.sharedReg && built && path.idup in s.roots &&
-                    universeDepsChanged(s.uni.deps))
-                {
-                    sendNeedRespawn();
-                    continue;
-                }
-                auto a = warmOrAnalyze(s, built, path, atext, orig);
-                hoverAndSend(s, a, orig, line, col, fullDecl);
-                continue;
-            }
-            if (ops == "documentSymbol")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                auto a = cachedAnalysis(s, path);
-                sendDocumentSymbol(a, text);
-                continue;
-            }
-            if (ops == "buildIndex")
-            {
-                string[] files;
-                if (auto a = jget(p, "files"))
-                    if ((a.type & 0xFF) == JsonArray)
-                        for (auto c = a.child; c; c = c.next)
-                        {
-                            auto v = jstr(c);
-                            if (v.length)
-                                files ~= v.idup;
-                        }
-                buildIndexNow(s, files);
-                // H3 keeps the parse registration-free, so the warm universe
-                // is untouched and stays valid for the next request.
-                sendIndexBuilt(g_index.length);
-                continue;
-            }
-            if (ops == "setDoc")
-            {
-                auto dp = jstr(jget(p, "path"));
-                auto tn = jget(p, "text");
-                if (dp !is null && dp.length)
-                {
-                    if (tn is null || (tn.type & 0xFF) == JsonNull)
-                        dmdRemoveDoc(dp);
-                    else
-                    {
-                        auto dt = jstr(tn);
-                        dmdSetDoc(dp, dt is null ? "" : dt);
-                    }
-                }
-                auto js = jmake();
-                auto root = js.create_object();
-                js.add_bool_to_object(root, "ok", true);
-                js.add_bool_to_object(root, "needRespawn", false);
-                writeFrame(outChan, printJsonStr(root));
-                continue;
-            }
-            if (ops == "workspaceSymbol")
-            {
-                auto q = jstr(jget(p, "query"));
-                if (q is null)
-                    q = "";
-                sendWorkspaceSymbols(queryIndex(q));
-                continue;
-            }
-            if (ops == "importCandidates")
-            {
-                auto nm = dupOrEmpty(jstr(jget(p, "name")));
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                sendImportCandidates(importCandidates(nm, path));
-                continue;
-            }
-            if (ops == "importCompletions")
-            {
-                auto pfx = dupOrEmpty(jstr(jget(p, "prefix")));
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                sendImportCandidates(importCompletions(pfx, path));
-                continue;
-            }
-            if (ops == "invalidateIndex")
-            {
-                g_index = null;
-                g_indexBuilt = false;
-                auto js = jmake();
-                auto root = js.create_object();
-                js.add_bool_to_object(root, "ok", true);
-                js.add_bool_to_object(root, "needRespawn", false);
-                writeFrame(outChan, printJsonStr(root));
-                continue;
-            }
-            if (ops == "semantic")
-            {
-                auto path = dupOrEmpty(jstr(jget(p, "path")));
-                auto text = jstr(jget(p, "text"));
-                if (text is null)
-                    text = "";
-                // Tokens answer from the warm per-root cache too (see
-                // `complete`/`hover`): analysis is debounce-only.
-                auto a = cachedAnalysis(s, path);
-                SemTok[] toks;
-                semanticTokens(cast(Module)a.module_, a.syn, text, toks);
-                sendSemantic(toks);
-                continue;
-            }
-            sendNeedRespawn(); // unknown op
+            buildIndexNow(s, files);
+            // H3 keeps the parse registration-free, so the warm universe
+            // is untouched and stays valid for the next request.
+            sendIndexBuilt(g_index.length);
+            continue;
+        }
+        if (ops == "workspaceSymbol")
+        {
+            auto q = jstr(jget(p, "query"));
+            if (q is null)
+                q = "";
+            sendWorkspaceSymbols(queryIndex(q));
+            continue;
+        }
+        if (ops == "importCandidates")
+        {
+            auto nm = dupOrEmpty(jstr(jget(p, "name")));
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            sendImportCandidates(importCandidates(nm, path));
+            continue;
+        }
+        if (ops == "importCompletions")
+        {
+            auto pfx = dupOrEmpty(jstr(jget(p, "prefix")));
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            sendImportCandidates(importCompletions(pfx, path));
+            continue;
+        }
+        if (ops == "semantic")
+        {
+            auto path = dupOrEmpty(jstr(jget(p, "path")));
+            auto text = jstr(jget(p, "text"));
+            if (text is null)
+                text = "";
+            // Tokens answer from the warm per-root cache too (see
+            // `complete`/`hover`): analysis is debounce-only.
+            auto a = cachedAnalysis(s, path);
+            SemTok[] toks;
+            semanticTokens(cast(Module)a.module_, a.syn, text, toks);
+            sendSemantic(toks);
+            continue;
+        }
+        writeFrame(outChan, `{"unknownOp":true}`);
+        }
+        catch (Throwable t)
+        {
+            log("op FAILED op=%.*s: %.*s",
+                cast(int) crashedOp.length, crashedOp.ptr,
+                cast(int) t.msg.length, t.msg.ptr);
+            if (t.info)
+                foreach (line; t.info)
+                    log("  %.*s", cast(int) line.length, line.ptr);
+            engineHardReset(s.engine);
+            if (!outChan.written)
+                writeFrame(outChan, `{"failed":true}`);
         }
     }
+    while (false);
+}
 
+// ---------- in-process front ----------
 
-// ---------- parent side ----------
+// The analysis side as the LSP front end sees it. It used to be a child
+// process; the name and the request/reply shape stayed.
 struct Worker
 {
-    Chan req;   // parent -> child requests
-    Chan resp;  // child -> parent responses
-    version (Posix)
-        pid_t pid = -1;
-    version (Windows)
-        void* proc = null;
-    bool alive = false;
+    ServerState* s;
+    bool alive;
 }
 
 private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
 {
     if (!w.alive)
         return false;
-    if (writeFrame(w.req, req) && readFrame(w.resp, resp))
-        return true;
-    log("worker exchange failed; respawning");
-    return false;
+    outChan.written = false;
+    serveRequest(*w.s, req);
+    if (!outChan.written)
+        return false;
+    // The reply buffer is reused by the next request: hand out a copy.
+    resp = outChan.buf.dup;
+    return true;
 }
 
 void workerKill(ref Worker w)
 {
-    version (Posix)
-    {
-        if (w.req.fd >= 0) { close(w.req.fd); w.req.fd = -1; }
-        if (w.resp.fd >= 0) { close(w.resp.fd); w.resp.fd = -1; }
-        if (w.pid > 0)
-        {
-            int status = 0;
-            waitpid(w.pid, &status, 0);
-            if (WIFSIGNALED(status))
-            {
-                log("worker killed by signal %d", WTERMSIG(status));
-            }
-            w.pid = -1;
-        }
-    }
-    version (Windows)
-    {
-        if (w.req.h) { CloseHandle(w.req.h); w.req.h = null; }
-        if (w.resp.h) { CloseHandle(w.resp.h); w.resp.h = null; }
-        if (w.proc)
-        {
-            TerminateProcess(w.proc, 0);
-            WaitForSingleObject(w.proc, 5000);
-            CloseHandle(w.proc);
-            w.proc = null;
-        }
-    }
+    if (w.s !is null)
+        serverShutdown(*w.s);
     w.alive = false;
 }
 
-// Pipe fds of `w` that a newly forked worker must close. Without this, a
-// second worker inherits the first's pipe ends; killing the first then cannot
-// EOF it (another process still holds the write end) and the server blocks in
-// waitpid. Windows has no fork; use workerDisinherit instead.
-void workerChildFds(ref Worker w, ref int[] out_)
-{
-    version (Posix)
-    {
-        if (w.req.fd >= 0)
-            out_ ~= w.req.fd;
-        if (w.resp.fd >= 0)
-            out_ ~= w.resp.fd;
-    }
-}
-
-// Windows: mark the server's ends of `w` non-inheritable so a later worker
-// (CreateProcess inherits inheritable handles) cannot hold them open.
-void workerDisinherit(ref Worker w)
-{
-    version (Windows)
-    {
-        import core.sys.windows.winbase : SetHandleInformation,
-            HANDLE_FLAG_INHERIT;
-        if (w.req.h)
-            SetHandleInformation(w.req.h, HANDLE_FLAG_INHERIT, 0);
-        if (w.resp.h)
-            SetHandleInformation(w.resp.h, HANDLE_FLAG_INHERIT, 0);
-    }
-}
-
 bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flags,
-    scope const(int)[] closeInChild = null, bool sharedReg = false, uint maxModules = 512)
+    DocProvider docs)
 {
-    version (Posix)
-    {
-        int[2] toChild, fromChild;
-        if (pipe(toChild) != 0)
-            return false;
-        if (pipe(fromChild) != 0)
-        {
-            close(toChild[0]); close(toChild[1]);
-            return false;
-        }
-        auto pid = fork();
-        if (pid < 0)
-        {
-            close(toChild[0]); close(toChild[1]);
-            close(fromChild[0]); close(fromChild[1]);
-            return false;
-        }
-        if (pid == 0)
-        {
-            // Child: never touch the parent's LSP stdout channel.
-            dup2(toChild[0], 0);
-            dup2(fromChild[1], 1);
-            close(toChild[0]); close(toChild[1]);
-            close(fromChild[0]); close(fromChild[1]);
-            // Drop the server's other workers' pipe ends: inheriting them
-            // would keep those workers alive after the server closes its end.
-            foreach (fd; closeInChild)
-                if (fd >= 0)
-                    close(fd);
-            workerMain();
-            _exit(0);
-        }
-        close(toChild[0]);
-        close(fromChild[1]);
-        w.req.fd = toChild[1];
-        w.resp.fd = fromChild[0];
-        w.pid = pid;
-        w.alive = true;
-    }
-    version (Windows)
-    {
-        SECURITY_ATTRIBUTES secattr;
-        secattr.nLength = SECURITY_ATTRIBUTES.sizeof;
-        secattr.lpSecurityDescriptor = null;
-        secattr.bInheritHandle = TRUE;
-        HANDLE toChildR, toChildW, fromChildR, fromChildW;
-        if (!CreatePipe(&toChildR, &toChildW, &secattr, 0))
-            return false;
-        if (!CreatePipe(&fromChildR, &fromChildW, &secattr, 0))
-        {
-            CloseHandle(toChildR); CloseHandle(toChildW);
-            return false;
-        }
-        // Don't inherit the parent's pipe ends, so the worker sees stdin EOF
-        // when this process exits.
-        SetHandleInformation(toChildW, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(fromChildR, HANDLE_FLAG_INHERIT, 0);
-        // Nor the LSP transport: an orphaned worker holding this process's
-        // stdout would keep the client's pipe open and the server "running".
-        SetHandleInformation(GetStdHandle(STD_INPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, 0);
-        STARTUPINFOA si;
-        si.cb = STARTUPINFOA.sizeof;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = toChildR;
-        si.hStdOutput = fromChildW;
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        PROCESS_INFORMATION pi;
-        char[4096] exe;
-        auto n = GetModuleFileNameA(null, exe.ptr, cast(DWORD)exe.length);
-        if (n == 0 || n >= exe.length)
-        {
-            CloseHandle(toChildR); CloseHandle(toChildW);
-            CloseHandle(fromChildR); CloseHandle(fromChildW);
-            return false;
-        }
-        exe[n] = 0;
-        // argv[0] must be the exe: druntime rebuilds args from the command
-        // line, and main.d finds the worker via `--worker` in args[1..$].
-        char[4200] cmd;
-        size_t ci = 0;
-        cmd[ci++] = '"';
-        cmd[ci .. ci + n] = exe[0 .. n];
-        ci += n;
-        cmd[ci++] = '"';
-        cmd[ci++] = ' ';
-        foreach (c; "--worker")
-            cmd[ci++] = c;
-        cmd[ci] = 0;
-        if (!CreateProcessA(exe.ptr, cmd.ptr, null, null, TRUE, 0, null, null, &si, &pi))
-        {
-            CloseHandle(toChildR); CloseHandle(toChildW);
-            CloseHandle(fromChildR); CloseHandle(fromChildW);
-            return false;
-        }
-        CloseHandle(pi.hThread);
-        CloseHandle(toChildR);
-        CloseHandle(fromChildW);
-        w.req.h = toChildW;
-        w.resp.h = fromChildR;
-        w.proc = pi.hProcess;
-        w.alive = true;
-    }
-
-    auto js = jmake();
-    auto root = js.create_object();
-    js.add_string_to_object(root, "op", zstr("init"));
-    js.add_bool_to_object(root, "shared", sharedReg);
-    js.add_number_to_object(root, "maxModules", cast(double) maxModules);
-    auto ia = js.create_array();
-    foreach (p; imports)
-        js.add_item_to_array(ia, js.create_string(zstr(p)));
-    js.add_item_to_object(root, "importPaths", ia);
-    auto sa = js.create_array();
-    foreach (p; strings)
-        js.add_item_to_array(sa, js.create_string(zstr(p)));
-    js.add_item_to_object(root, "stringPaths", sa);
-    auto fa = js.create_array();
-    foreach (p; flags)
-        js.add_item_to_array(fa, js.create_string(zstr(p)));
-    js.add_item_to_object(root, "flags", fa);
-
-    char[] resp;
-    if (!workerExchange(w, printJsonStr(root), resp))
-    {
-        log("worker: init exchange failed");
-        workerKill(w);
-        return false;
-    }
+    if (w.s is null)
+        w.s = new ServerState;
+    w.s.engine.docs = docs;
+    serverInit(*w.s, imports, strings, flags);
+    w.alive = true;
     return true;
+}
+
+// The engine behind `w`, for document/disk change notifications.
+ref Engine workerEngine(ref Worker w)
+{
+    return w.s.engine;
 }
 
 struct WDiag
@@ -3228,7 +2720,6 @@ struct WAnalysis
     WDiag[] diags;
     WLint lintImports;
     WLint lintParams;
-    bool unchanged; // trivia-only edit: no re-analysis, keep prior diagnostics
 }
 
 struct WItem
@@ -3364,8 +2855,7 @@ struct WToken
 enum ExchangeResult
 {
     ok,
-    respawn,
-    failed,
+    failed, // the op threw (the engine was reset) or produced no reply
 }
 
 private void parseLint(JsonNode* node, ref WLint out_)
@@ -3411,20 +2901,11 @@ private void parseAnalysis(JsonNode* root, ref WAnalysis out_)
 }
 
 ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] text,
-    ref WAnalysis out_, bool realOnly = false)
+    ref WAnalysis out_)
 {
     auto js = jmake();
     auto root = js.create_object();
-    // open/save (realOnly) get full semantic diagnostics. The debounced
-    // keypress normally uses the parse-only lint path, which is cheap because
-    // POSIX forks a child for it. Windows has no fork, so the lint would
-    // clobber the warm universe and force a worker respawn on the next
-    // semantic request; use the in-place analyze path there instead.
-    version (Windows)
-        immutable bool useLint = false;
-    else
-        immutable bool useLint = !realOnly;
-    js.add_string_to_object(root, "op", zstr(useLint ? "lint" : "analyze"));
+    js.add_string_to_object(root, "op", zstr("analyze"));
     js.add_string_to_object(root, "path", zstr(path));
     js.add_string_to_object(root, "text", zstr(text));
     char[] resp;
@@ -3433,9 +2914,6 @@ ExchangeResult workerAnalyze(ref Worker w, const(char)[] path, const(char)[] tex
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
-    out_.unchanged = jbool(jget(r, "unchanged"), false);
     parseAnalysis(r, out_);
     return ExchangeResult.ok;
 }
@@ -3458,8 +2936,6 @@ ExchangeResult workerComplete(ref Worker w, const(char)[] path, const(char)[] at
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "items"))
     {
         for (auto c = arr.child; c; c = c.next)
@@ -3507,8 +2983,6 @@ ExchangeResult workerSignature(ref Worker w, const(char)[] path, const(char)[] a
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_.found = jbool(jget(r, "found"), false);
     if (out_.found)
     {
@@ -3547,8 +3021,6 @@ ExchangeResult workerDefinition(ref Worker w, const(char)[] path, const(char)[] 
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_.found = jbool(jget(r, "found"), false);
     if (out_.found)
     {
@@ -3578,8 +3050,6 @@ ExchangeResult workerTypeDefinition(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_.found = jbool(jget(r, "found"), false);
     if (out_.found)
     {
@@ -3609,8 +3079,6 @@ ExchangeResult workerImplementation(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto la = jget(r, "locs"))
         if ((la.type & 0xFF) == JsonArray)
             for (auto c = la.child; c; c = c.next)
@@ -3657,8 +3125,6 @@ ExchangeResult workerCallHierarchy(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto ia = jget(r, "items"))
         if ((ia.type & 0xFF) == JsonArray)
             for (auto c = ia.child; c; c = c.next)
@@ -3705,8 +3171,6 @@ ExchangeResult workerTypeHierarchy(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "items"))
         for (auto c = arr.child; c; c = c.next)
         {
@@ -3737,8 +3201,6 @@ ExchangeResult workerInlayHints(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto ha = jget(r, "hints"))
         if ((ha.type & 0xFF) == JsonArray)
             for (auto c = ha.child; c; c = c.next)
@@ -3766,8 +3228,6 @@ ExchangeResult workerFolding(ref Worker w, const(char)[] text, ref WFold[] out_)
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto fa = jget(r, "folds"))
         if ((fa.type & 0xFF) == JsonArray)
             for (auto c = fa.child; c; c = c.next)
@@ -3798,8 +3258,6 @@ ExchangeResult workerDocumentLinks(ref Worker w, const(char)[] text,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto la = jget(r, "links"))
         if ((la.type & 0xFF) == JsonArray)
             for (auto c = la.child; c; c = c.next)
@@ -3833,8 +3291,6 @@ ExchangeResult workerDocumentHighlight(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto la = jget(r, "locs"))
         if ((la.type & 0xFF) == JsonArray)
             for (auto c = la.child; c; c = c.next)
@@ -3868,8 +3324,6 @@ ExchangeResult workerHover(ref Worker w, const(char)[] path, const(char)[] atext
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_.found = jbool(jget(r, "found"), false);
     if (out_.found)
     {
@@ -3893,8 +3347,6 @@ ExchangeResult workerSemantic(ref Worker w, const(char)[] path, const(char)[] te
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "tokens"))
     {
         for (auto c = arr.child; c; c = c.next)
@@ -3911,7 +3363,7 @@ ExchangeResult workerSemantic(ref Worker w, const(char)[] path, const(char)[] te
     return ExchangeResult.ok;
 }
 
-// documentSymbol is forwarded as raw LSP JSON: the tree is built in the child
+// documentSymbol is forwarded as raw LSP JSON: the tree is built by the op
 // (which owns the Module) and the parent re-serializes the `result` subtree.
 ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
     const(char)[] text, ref string resultJson)
@@ -3927,8 +3379,6 @@ ExchangeResult workerDocumentSymbol(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     resultJson = printJsonStr(jget(r, "result"));
     return ExchangeResult.ok;
 }
@@ -3952,8 +3402,6 @@ ExchangeResult workerReferences(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     // A fresh result each request.
     out_.refs = null;
     out_.complete = jbool(jget(r, "complete"), true);
@@ -4006,8 +3454,6 @@ ExchangeResult workerPrepareRename(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_ = WPrep.init;
     out_.ok = jbool(jget(r, "ok"), false);
     out_.line = cast(uint)jint(jget(r, "line"));
@@ -4037,8 +3483,6 @@ ExchangeResult workerRename(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     out_ = WRename.init;
     out_.ok = jbool(jget(r, "ok"), false);
     out_.reason = dupOrEmpty(jstr(jget(r, "reason")));
@@ -4062,28 +3506,6 @@ ExchangeResult workerBuildIndex(ref Worker w, string[] files)
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
-    return ExchangeResult.ok;
-}
-
-// Push one open document into the worker's mirror (text) or drop it (null
-// text). The worker reads dependency sources from here, so an unsaved edit to
-// an imported file is visible without saving. Best-effort: a failed push just
-// leaves the worker on disk bytes until it is respawned/primed.
-ExchangeResult workerSetDoc(ref Worker w, const(char)[] path, const(char)[] text)
-{
-    auto js = jmake();
-    auto root = js.create_object();
-    js.add_string_to_object(root, "op", zstr("setDoc"));
-    js.add_string_to_object(root, "path", zstr(path));
-    if (text is null)
-        js.add_item_to_object(root, "text", js.create_null());
-    else
-        js.add_string_to_object(root, "text", zstr(text));
-    char[] resp;
-    if (!workerExchange(w, printJsonStr(root), resp))
-        return ExchangeResult.failed;
     return ExchangeResult.ok;
 }
 
@@ -4100,8 +3522,6 @@ ExchangeResult workerWorkspaceSymbol(ref Worker w, const(char)[] query,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "syms"))
     {
         for (auto c = arr.child; c; c = c.next)
@@ -4134,8 +3554,6 @@ private ExchangeResult workerImportCands(ref Worker w, const(char)[] op,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "cands"))
         for (auto c = arr.child; c; c = c.next)
         {
@@ -4183,25 +3601,9 @@ ExchangeResult workerImplementStubs(ref Worker w, const(char)[] path,
     auto r = jparse(resp);
     if (!r)
         return ExchangeResult.failed;
-    if (jbool(jget(r, "needRespawn"), false))
-        return ExchangeResult.respawn;
     if (auto arr = jget(r, "stubs"))
         for (auto c = arr.child; c; c = c.next)
             out_ ~= WStub(dupOrEmpty(jstr(jget(c, "name"))),
                 dupOrEmpty(jstr(jget(c, "sig"))));
-    return ExchangeResult.ok;
-}
-
-ExchangeResult workerInvalidateIndex(ref Worker w)
-{
-    auto js = jmake();
-    auto root = js.create_object();
-    js.add_string_to_object(root, "op", zstr("invalidateIndex"));
-    char[] resp;
-    if (!workerExchange(w, printJsonStr(root), resp))
-        return ExchangeResult.failed;
-    auto r = jparse(resp);
-    if (!r)
-        return ExchangeResult.failed;
     return ExchangeResult.ok;
 }
