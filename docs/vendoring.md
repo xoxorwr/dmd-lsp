@@ -10,6 +10,7 @@ patches in `patches/` applied:
 | `h1-record-const-folds.patch` | `optimize.d` | [hacks.md](hacks.md) H1 |
 | `h2-baseclass-loc.patch` | `dclass.d`, `dsymbolsem.d` | [hacks.md](hacks.md) H2 |
 | `h5-keep-errored-bodies.patch` | `statementsem.d` | [hacks.md](hacks.md) H5 |
+| `h6-record-ctfe-calls.patch` | `dinterpret.d` | [hacks.md](hacks.md) H6 |
 | `outbuffer-mem.patch` | `common/outbuffer.d` | [upstream.md](upstream.md) |
 
 No other file differs from stock. The build needs no dmd checkout; only the D

@@ -21,12 +21,13 @@ struct ServerState
 }
 
 void serverInit(ref ServerState s, string[] imports, string[] stringImports = null,
-    string[] flags = null)
+    string[] flags = null, string[] libraries = null)
 {
     EngineConfig cfg;
     cfg.importPaths = imports;
     cfg.stringPaths = stringImports;
     cfg.flags = flags;
+    cfg.libraryPaths = libraries;
     engineConfigure(s.engine, cfg);
 }
 

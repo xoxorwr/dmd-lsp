@@ -65,6 +65,7 @@ struct App
     string[] importPaths; // effective
     string[] stringPaths; // effective
     string[] flags; // effective dmd flags (CLI ++ dls.json)
+    string[] libraryPaths; // the stdlib's import dirs: code no edit can reach
     ulong configGen = 0; // bumped on import-path change; invalidates worker
     FileConfig fileCfg; // project dls.json (see below)
     PoolEntry[] pool;
@@ -754,7 +755,7 @@ private PoolEntry* poolAcquire(App* app, const(char)[] path)
                 r ~= d.path;
         return r;
     };
-    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, docs))
+    if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, app.libraryPaths, docs))
     {
         log("worker: start failed");
         return null;
@@ -3428,7 +3429,7 @@ private int runCheck(string[] files, string[] imports, string[] stringImports = 
     app.baseFlags = flags;
     refreshImports(&app);
     ServerState srv;
-    serverInit(srv, app.importPaths, app.stringPaths, app.flags);
+    serverInit(srv, app.importPaths, app.stringPaths, app.flags, app.libraryPaths);
     scope (exit)
         serverShutdown(srv);
     int code = 0;
@@ -3501,7 +3502,8 @@ private void refreshImports(App* app)
         if (!have)
             eff ~= p;
     }
-    foreach (d; defaultImports())
+    auto defaults = defaultImports();
+    foreach (d; defaults)
     {
         bool have = false;
         foreach (q; eff)
@@ -3539,6 +3541,7 @@ private void refreshImports(App* app)
         if (!have)
             feff ~= f;
     }
+    app.libraryPaths = defaults;
     if (eff != app.importPaths || seff != app.stringPaths || feff != app.flags)
     {
         app.importPaths = eff;

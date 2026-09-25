@@ -575,8 +575,12 @@ void lintUnusedParams(Arena* arena, Module mod, const(char)[] path, const(char)[
     foreach (s; (*mod.members)[])
         gather(s);
 
-    // Split text into lines for body ranges.
-    // (simple: reuse importEndLine-style? no — scan body range directly.)
+    // Line starts, once: a scan from the top per function made this
+    // quadratic on large modules.
+    size_t[] lineStart = [0];
+    foreach (i, c; text)
+        if (c == '\n')
+            lineStart ~= i + 1;
     foreach (fd; funcs)
     {
         if (!fd.parameters || !fd.fbody)
@@ -594,7 +598,7 @@ void lintUnusedParams(Arena* arena, Module mod, const(char)[] path, const(char)[
         // own declaration is the first occurrence of its name (D is
         // declare-before-use), so: unused iff total occurrences < 2.
         // Shadowing may hide an unused param (safe false negative).
-        const(char)[] body_ = sliceLines(text, sl, el);
+        const(char)[] body_ = sliceLines(text, lineStart, sl, el);
         if (!body_.length)
             continue;
         ScanOut bs;
@@ -634,32 +638,14 @@ void lintUnusedParams(Arena* arena, Module mod, const(char)[] path, const(char)[
     }
 }
 
-private const(char)[] sliceLines(const(char)[] text, uint fromLine, uint toLine)
+// Lines `fromLine` .. `toLine` (1-based, inclusive) of `text`, without the
+// last newline; empty when `fromLine` is past the end.
+private const(char)[] sliceLines(const(char)[] text, const(size_t)[] lineStart,
+    uint fromLine, uint toLine)
 {
-    size_t i = 0;
-    uint line = 1;
-    size_t start = 0;
-    size_t end = text.length;
-    bool sset = false;
-    while (i < text.length)
-    {
-        if (line == fromLine && !sset)
-        {
-            start = i;
-            sset = true;
-        }
-        if (text[i] == '\n')
-        {
-            if (line == toLine)
-            {
-                end = i;
-                break;
-            }
-            line++;
-        }
-        i++;
-    }
-    if (!sset)
+    if (fromLine < 1 || fromLine > lineStart.length)
         return null;
-    return text[start .. end];
+    size_t start = lineStart[fromLine - 1];
+    size_t end = toLine < lineStart.length ? lineStart[toLine] - 1 : text.length;
+    return end > start ? text[start .. end] : null;
 }

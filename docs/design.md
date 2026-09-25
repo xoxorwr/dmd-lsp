@@ -38,9 +38,11 @@ Everything now runs in the server process, on a stack of **memory levels**
 |---|---|---|
 | 0 | the runtime and the server (documents, config, replies) | never |
 | 1 | dmd, configured: identifier table, basic types, import paths, flags | config change |
-| 2 | dependencies: the modules the roots import, analysed like imports | a file it loaded changes, or it would have to contain an edited document |
-| 3 | warm: a copy of the current root under another module name | root switch; an edited document it loaded changes; level 2 rebuilt |
-| 4 | the overlay: the roots analysed since the last change, from their buffers | any document change (lazily, on the next analysis) |
+| 2 | libraries: druntime/Phobos modules that import only library code | a file it loaded changes on disk (never by an edit) |
+| 3 | dependencies: the project's modules the roots need, analysed like imports | a file it loaded changes, it would have to contain an edited document, or the overlay keeps loading a module it could hold |
+| 4 | warm: a copy of the current root under another module name | root switch; an edited document it loaded changes; a level below rebuilt |
+| 5 | the overlay: the roots analysed since the last change, from their buffers | a change the root's body patches cannot take (lazily, on the next analysis) |
+| 6 | a body patch of the overlay's root | the next edit of the root (replaced), or the overlay popped |
 
 The mechanism:
 
@@ -101,12 +103,27 @@ never match the real root's and are just dead weight. The copy cannot collide
 with the real root (its module declaration is dropped). A root whose copy
 imports the root itself (an import cycle) runs without a warm level.
 
-What goes on level 2: the imports of the roots (from a parse on a scratch
-level), plus what later overlays had to load from disk. It never holds an
-*edited* document or anything that imports one (a cycle through the root):
-those are loaded in the overlay, from the buffer, on every analysis. Unedited
-open documents may live there (their buffer is the disk text). Level 2 records
-the size and mtime of every file it loaded and is rebuilt when one changes.
+What goes on the dependency levels is planned from the **import graph**: every
+module dmd has loaded on any level, with its file and the modules it imports,
+recorded after each load (level 0). A module that reaches an edited document
+through the graph (the document itself, or a cycle through it) is never on
+these levels: it is loaded in the overlay, from the buffer, on every analysis.
+Everything else the graph knows is: library code (under the stdlib's import
+directories, importing only library code) on level 2, the rest on level 3.
+Unedited open documents may live there (their buffer is the disk text). A
+root's imports come from a parse on a scratch level the first time only, and
+a module the graph has not seen yet is loaded, checked (did it pull in an
+edited document? does a library pull in project code, e.g. a project
+`object.d`?) and planned again with what the load taught the graph.
+
+Each level is rebuilt only when it must: a file it loaded changed on disk (it
+records their size and mtime), it holds a module that now reaches an edited
+document, or (level 3) the overlay keeps loading, on every analysis, a module
+it could hold. What only the warm level loaded does not count: it is cached
+there already. Library modules the project level pulled in move to level 2
+only when level 3 is rebuilt anyway. (Planning by names alone used to ban a
+cycle's members from level 3 and learn them back after the next analysis, so
+in a cycle-heavy tree like dmd's every analysis rebuilt it: ~900 ms each.)
 
 Costs, measured with `tests/layers_probe.d` and an LSP client: an overlay pop
 is ~2–3 ms (a thousand saved pages) and a push ~1 ms; a small Phobos-heavy
@@ -222,6 +239,43 @@ them, as roots kept out of the dependency and warm levels — one dependency
 rebuild for the search and one to restore afterwards (~0.3 s, only for
 constant searches).
 
+### Body patches
+
+An edit inside function bodies of the overlay's root changes nothing another
+module can see, as long as the bodies belong to plain functions with declared
+return type and attributes that nothing evaluated at compile time. Then only
+those bodies are analysed again, in place, on level 6 (`tryPatch`,
+`applyPatch` in `engine.d`):
+
+- The root's full analysis is the **base**. Its parse records each function
+  body's span; between semantic 2 and 3 the engine keeps the bytes of every
+  function whose body may later be swapped (no constructor, destructor,
+  invariant, unittest, literal or nested function; no `auto`, no inferred
+  attributes, no contracts), and H6 ([hacks.md](hacks.md)) marks every
+  function the interpreter ran as not swappable.
+- An edit is patched when only the root changed since the base, nothing it
+  rests on changed on disk, and the new text equals the base's byte for byte
+  outside the bodies. Parse errors are allowed inside the edited bodies (a
+  statement being typed): the parser recovers there. Each changed function
+  is restored to its bytes from before its body was analysed, takes the new
+  body and is analysed again (`functionSemantic3`); callers, overload sets and
+  vtables keep pointing at the same object.
+- Positions follow the new text through the location table: from the end of
+  each body on, lines move by what the bodies up to it gained (the `#line`
+  substitutions of the root's `BaseLoc`). Only text after a closing `}` on the
+  same line keeps a stale column.
+- The base's messages are carried over, moved the same way, except those
+  inside the re-analysed bodies; the patch's own follow. Lint runs on the
+  patched module; the pre-semantic snapshot comes from the new parse.
+- Each edit pops the previous patch and patches from the base again (the
+  base is re-built by a full analysis after 32 changed bodies, an edit outside
+  bodies, a CTFE'd body, another document's change, or a disk change).
+
+On dmd's `expressionsem.d` (in import cycles with most of the compiler) this
+turns a re-analysis from ~500 ms into ~40–80 ms, most of it the new parse and
+the lint; the bodies themselves take a few ms. `tests/test_body_patch.py`
+pins the behaviour, positions included.
+
 ### Completion never analyses
 
 Completion answers from the analysis the overlay already holds for the file,
@@ -316,10 +370,10 @@ cycle was not recognised, and it was analysed from the disk. The engine adds
 the current directory as the last import path (same files, absolute names).
 
 Every module that imports an edited document, directly or through a cycle,
-must be analysed above it, so a document in a large cycle costs more per
-build: `expressionsem.d`, in cycles with most of dmd, ~380 ms after two
-one-time rebuilds of the dependency level (the first edit drops what reached
-the document; the next build learns back what did not). Projects that use
+must be analysed above it, so a full analysis of a document in a large cycle
+costs more: `expressionsem.d`, in cycles with most of dmd, ~450 ms after the
+one rebuild of the dependency level its first edit causes. Edits inside
+function bodies are body patches (above) and skip all of that. Projects that use
 string imports need their `-J` paths configured (`stringImportPaths`): a
 failed `import("...")` inside a cycle cascades into unrelated errors (dmd's own
 `alias visit = …` overloads report conflicts).

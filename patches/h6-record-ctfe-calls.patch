@@ -1,0 +1,24 @@
+--- a/dinterpret.d
++++ b/dinterpret.d
+@@ -55,6 +55,12 @@
+ import dmd.utils : arrayCastBigEndian;
+ import dmd.visitor;
+ 
++// dmd-lsp H6 (docs/hacks.md): tooling hook, null for normal compilation.
++// Called with each function the interpreter is about to run, so a tool that
++// re-analyses edited function bodies knows which bodies other code evaluated
++// at compile time. Interpretation itself is unchanged.
++__gshared void function(FuncDeclaration) nothrow lspCtfeCalled;
++
+ /*************************************
+  * Entry point for CTFE.
+  * A compile-time result is required. Give an error if not possible.
+@@ -432,6 +438,8 @@
+  */
+ private Expression interpretFunction(UnionExp* pue, FuncDeclaration fd, InterState* istate, Expressions* arguments, Expression thisarg)
+ {
++    if (lspCtfeCalled) // dmd-lsp H6
++        lspCtfeCalled(fd);
+     debug (LOG)
+     {
+         printf("\n********\n%s FuncDeclaration::interpret(istate = %p) %s\n", fd.loc.toChars(), istate, fd.toChars());

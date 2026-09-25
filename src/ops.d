@@ -2746,12 +2746,12 @@ void workerKill(ref Worker w)
 }
 
 bool workerSpawn(ref Worker w, string[] imports, string[] strings, string[] flags,
-    DocProvider docs)
+    string[] libraries, DocProvider docs)
 {
     if (w.s is null)
         w.s = new ServerState;
     w.s.engine.docs = docs;
-    serverInit(*w.s, imports, strings, flags);
+    serverInit(*w.s, imports, strings, flags, libraries);
     w.alive = true;
     return true;
 }

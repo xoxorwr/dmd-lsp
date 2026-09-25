@@ -12,7 +12,8 @@ Rule of thumb:
   escape hatch no compiler user would want — it belongs here.
 
 Each lives as a patch file in `patches/` (`h1-record-const-folds.patch`,
-`h2-baseclass-loc.patch`, `h5-keep-errored-bodies.patch`), applied by
+`h2-baseclass-loc.patch`, `h5-keep-errored-bodies.patch`,
+`h6-record-ctfe-calls.patch`), applied by
 `make vendor` on top of stock dmd; every edited spot carries a
 `dmd-lsp Hn (docs/hacks.md)` comment. A patch that no longer applies fails the
 vendor step. Beyond that:
@@ -196,6 +197,51 @@ the global is a **compile error**. `tests/test_realworld.py`
 (`typing-completion-items`) completes a member chain on a struct local in a
 function whose next line is a dangling `w.assets.`: it yields nothing if the
 body is collapsed away.
+
+---
+
+## H6. `lspCtfeCalled` — record the functions CTFE runs
+
+**Files**: `src/dmd/dinterpret.d` (global + `interpretFunction`)
+**Consumer**: `src/engine.d` (body patches: `semanticRoot`, `applyPatch`)
+**Tests**: `tests/test_body_patch.py` (`ctfe-body-full`, `ctfe-value-follows`)
+**Status**: not upstreamable.
+
+### Problem
+
+After an edit inside function bodies, the engine re-analyses only those bodies
+in place (docs/design.md, *Body patches*). That is only sound for a body
+nothing else has seen. A plain function's body is invisible to its callers,
+except to compile-time evaluation: `enum K = compute();` or a `static assert`
+runs `compute`'s body, and the result is baked into another declaration's
+analysis. Re-analysing `compute` alone would leave `K` stale. dmd keeps no
+record of which functions the interpreter ran.
+
+### Hack
+
+A tooling hook in `dmd.dinterpret`, null for normal compilation:
+
+```d
+__gshared void function(FuncDeclaration) nothrow lspCtfeCalled;
+```
+
+`interpretFunction` calls it with each function it is about to run. The engine
+sets it while analysing a root (and while patching one) and marks every
+function it reports as not swappable: an edit of its body analyses the root in
+full. Interpretation itself is unchanged.
+
+### Why it is a hack
+
+It is instrumentation for one consumer's incremental analysis; a compiler has
+no use for it.
+
+### Keeping it honest
+
+`src/engine.d` imports `lspCtfeCalled`, so a `make vendor` that drops it is a
+compile error. `tests/test_body_patch.py` edits a function that an `enum`
+initialiser evaluates, and fails if the edit is patched in place
+(`ctfe-body-full`) or the `static assert` on the value does not follow
+(`ctfe-value-follows`).
 
 ---
 

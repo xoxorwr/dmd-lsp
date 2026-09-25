@@ -41,7 +41,12 @@ import timing : nowMs, traceMs;
 
 import dmd.dmodule : Module;
 import dmd.expression : VarExp;
+import dmd.func : FuncDeclaration;
 import dmd.globals : global;
+import dmd.location : Loc;
+import dmd.dsymbol : PASS;
+import core.stdc.stdlib : c_realloc = realloc;
+import core.stdc.string : memcpy;
 
 struct Analysis
 {
@@ -65,6 +70,9 @@ struct EngineConfig
     string[] importPaths;
     string[] stringPaths;
     string[] flags;
+    // Directories of library code (druntime, Phobos): never edited, so what
+    // imports only library code is cached below the project and kept.
+    string[] libraryPaths;
 }
 
 // The source of document text. Open documents are served from the editor;
@@ -93,16 +101,19 @@ struct Engine
     // Hash of the text dmd reads for each document seen (buffer, else disk).
     ulong[string] docHash;
 
-    // L2
-    bool depsBuilt;
-    string[] depsWanted;      // module names requested (level 0)
-    string[] depsFiles;       // files loaded in L2 (level 0)
-    ulong[] depsStamps;       // their fileStamp at load, to notice disk edits
-    bool depsStale;           // disk changed under a loaded file
-    string[] learned;         // modules the overlay loaded that L2 lacks
-    string[] depsBanned;      // wanted names that import an edited document
-    string[] rootFiles;       // files analysed as roots: never learned into L2
-    DiagMsg[] depsDiags;      // L2's diagnostics (level 0), for roots found there
+    // The import graph as far as dmd has loaded it, on any level: decides
+    // what the dependency levels may hold (level 0).
+    ModInfo[string] graph;
+
+    // Dependencies, analysed as imports and kept across edits. Library code
+    // (under cfg.libraryPaths, importing only library code) has its own level
+    // below the project's: no edit can invalidate it.
+    DepLevel libs;
+    DepLevel deps;
+    string[] rootFiles;       // files analysed as roots: not requested there
+    // Modules the last overlay loaded from disk: each analysis loads them
+    // again, so they are worth moving to the dependency level (level 0).
+    string[] overlayLoads;
 
     // L3
     bool warmBuilt;
@@ -117,6 +128,9 @@ struct Engine
     bool recordFolds;
     string[] isolated;
 
+    // Body patches of the overlay's root (see "body patches" below).
+    PatchBase patch;
+
     // L4
     bool overlay;
     bool overlayVariant;      // built from a non-document text (placeholder)
@@ -124,6 +138,51 @@ struct Engine
     Root[] roots;
     DiagSink sink;            // messages of the overlay, level 0
     Arena lintArena;          // lint hits of the overlay's analyses
+}
+
+// A function body in a root's text: `{` .. just past `}` (byte offsets), and
+// the function (the root level's, when recorded for the base).
+struct BodySpan
+{
+    uint start, end;
+    uint startLine, endLine; // 1-based lines of `{` and `}`
+    uint newlines;
+    void* fd;
+}
+
+// The overlay root's analysis that edits inside function bodies are patched
+// onto: its text, its bodies, and, for each body that may be re-analysed in
+// place, the function's bytes from before its body was analysed.
+struct PatchBase
+{
+    bool valid;
+    bool patched;              // a patch level is on top of the overlay
+    bool othersChanged;        // another document changed since the base
+    string path;
+    string text;
+    BodySpan[] spans;
+    void[][] pristine;         // per span, null when not swappable
+    Analysis base;             // the root's analysis at `text`
+    string[] loadedFiles;      // files the base loaded on the overlay, and
+    ulong[] loadedStamps;      // their fileStamp: a patch keeps them
+}
+
+// A module dmd loaded: its file and the modules it imports.
+struct ModInfo
+{
+    string file;
+    string[] imports;
+}
+
+// A dependency level: what it was asked for and what it holds (level 0).
+struct DepLevel
+{
+    bool built;
+    bool stale;               // a file it loaded changed on disk
+    string[] modules;         // module names loaded on it
+    string[] files;           // their files
+    ulong[] stamps;           // their fileStamp at load
+    DiagMsg[] diags;          // its diagnostics, for roots found there
 }
 
 struct Root
@@ -175,13 +234,12 @@ void engineDocChanged(ref Engine e, const(char)[] path, bool edited)
             return;
     }
     e.generation++;
+    if (path != e.patch.path)
+        e.patch.othersChanged = true;
+    // An edited document is served from its buffer: the dependency levels
+    // drop it, and what reaches it, when the next analysis plans them.
     if (edited && !contains(e.edited, path))
-    {
         e.edited ~= path.idup;
-        // An L2 that loaded the disk copy of this file is now wrong.
-        if (contains(e.depsFiles, path))
-            e.depsStale = true;
-    }
     if (contains(e.warmFiles, path))
         e.warmStale = true;
 }
@@ -193,12 +251,24 @@ void engineDiskChanged(ref Engine e, const(char)[] path)
     scope (exit)
         levelResume(t);
     e.generation++;
+    e.patch.othersChanged = true;
     if (path !is null)
         e.docHash.remove(cast(string) path); // remove only hashes the key
     if (path is null || contains(e.warmFiles, path))
         e.warmStale = true;
-    if (path is null || contains(e.depsFiles, path))
-        e.depsStale = true;
+    foreach (lv; [&e.libs, &e.deps])
+        if (path is null || contains(lv.files, path))
+            lv.stale = true;
+    // Its imports may have changed: learn them again when it next loads.
+    if (path is null)
+        e.graph = null;
+    else
+        foreach (name, ref info; e.graph)
+            if (info.file == path)
+            {
+                e.graph.remove(name);
+                break;
+            }
 }
 
 // Analyses currently cached in the overlay (valid until it pops).
@@ -264,6 +334,7 @@ void engineScratch(ref Engine e, scope void delegate() fn)
 void engineHardReset(ref Engine e)
 {
     levelAbandonAll();
+    e.patch = PatchBase.init;
     gSink = null;
     e.initialized = false;
     e.overlay = false;
@@ -271,11 +342,8 @@ void engineHardReset(ref Engine e)
     e.roots = null;
     e.sink.reset();
     e.lintArena.reset();
-    e.depsBuilt = false;
-    e.depsFiles = null;
-    e.depsStamps = null;
-    e.depsDiags = null;
-    e.learned = null;
+    e.libs = DepLevel.init;
+    e.deps = DepLevel.init;
     e.warmBuilt = false;
     e.warmFiles = null;
     e.warmDiags = null;
@@ -295,11 +363,7 @@ void engineBeginUnfolded(ref Engine e, const(char)[][] files)
         levelResume(t);
     e.isolated = null;
     foreach (f; files)
-    {
-        e.isolated ~= f.idup;
-        if (contains(e.depsFiles, f))
-            e.depsStale = true;
-    }
+        e.isolated ~= f.idup; // the next plan drops them from the dependencies
     e.recordFolds = true;
     popWarm(e); // and the overlay: both may hold candidates, unrecorded
 }
@@ -323,7 +387,7 @@ void engineReset(ref Engine e, bool deps)
         levelResume(t);
     popOverlay(e);
     if (deps)
-        popDeps(e);
+        popLibs(e);
 }
 
 // ---- internals -----------------------------------------------------------------
@@ -341,7 +405,8 @@ bool contains(const(string)[] list, const(char)[] s)
 void dropAll(ref Engine e)
 {
     popOverlay(e);
-    popDeps(e);
+    popLibs(e);
+    e.graph = null;
     if (e.initialized)
     {
         levelPop();
@@ -356,6 +421,9 @@ void popOverlay(ref Engine e)
     auto t0 = nowMs();
     scope (exit)
         traceMs("overlay.pop", nowMs() - t0);
+    if (e.patch.patched)
+        levelPop();
+    e.patch = PatchBase.init;
     levelPop();
     engineCheckIdentifiers("after overlay pop");
     e.overlay = false;
@@ -382,14 +450,21 @@ void popWarm(ref Engine e)
 void popDeps(ref Engine e)
 {
     popWarm(e);
-    if (!e.depsBuilt)
+    if (!e.deps.built)
         return;
     levelPop();
     engineCheckIdentifiers("after deps pop");
-    e.depsBuilt = false;
-    e.depsFiles = null;
-    e.depsStamps = null;
-    e.depsDiags = null;
+    e.deps = DepLevel.init;
+}
+
+void popLibs(ref Engine e)
+{
+    popDeps(e);
+    if (!e.libs.built)
+        return;
+    levelPop();
+    engineCheckIdentifiers("after libs pop");
+    e.libs = DepLevel.init;
 }
 
 // L1: a configured frontend.
@@ -488,6 +563,14 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
     foreach (ref r; e.roots)
         if (why == "new-root" && r.path == path)
             why = "text-changed";
+    // An edit inside function bodies of the overlay's root: re-analyse only
+    // those bodies.
+    if (!variant)
+    {
+        Analysis pa;
+        if (tryPatch(e, path, text, h, pa))
+            return pa;
+    }
     // Anything changed since the overlay was built, or a variant on either
     // side: start a fresh overlay.
     if (e.overlay && (variant || e.overlayVariant || e.overlayGeneration != e.generation))
@@ -510,6 +593,9 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
 
     auto t0 = nowMs();
     Analysis a;
+    bool fresh;
+    BodySpan[] spans;
+    void[][] pristine;
     levelEnter();
     size_t diagFrom = e.sink.msgs.length;
     {
@@ -523,15 +609,21 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
             lspConstFolded = null;
         immutable loadedBefore = Module.amodules.length;
         auto m = findLoaded(path);
+        fresh = m is null;
         if (m is null)
         {
             immutable errorsBefore = global.errors;
             m = parseRoot(path, text);
             a.syntaxErrors = global.errors != errorsBefore;
             if (m !is null)
+            {
                 a.syn = snapshotModule(m, text);
-            if (m !is null)
-                semanticRoot(m);
+                // The base for body patches: what the parse laid out (before
+                // semantic can add or rewrite members).
+                if (!variant && !e.recordFolds && !a.syntaxErrors)
+                    spans = bodySpans(m, text);
+                semanticRoot(m, spans, pristine);
+            }
         }
         else
         {
@@ -552,7 +644,7 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
     // Messages for this file from the whole overlay, plus everything this
     // analysis reported (template errors point into other files).
     uint errs = 0;
-    foreach (ref d; e.depsDiags ~ e.warmDiags)
+    foreach (ref d; e.libs.diags ~ e.deps.diags ~ e.warmDiags)
         if (d.file == path)
         {
             a.diags ~= d;
@@ -578,11 +670,23 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         ownLintStrings(e.lintArena, a.lintImports);
         ownLintStrings(e.lintArena, a.lintParams);
     }
-    learnLoads(e);
+    recordGraph(e);
+    noteOverlayLoads(e);
     levelLeave();
     traceMs(variant ? "analyze.variant" : "analyze", nowMs() - t0, why ~ " " ~ path);
     engineCheckIdentifiers("after analyze");
     e.roots ~= Root(path.idup, h, a);
+    if (fresh && spans.length)
+    {
+        e.patch = PatchBase.init;
+        e.patch.valid = true;
+        e.patch.path = path.idup;
+        e.patch.text = text.idup;
+        e.patch.spans = spans;
+        e.patch.pristine = pristine;
+        e.patch.base = a;
+        overlayFiles(e, e.patch.loadedFiles, e.patch.loadedStamps);
+    }
     return a;
 }
 
@@ -662,6 +766,7 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
         immutable before = Module.amodules.length;
         analyzeCopy(text, e.warmPaths.length);
         logLoaded(before, "warm", path);
+        recordGraph(e);
         // What this copy loaded: the real root among it means the root is in
         // an import cycle, and its copy is no use (the overlay could not
         // load the root from the buffer).
@@ -670,7 +775,7 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
             auto f = m.srcfile.toString();
             if (f == path)
                 cyclic = true;
-            else if (!contains(e.depsFiles, f))
+            else if (!inDeps(e, f))
                 loaded ~= f;
         }
     }
@@ -701,8 +806,8 @@ void logLoaded(size_t from, const(char)* level, const(char)[] copyOf)
     foreach (m; Module.amodules[from .. $])
     {
         const(char)[] f = m.srcfile.toString();
-        if (f == "__dmdlsp_deps.d")
-            continue; // the synthetic module importing the dependencies
+        if (!isWarmCopy(m.ident.toString()) && isSynthetic(m.ident.toString()))
+            continue; // a dependency level's loader
         if (copyOf !is null && isWarmCopy(m.ident.toString()))
             logDebug("parse & analyse module: '%.*s' (%s, renamed copy)",
                 cast(int) copyOf.length, copyOf.ptr, level);
@@ -760,111 +865,207 @@ void analyzeCopy(const(char)[] text, size_t n)
     runDeferredSemantic3();
 }
 
-// ---- L2 -------------------------------------------------------------------------
+// ---- dependency levels ----------------------------------------------------------
 
-// Make sure L2 is usable for analysing `path`: built, not stale, and holding
-// nothing that imports an edited document.
+// Make the dependency levels right for analysing `path`: they hold every
+// module the engine knows (from the import graph, and the root's imports the
+// first time) that reaches no edited document, library code on its own level.
+// Each is rebuilt only when it lacks a module it should hold, holds one it may
+// no longer (an edit made it reach an edited document), or a file it loaded
+// changed on disk.
 void ensureDeps(ref Engine e, const(char)[] path, const(char)[] text)
 {
     // A file can change on disk without a notification (another tool, a
-    // client without file watching): compare what L2 loaded with the disk.
-    // Runs once per new overlay, i.e. after a change.
-    if (e.depsBuilt && !e.depsStale)
+    // client without file watching): compare what each level loaded with the
+    // disk. Runs once per new overlay, i.e. after a change.
+    foreach (lv; [&e.libs, &e.deps])
+        if (lv.built && !lv.stale)
+        {
+            import fsutil : fileStamp;
+
+            foreach (i, f; lv.files)
+                if (fileStamp(f) != lv.stamps[i])
+                {
+                    lv.stale = true;
+                    break;
+                }
+        }
+
+    // The root's own imports: known from the graph once it has been analysed.
+    string[] extra;
+    if (!knowsFile(e, path))
+        extra = rootImports(e, path, text);
+
+    auto tainted = taintedModules(e);
+    bool[string] libClosure;
+    string[] wantLibs, wantDeps;
+    foreach (name, ref info; e.graph)
     {
-        import fsutil : fileStamp;
-
-        foreach (i, f; e.depsFiles)
-            if (fileStamp(f) != e.depsStamps[i])
-            {
-                e.depsStale = true;
-                break;
-            }
+        if (name in tainted || contains(e.rootFiles, info.file))
+            continue;
+        if (isLibraryClosure(e, name, libClosure))
+            wantLibs ~= name;
+        else
+            wantDeps ~= name;
     }
-    bool need = !e.depsBuilt || e.depsStale || e.learned.length;
-    if (!need)
-        return;
-    string why = !e.depsBuilt ? "none" : e.depsStale ? "stale" : "learned";
-    if (why == "learned")
-        foreach (n; e.learned)
-            why ~= " " ~ n;
-    popDeps(e);
-    // Wanted: what was wanted before, what the overlays had to load, and the
-    // imports of this root.
-    string[] want = e.depsWanted;
-    foreach (n; e.learned)
-        if (!contains(want, n))
-            want ~= n;
-    foreach (n; rootImports(e, path, text))
-        if (!contains(want, n))
-            want ~= n;
-    // A name banned before stays banned only while its reason holds: retry
-    // them, the check below bans them again if needed.
-    e.depsBanned = null;
-    e.learned = null;
-    e.depsStale = false;
+    // Not known yet: by where it would load from (buildLevel checks what a
+    // library actually pulls in).
+    foreach (n; extra)
+        if (n !in e.graph && !contains(wantLibs, n) && !contains(wantDeps, n))
+        {
+            if (isLibraryFile(e, resolveModule(e, n)))
+                wantLibs ~= n;
+            else
+                wantDeps ~= n;
+        }
 
+    // The project level must hold what it wants and what the library level
+    // lacks. Library modules loaded there (imported by project code) move to
+    // their level only when the project level is rebuilt anyway: learning
+    // them alone would rebuild both.
+    // Learning alone rebuilds it only for what the overlay keeps reloading
+    // (what the warm level loaded is cached there already).
+    string[] learn;
+    foreach (n; e.overlayLoads)
+        if (n !in tainted && !contains(e.libs.modules, n) && !contains(e.deps.modules, n))
+            learn ~= n;
+    string why = !e.deps.built ? "none" : e.deps.stale ? "stale"
+        : holdsAny(e.deps, tainted) ? "reaches-edited"
+        : learn.length ? "learned" : null;
+    string whyLibs = !e.libs.built ? "none" : e.libs.stale ? "stale"
+        : holdsAny(e.libs, tainted) ? "reaches-edited"
+        : why !is null && !holdsAll(e.libs, wantLibs, null) ? "learned" : null;
+    if (whyLibs !is null)
+    {
+        popLibs(e);
+        buildLevel(e, e.libs, wantLibs, "libraries", whyLibs ~ " " ~ path);
+        if (why is null)
+            why = "libraries";
+    }
+    if (why !is null)
+    {
+        popDeps(e);
+        string[] want;
+        foreach (n; wantDeps ~ wantLibs)
+            if (!contains(e.libs.modules, n))
+                want ~= n;
+        buildLevel(e, e.deps, want, "dependencies", why ~ " " ~ path);
+    }
+}
+
+// After an overlay analysis: the modules it loaded from disk (not roots, not
+// edited documents; ensureDeps filters out what reaches one).
+void noteOverlayLoads(ref Engine e)
+{
+    immutable top = levelDepth();
+    string[] res;
+    foreach (m; Module.amodules)
+    {
+        if (levelOf(cast(void*) m) != top)
+            continue;
+        auto n = moduleName(m);
+        auto f = m.srcfile.toString();
+        if (isSynthetic(n) || contains(e.edited, f) || contains(e.rootFiles, f))
+            continue;
+        res ~= n;
+    }
+    auto t = levelSuspend();
+    e.overlayLoads = null;
+    foreach (n; res)
+        e.overlayLoads ~= n.idup;
+    levelResume(t);
+}
+
+// The file dmd would load module `name` from: the first import path holding
+// it (`a/b.d`, `a/b.di`, `a/b/package.d`), or null.
+string resolveModule(ref Engine e, const(char)[] name)
+{
+    import fsutil : fileStamp;
+
+    char[] rel;
+    foreach (c; name)
+        rel ~= c == '.' ? '/' : c;
+    foreach (dir; e.cfg.importPaths)
+    {
+        auto base = (dir.length && (dir[$ - 1] == '/' || dir[$ - 1] == '\\')) ? dir : dir ~ "/";
+        foreach (cand; [base ~ rel ~ ".di", base ~ rel ~ ".d", base ~ rel ~ "/package.d"])
+            if (fileStamp(cand) != 0)
+                return cand.idup;
+    }
+    return null;
+}
+
+// Push a dependency level holding `want`. A module the graph did not know
+// may turn out to reach an edited document: then the level is rebuilt
+// without the names that pull one in, now that the graph knows.
+void buildLevel(ref Engine e, ref DepLevel lv, string[] want, string what,
+    const(char)[] why)
+{
     auto t0 = nowMs();
-    foreach (attempt; 0 .. 4)
+    foreach (attempt; 0 .. 3)
     {
         levelPush(dmdGlobalRanges());
         levelEnter();
         DiagSink sink; // level 0 (see onDiag)
         gSink = &sink;
+        immutable before = Module.amodules.length;
+        loadModules(what == "libraries" ? "__dmdlsp_libs" : "__dmdlsp_deps", want);
+        logLoaded(before, what.ptr, null);
+        recordGraph(e);
+        // Nothing an edit can reach; on the library level, only library code
+        // (a project `object.d` is imported by all of druntime).
+        immutable libraries = what == "libraries";
+        // The last try asks for nothing: keep what dmd loads regardless (its
+        // own `object`, which may be the project's).
+        bool clean = true;
+        immutable last = want.length == 0;
+        foreach (m; Module.amodules[before .. $])
         {
-            immutable before = Module.amodules.length;
-            loadModules(want);
-            logLoaded(before, "dependencies", null);
+            auto f = m.srcfile.toString();
+            if (contains(e.edited, f) || contains(e.isolated, f))
+                clean = false;
+            if (libraries && !isSynthetic(moduleName(m)) && !isLibraryFile(e, f))
+                clean = false;
         }
-        // Modules that must not be here, and the wanted names that pull them in.
-        string[] bannedDmd;
-        auto bad = excludedLoaded(e);
-        const(char)[][] files;
-        if (bad.length)
-            bannedDmd = wantedReaching(want, bad);
-        else
-            files = loadedFiles();
+        clean |= last;
+        const(char)[][] names, files;
+        if (clean)
+            foreach (m; Module.amodules[before .. $])
+            {
+                auto n = moduleName(m);
+                if (isSynthetic(n))
+                    continue;
+                names ~= n;
+                files ~= m.srcfile.toString();
+            }
         levelLeave();
         gSink = null;
-        // Level-0 copies: these are read after this level may be popped.
-        string[] banned;
-        foreach (b; bannedDmd)
-            banned ~= b.idup;
-        if (!banned.length)
+        if (clean)
         {
             import fsutil : fileStamp;
 
-            e.depsFiles = null;
-            e.depsStamps = null;
-            foreach (f; files)
+            lv = DepLevel.init;
+            lv.built = true;
+            foreach (i, n; names)
             {
-                e.depsFiles ~= f.idup;
-                e.depsStamps ~= fileStamp(f);
+                lv.modules ~= n.idup;
+                lv.files ~= files[i].idup;
+                lv.stamps ~= fileStamp(files[i]);
             }
-            e.depsDiags = sink.msgs;
+            lv.diags = sink.msgs;
             break;
         }
-        foreach (b; banned)
-            e.depsBanned ~= b;
         levelPop();
+        auto tainted = taintedModules(e);
+        bool[string] libClosure;
         string[] keep;
         foreach (w; want)
-            if (!contains(banned, w))
+            if (w !in tainted && (!libraries || isLibraryClosure(e, w, libClosure)))
                 keep ~= w;
-        want = keep;
-        if (attempt == 3)
-        {
-            // Could not isolate (should not happen): run without L2.
-            want = null;
-            levelPush(dmdGlobalRanges());
-        }
+        want = attempt == 1 ? null : keep; // last try: an empty level
     }
-    e.depsWanted = null;
-    foreach (w; want)
-        e.depsWanted ~= w.idup;
-    e.depsBuilt = true;
-    traceMs("deps", nowMs() - t0, why ~ " " ~ path);
-    log("deps: %d modules requested, %d files loaded", cast(int) e.depsWanted.length,
-        cast(int) e.depsFiles.length);
+    traceMs(what == "libraries" ? "libs" : "deps", nowMs() - t0, why);
+    log("%.*s: %d modules loaded", cast(int) what.length, what.ptr, cast(int) lv.modules.length);
 }
 
 // Names of the modules `path` imports (module-level, function-local and
@@ -906,18 +1107,19 @@ string[] rootImports(ref Engine e, const(char)[] path, const(char)[] text)
     return res;
 }
 
-// Load `names` as imports of a synthetic module and analyse them as dmd
-// analyses imported modules (semantic 1 and 2; bodies on demand).
-void loadModules(const(string)[] names)
+// Load `names` as imports of a synthetic module (named `synthetic`, one per
+// level) and analyse them as dmd analyses imported modules (semantic 1 and 2;
+// bodies on demand).
+void loadModules(string synthetic, const(string)[] names)
 {
     import dmd.frontend : parseModule;
     import dmd.dsymbolsem : dsymbolSemantic, importAll, runDeferredSemantic, runDeferredSemantic2;
     import dmd.semantic2 : semantic2;
 
-    string src = "module __dmdlsp_deps;\n";
+    string src = "module " ~ synthetic ~ ";\n";
     foreach (n; names)
         src ~= "static import " ~ n ~ ";\n";
-    auto m = parseModule("__dmdlsp_deps.d", src).module_;
+    auto m = parseModule(synthetic ~ ".d", src).module_;
     if (m is null)
         return;
     m.importAll(null);
@@ -927,50 +1129,116 @@ void loadModules(const(string)[] names)
     runDeferredSemantic2();
 }
 
-// Loaded modules that may not be in L2: edited documents (their text is the
-// buffer's, which changes).
-Module[] excludedLoaded(ref Engine e)
+// Record what dmd has loaded into the import graph: modules it did not know,
+// and, for those on the top level (a root, its buffer's imports), afresh.
+void recordGraph(ref Engine e)
 {
-    Module[] res;
+    immutable top = levelDepth();
     foreach (m; Module.amodules)
     {
-        auto f = m.srcfile.toString();
-        if (contains(e.edited, f) || contains(e.isolated, f))
-            res ~= m;
+        auto n = moduleName(m);
+        if (isSynthetic(n))
+            continue;
+        if (n in e.graph && levelOf(cast(void*) m) != top)
+            continue;
+        auto t = levelSuspend();
+        ModInfo info;
+        info.file = m.srcfile.toString().idup;
+        foreach (imp; m.aimports)
+            if (imp)
+                info.imports ~= moduleName(imp).idup;
+        e.graph[n.idup] = info;
+        levelResume(t);
     }
-    return res;
 }
 
-string[] wantedReaching(const(string)[] want, Module[] targets)
+// Modules the engine makes up (dependency loaders, warm copies).
+bool isSynthetic(const(char)[] name)
 {
-    string[] res;
-    foreach (m; Module.amodules)
+    return name.length >= 8 && name[0 .. 8] == "__dmdlsp";
+}
+
+bool knowsFile(ref Engine e, const(char)[] path)
+{
+    foreach (ref info; e.graph)
+        if (info.file == path)
+            return true;
+    return false;
+}
+
+// Modules that reach an edited (or isolated) document through the graph,
+// the documents' own modules included.
+bool[string] taintedModules(ref Engine e)
+{
+    string[][string] importers;
+    string[] stack;
+    foreach (name, ref info; e.graph)
     {
-        auto name = moduleName(m);
-        if (contains(want, name) && reachesAny(m, targets))
-            res ~= name;
+        foreach (i; info.imports)
+            importers[i] ~= name;
+        if (contains(e.edited, info.file) || contains(e.isolated, info.file))
+            stack ~= name;
     }
-    return res;
-}
-
-bool reachesAny(Module from, Module[] targets)
-{
-    bool[Module] seen;
-    Module[] stack = [from];
+    bool[string] res;
     while (stack.length)
     {
-        auto m = stack[$ - 1];
+        auto n = stack[$ - 1];
         stack = stack[0 .. $ - 1];
-        foreach (t; targets)
-            if (m is t)
-                return true;
-        if (m in seen)
+        if (n in res)
             continue;
-        seen[m] = true;
-        foreach (i; m.aimports)
-            stack ~= i;
+        res[n] = true;
+        if (auto p = n in importers)
+            stack ~= *p;
     }
+    return res;
+}
+
+// `name` is library code importing only library code (memoised in `memo`).
+bool isLibraryClosure(ref Engine e, string name, ref bool[string] memo)
+{
+    if (auto p = name in memo)
+        return *p;
+    auto info = name in e.graph;
+    if (info is null || !isLibraryFile(e, info.file))
+        return memo[name] = false;
+    memo[name] = true; // an import cycle among library modules stays library
+    foreach (i; info.imports)
+        if (!isLibraryClosure(e, i, memo))
+            return memo[name] = false;
+    return true;
+}
+
+bool isLibraryFile(ref Engine e, const(char)[] file)
+{
+    foreach (d; e.cfg.libraryPaths)
+        if (file.length > d.length && file[0 .. d.length] == d &&
+            (file[d.length] == '/' || file[d.length] == '\\' ||
+             d[$ - 1] == '/' || d[$ - 1] == '\\'))
+            return true;
     return false;
+}
+
+bool holdsAny(ref DepLevel lv, bool[string] names)
+{
+    foreach (m; lv.modules)
+        if (m in names)
+            return true;
+    return false;
+}
+
+// `lv` (or `below`) holds every module of `want`.
+bool holdsAll(ref DepLevel lv, const(string)[] want, DepLevel* below)
+{
+    foreach (w; want)
+        if (!contains(lv.modules, w) && (below is null || !contains(below.modules, w)))
+            return false;
+    return true;
+}
+
+// The file is on a dependency level.
+bool inDeps(ref Engine e, const(char)[] file)
+{
+    return contains(e.libs.files, file) || contains(e.deps.files, file);
 }
 
 const(char)[][] loadedFiles()
@@ -989,28 +1257,412 @@ string moduleName(Module m)
     return cast(string) p[0 .. strlen(p)];
 }
 
-// After an overlay analysis: modules it loaded from disk that L2 could have
-// held. They seed the next L2 build.
-void learnLoads(ref Engine e)
+// ---- body patches -------------------------------------------------------------
+//
+// An edit inside function bodies of the overlay's root changes nothing another
+// module can see, when the bodies are those of plain functions with declared
+// attributes and return type that nothing evaluated at compile time. Then only
+// those bodies are analysed again: on a level above the root's analysis, each
+// function is restored to its bytes from before its body was analysed, takes
+// the new body and is analysed again; the root's positions after each body
+// shift by the lines it gained (the location table's `#line` substitutions).
+// Anything else (an edit outside bodies, another document changed, a body not
+// swappable) analyses the root in full. docs/design.md, "Body patches".
+
+__gshared void** g_ctfeFns; // functions CTFE ran (C memory: noted from dmd code)
+__gshared size_t g_ctfeCount, g_ctfeCap;
+
+void noteCtfe(FuncDeclaration fd) nothrow
 {
-    // Only what this overlay loaded: modules the warm level loaded are cached
-    // there already, and moving them to L2 would cost a rebuild of both.
-    immutable overlayLevel = levelDepth();
+    if (g_ctfeCount == g_ctfeCap)
+    {
+        auto cap = g_ctfeCap ? g_ctfeCap * 2 : 64;
+        auto p = cast(void**) c_realloc(g_ctfeFns, cap * (void*).sizeof);
+        if (p is null)
+            return;
+        g_ctfeFns = p;
+        g_ctfeCap = cap;
+    }
+    g_ctfeFns[g_ctfeCount++] = cast(void*) fd;
+}
+
+bool ctfeCalled(void* fd) nothrow @nogc
+{
+    foreach (i; 0 .. g_ctfeCount)
+        if (g_ctfeFns[i] is fd)
+            return true;
+    return false;
+}
+
+// Function bodies of `m` as parsed from `text`, in source order: functions at
+// module level, in aggregates and attribute blocks (both branches of a
+// condition). Not inside templates, mixins or `static foreach`: those are
+// part of what others see.
+BodySpan[] bodySpans(Module m, const(char)[] text)
+{
+    import dmd.attrib : AttribDeclaration, ConditionalDeclaration;
+    import dmd.dsymbol : Dsymbol, DSYM;
+    import dmd.arraytypes : Dsymbols;
+
+    uint[] lineStart = [0];
+    foreach (i, c; text)
+        if (c == '\n')
+            lineStart ~= cast(uint)(i + 1);
+    uint offsetOf(Loc loc)
+    {
+        uint l = loc.linnum(), c = loc.charnum();
+        if (l < 1 || l > lineStart.length || c < 1)
+            return uint.max;
+        return lineStart[l - 1] + c - 1;
+    }
+    BodySpan[] res;
+    void walk(Dsymbols* members)
+    {
+        if (!members)
+            return;
+        foreach (s; *members)
+        {
+            if (!s)
+                continue;
+            if (auto fd = s.isFuncDeclaration())
+            {
+                if (!fd.fbody)
+                    continue;
+                immutable st = offsetOf(fd.fbody.loc), en = offsetOf(fd.endloc);
+                if (st >= text.length || en >= text.length || st >= en ||
+                    text[st] != '{' || text[en] != '}')
+                    continue; // not a plain `{ }` body: counts as interface
+                uint nl = 0;
+                foreach (c; text[st .. en + 1])
+                    nl += c == '\n';
+                res ~= BodySpan(st, en + 1, fd.fbody.loc.linnum(), fd.endloc.linnum(), nl,
+                    cast(void*) fd);
+                continue;
+            }
+            if (s.isTemplateDeclaration() || s.isTemplateMixin())
+                continue;
+            if (auto ad = s.isAttribDeclaration())
+            {
+                if (ad.dsym == DSYM.staticForeachDeclaration ||
+                    ad.dsym == DSYM.mixinDeclaration)
+                    continue;
+                walk(ad.decl);
+                if (ad.dsym == DSYM.conditionalDeclaration || ad.dsym == DSYM.staticIfDeclaration)
+                    walk((cast(ConditionalDeclaration) ad).elsedecl);
+                continue;
+            }
+            if (auto ag = s.isAggregateDeclaration())
+                walk(ag.members);
+        }
+    }
+    walk(m.members);
+    return res;
+}
+
+// The bytes of `fd` if its body may be re-analysed in place later: a plain
+// function (no constructor, destructor, ... whose analysis touches its
+// aggregate), analysed up to semantic 2, with declared return type and
+// attributes and no contracts. Null otherwise.
+void[] snapshotFunction(FuncDeclaration fd)
+{
+    if (fd is null || fd.isFuncLiteralDeclaration() || fd.isFuncAliasDeclaration() ||
+        fd.isCtorDeclaration() || fd.isPostBlitDeclaration() || fd.isDtorDeclaration() ||
+        fd.isStaticCtorDeclaration() || fd.isStaticDtorDeclaration() ||
+        fd.isInvariantDeclaration() || fd.isUnitTestDeclaration() || fd.isNewDeclaration())
+        return null;
+    if (fd._scope is null || fd.errors || fd.semanticRun >= PASS.semantic3 ||
+        fd.inferRetType || fd.purityInprocess || fd.safetyInprocess ||
+        fd.nothrowInprocess || fd.nogcInprocess || fd.frequires || fd.fensures ||
+        fd.isNested())
+        return null;
+    enum size = __traits(classInstanceSize, FuncDeclaration);
+    // Scanned memory: the bytes point into the level's objects.
+    auto copy = new void*[(size + (void*).sizeof - 1) / (void*).sizeof];
+    memcpy(copy.ptr, cast(void*) fd, size);
+    return (cast(void*) copy.ptr)[0 .. size];
+}
+
+// Re-analyse the edited bodies of the overlay's root in place, when that is
+// all that changed. False: analyse it in full.
+bool tryPatch(ref Engine e, const(char)[] path, const(char)[] text, ulong h, ref Analysis out_)
+{
+    auto pb = &e.patch;
+    if (!pb.valid || pb.othersChanged || pb.path != path || !e.overlay ||
+        e.overlayVariant || e.recordFolds || e.isolated.length)
+        return false;
+    // A patch keeps every level and what the base loaded: none of it may have
+    // changed on disk (a change without a notification; see ensureDeps).
+    if (changedOnDisk(e))
+        return false;
+    auto t0 = nowMs();
+    // Back to the base (the previous patch's writes are undone).
+    if (pb.patched)
+    {
+        levelPop();
+        pb.patched = false;
+        replaceRoot(e, path, fnv1a64(cast(const(ubyte)[]) pb.text), pb.base);
+    }
+    if (text == pb.text)
+    {
+        e.overlayGeneration = e.generation;
+        out_ = pb.base;
+        return true;
+    }
+    levelPush(dmdGlobalRanges());
+    pb.patched = true;
+    bool ok;
+    Analysis a;
+    string why;
+    {
+        levelEnter();
+        scope (exit)
+            levelLeave();
+        ok = applyPatch(e, path, text, a, why);
+    }
+    if (!ok)
+    {
+        levelPop();
+        pb.patched = false;
+        traceMs("patch.declined", nowMs() - t0, why ~ " " ~ path);
+        return false;
+    }
+    replaceRoot(e, path, h, a);
+    e.overlayGeneration = e.generation;
+    traceMs("analyze.patch", nowMs() - t0, why ~ " " ~ path);
+    engineCheckIdentifiers("after patch");
+    out_ = a;
+    return true;
+}
+
+// Files on the overlay level (not the roots), with their stamps.
+void overlayFiles(ref Engine e, ref string[] files, ref ulong[] stamps)
+{
+    import fsutil : fileStamp;
+
+    immutable top = levelDepth();
+    files = null;
+    stamps = null;
     foreach (m; Module.amodules)
     {
-        if (levelOf(cast(void*) m) != overlayLevel)
+        if (levelOf(cast(void*) m) != top)
             continue;
         auto f = m.srcfile.toString();
-        if (contains(e.depsFiles, f) || contains(e.edited, f) || contains(e.rootFiles, f))
-            continue;
-        auto n = moduleName(m);
-        if (n == "__dmdlsp_deps" || isWarmCopy(n) || contains(e.depsBanned, n))
+        if (isSynthetic(moduleName(m)) || contains(e.rootFiles, f) || contains(e.edited, f))
             continue;
         auto t = levelSuspend();
-        if (!contains(e.learned, n) && !contains(e.depsWanted, n))
-            e.learned ~= n.idup;
+        files ~= f.idup;
         levelResume(t);
+        stamps ~= fileStamp(f);
     }
+}
+
+// Something the overlay rests on changed on disk: a dependency level's file
+// (the level is marked stale) or one the patch base loaded.
+bool changedOnDisk(ref Engine e)
+{
+    import fsutil : fileStamp;
+
+    bool any;
+    foreach (lv; [&e.libs, &e.deps])
+        foreach (i, f; lv.files)
+            if (fileStamp(f) != lv.stamps[i])
+            {
+                lv.stale = true;
+                any = true;
+                break;
+            }
+    foreach (i, f; e.patch.loadedFiles)
+        if (fileStamp(f) != e.patch.loadedStamps[i])
+            any = true;
+    return any;
+}
+
+bool decline(ref string why, string reason)
+{
+    why = reason;
+    return false;
+}
+
+void replaceRoot(ref Engine e, const(char)[] path, ulong h, Analysis a)
+{
+    foreach (ref r; e.roots)
+        if (r.path == path)
+        {
+            r.hash = h;
+            r.a = a;
+            return;
+        }
+    e.roots ~= Root(path.idup, h, a);
+}
+
+// On the patch level: parse `text`, check that only bodies changed, swap and
+// analyse them. `why` says what was done or why not.
+bool applyPatch(ref Engine e, const(char)[] path, const(char)[] text, ref Analysis a,
+    ref string why)
+{
+    import dmdwrap : dmdParseNoRegister;
+    import dmd.funcsem : functionSemantic3;
+    import dmd.dsymbolsem : runDeferredSemantic3;
+    import dmd.dinterpret : lspCtfeCalled;
+
+    auto pb = &e.patch;
+    // Parse errors are fine inside the edited bodies (a statement being
+    // typed): the parser recovers there, and they are reported with the
+    // patch. Anywhere else the structure may be lost.
+    size_t diagFrom = e.sink.msgs.length;
+    auto pr = dmdParseNoRegister(path, text, false);
+    if (!pr.ok)
+        return decline(why, "syntax-errors");
+    auto nm = cast(Module) pr.module_;
+    auto spans = bodySpans(nm, text);
+    if (spans.length != pb.spans.length)
+        return decline(why, "declarations-changed");
+    // Outside the bodies, the text must be the same.
+    size_t po = 0, pn = 0;
+    size_t[] changed;
+    foreach (i; 0 .. spans.length + 1)
+    {
+        immutable oe = i < spans.length ? pb.spans[i].start : pb.text.length;
+        immutable ne = i < spans.length ? spans[i].start : text.length;
+        if (pb.text[po .. oe] != text[pn .. ne])
+            return decline(why, "declarations-changed");
+        if (i == spans.length)
+            break;
+        po = pb.spans[i].end;
+        pn = spans[i].end;
+        if (pb.text[pb.spans[i].start .. po] != text[spans[i].start .. pn])
+            changed ~= i;
+    }
+    foreach (i; changed)
+        if (pb.pristine[i] is null)
+            return decline(why, "body-not-swappable");
+    foreach (k; diagFrom .. e.sink.msgs.length)
+    {
+        auto d = &e.sink.msgs[k];
+        bool inChanged;
+        foreach (i; changed)
+            inChanged |= d.file == path && d.line >= spans[i].startLine &&
+                d.line <= spans[i].endLine;
+        if (!inChanged)
+            return decline(why, "syntax-errors");
+    }
+    if (changed.length > 32)
+        return decline(why, "too-many-bodies");
+
+    // Positions after each body move by the lines it gained.
+    shiftLines(e, spans);
+
+    // Swap the bodies, then analyse them.
+    FuncDeclaration[] fds;
+    foreach (i; changed)
+    {
+        auto fd = cast(FuncDeclaration) pb.spans[i].fd;
+        auto nfd = cast(FuncDeclaration) spans[i].fd;
+        memcpy(cast(void*) fd, pb.pristine[i].ptr, pb.pristine[i].length);
+        fd.fbody = nfd.fbody;
+        fd.endloc = nfd.endloc;
+        fds ~= fd;
+    }
+    lspCtfeCalled = &noteCtfe;
+    immutable ctfeBefore = g_ctfeCount;
+    foreach (fd; fds)
+        functionSemantic3(fd);
+    runDeferredSemantic3();
+    lspCtfeCalled = null;
+    // A body evaluated at compile time from now on is no longer swappable.
+    foreach (k; ctfeBefore .. g_ctfeCount)
+        foreach (i, ref sp; pb.spans)
+            if (sp.fd is g_ctfeFns[k])
+                pb.pristine[i] = null;
+
+    auto m = cast(Module) pb.base.module_;
+    a.module_ = cast(void*) m;
+    a.ok = true;
+    a.syn = snapshotModule(nm, text);
+    // The base's messages, moved like the text, but those inside the bodies
+    // analysed again; then theirs.
+    uint errs = 0;
+    foreach (ref d; pb.base.diags)
+    {
+        if (d.file != path)
+        {
+            a.diags ~= d;
+            continue;
+        }
+        int shift = 0;
+        bool inside = false;
+        foreach (k, ref sp; pb.spans)
+        {
+            if (d.line > sp.endLine)
+                shift += cast(int) spans[k].newlines - cast(int) sp.newlines;
+            else if (d.line >= sp.startLine)
+            {
+                foreach (c; changed)
+                    inside |= c == k;
+                break;
+            }
+            else
+                break;
+        }
+        if (inside)
+            continue;
+        auto nd = d;
+        nd.line = d.line + shift;
+        a.diags ~= nd;
+        if (nd.kind == 'E')
+            errs++;
+    }
+    foreach (i, ref d; e.sink.msgs)
+        if (i >= diagFrom)
+        {
+            a.diags ~= d;
+            if (d.kind == 'E' && d.file == path)
+                errs++;
+        }
+    a.errors = errs;
+    lintUnusedImports(&e.lintArena, m, path, text, errs != 0, a.lintImports);
+    lintUnusedParams(&e.lintArena, m, path, text, errs != 0, a.lintParams);
+    ownLintStrings(e.lintArena, a.lintImports);
+    ownLintStrings(e.lintArena, a.lintParams);
+    recordGraph(e);
+    char[16] b;
+    import core.stdc.stdio : snprintf;
+
+    auto n = snprintf(b.ptr, b.length, "%d bodies", cast(int) changed.length);
+    why = b[0 .. n].idup;
+    return true;
+}
+
+// Make the root's positions follow the new text: from the end of each body
+// on, lines move by what the bodies up to it gained (`#line`-style
+// substitutions on the root's location table entry; its own level undoes them).
+void shiftLines(ref Engine e, BodySpan[] spans)
+{
+    import dmd.location : BaseLoc;
+    static import dmd.location;
+
+    auto pb = &e.patch;
+    auto first = cast(FuncDeclaration) pb.spans[0].fd;
+    immutable idx = __traits(getMember, first.loc, "index");
+    auto table = __traits(getMember, dmd.location, "locFileTable");
+    BaseLoc* bl;
+    foreach (entry; table)
+        if (entry.startIndex <= idx)
+            bl = entry;
+    if (bl is null)
+        return;
+    BaseLoc[] subs = [BaseLoc(bl.filename, null, 0, 0)];
+    int delta = 0;
+    foreach (k, ref sp; pb.spans)
+    {
+        immutable d = cast(int) spans[k].newlines - cast(int) sp.newlines;
+        if (d == 0)
+            continue;
+        delta += d;
+        subs ~= BaseLoc(bl.filename, null, sp.end, delta);
+    }
+    bl.substitutions = subs.length > 1 ? subs : null;
+    __traits(getMember, *bl, "lastSubstIndex") = 0;
 }
 
 // ---- dmd driving --------------------------------------------------------------
@@ -1030,11 +1682,37 @@ Module parseRoot(const(char)[] path, const(char)[] text)
     return parseModule(path, text).module_;
 }
 
-void semanticRoot(Module m)
+// Analyse a root module. Between semantic 2 and 3, keep the bytes of each
+// function in `spans` whose body may later be re-analysed in place.
+void semanticRoot(Module m, BodySpan[] spans, ref void[][] pristine)
 {
-    import dmdwrap : dmdSemantic;
+    import dmd.dsymbolsem : dsymbolSemantic, importAll, runDeferredSemantic,
+        runDeferredSemantic2, runDeferredSemantic3;
+    import dmd.semantic2 : semantic2;
+    import dmd.semantic3 : semantic3;
+    import dmd.dinterpret : lspCtfeCalled;
+    import dmdwrap : dmdHasUnloadedImport;
 
-    dmdSemantic(cast(void*) m);
+    g_ctfeCount = 0;
+    lspCtfeCalled = &noteCtfe;
+    scope (exit)
+        lspCtfeCalled = null;
+    m.importAll(null);
+    if (dmdHasUnloadedImport(cast(void*) m))
+        return;
+    m.dsymbolSemantic(null);
+    runDeferredSemantic();
+    m.semantic2(null);
+    runDeferredSemantic2();
+    pristine = new void[][](spans.length);
+    foreach (i, ref sp; spans)
+        pristine[i] = snapshotFunction(cast(FuncDeclaration) sp.fd);
+    m.semantic3(null);
+    runDeferredSemantic3();
+    // Bodies something evaluated at compile time are part of what others see.
+    foreach (i, ref sp; spans)
+        if (pristine[i] !is null && ctfeCalled(sp.fd))
+            pristine[i] = null;
 }
 
 void finishImported(Module m)

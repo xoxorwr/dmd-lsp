@@ -3,7 +3,7 @@
 The vendored frontend (`src/dmd/`) is stock upstream `master` at the commit
 recorded in [vendoring.md](vendoring.md), plus the patches in `patches/`:
 
-- the LSP-only hacks H1, H2, H5 ([hacks.md](hacks.md)), which are not meant for
+- the LSP-only hacks H1, H2, H5, H6 ([hacks.md](hacks.md)), which are not meant for
   upstream;
 - one allocator patch, below (`patches/outbuffer-mem.patch`), which is. It has
   not been submitted, and is not applied in `../dmd`.
