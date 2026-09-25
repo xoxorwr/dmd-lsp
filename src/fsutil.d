@@ -154,8 +154,20 @@ ulong fileStamp(const(char)[] path) nothrow
         stat_t st;
         if (stat(z, &st) != 0)
             return 0;
-        return (cast(ulong) st.st_mtim.tv_sec * 1_000_000_007UL + st.st_mtim.tv_nsec)
-            ^ (cast(ulong) st.st_size << 1) | 1;
+        ulong sec, nsec;
+        static if (__traits(compiles, st.st_mtim)) // Linux, BSD
+        {
+            sec = st.st_mtim.tv_sec;
+            nsec = st.st_mtim.tv_nsec;
+        }
+        else static if (__traits(compiles, st.st_mtimespec)) // Darwin
+        {
+            sec = st.st_mtimespec.tv_sec;
+            nsec = st.st_mtimespec.tv_nsec;
+        }
+        else
+            sec = st.st_mtime;
+        return (sec * 1_000_000_007UL + nsec) ^ (cast(ulong) st.st_size << 1) | 1;
     }
     else version (Windows)
     {

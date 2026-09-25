@@ -31,6 +31,7 @@ import dmdwrap : dmdParseNoRegister, dmdHasUnloadedImport, dmdIsPlainIdentifier,
 
 import dmd.dmodule : Module;
 import dmd.dsymbol : Dsymbol;
+import dmd.astenums : STC;
 import dmd.func : FuncDeclaration;
 import dmd.dclass : ClassDeclaration;
 import dmd.tokens : Token;
@@ -1955,6 +1956,11 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     // The target identity must be copied (to level 0) before the overlay it
     // points into is dropped below; matching is by key only.
     auto key = declKey(target);
+    // A target constant folding can erase: enum types and members, and
+    // manifest/const/immutable variables.
+    bool foldable = target.isEnumMember() || target.isEnumDeclaration();
+    if (auto vd = target.isVarDeclaration())
+        foldable |= (vd.storage_class & (STC.manifest | STC.const_ | STC.immutable_)) != 0;
 
     // From here on, everything this function returns or keeps across the
     // overlay reset below is built on level 0. dmd itself is only called in
@@ -2025,25 +2031,22 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
     // its siblings.
     RefLoc[] out_;
     ulong tAnalyze0 = nowMs();
-    // Resolving a reference to a manifest constant requires the *unfolded* AST:
-    // the frontend substitutes `Test.A` with its value, losing the member. Turn
-    // that substitution off for the candidate analyses only (diagnostics and
-    // completion keep it), and drop the cached universe so the request module is
-    // re-analysed unfolded too. `lspNoManifestExpand` is imported from the
-    // vendored frontend on purpose: a `make vendor` that drops the patch fails
-    // to compile here instead of silently regressing.
-    // The flag changes what dmd produces, so the candidates are analysed on
-    // levels of their own, dependencies included (a candidate may be one of
-    // them), and those are dropped again afterwards so later requests see
-    // folded ASTs. `a` is invalid from here on.
-    import dmd.optimize : lspNoManifestExpand;
-    engineReset(s.engine, true);
-    lspNoManifestExpand = true;
-    scope (exit)
+    // Constant folding erases uses of constants (`Test.A + Test.B` becomes a
+    // literal). For such a target the candidates are analysed recording what
+    // folding replaces, each as a root (engineBeginUnfolded); `a` is invalid
+    // from then on. Any other target is found in the ordinary analyses, added
+    // to the current overlay as further roots.
+    if (foldable)
     {
-        engineReset(s.engine, true);
-        lspNoManifestExpand = false;
+        const(char)[][] candidates;
+        foreach (mn, _; want)
+            if (auto f = indexFileOf(mn))
+                candidates ~= f;
+        engineBeginUnfolded(s.engine, candidates);
     }
+    scope (exit)
+        if (foldable)
+            engineEndUnfolded(s.engine);
     foreach (mn, _; want)
     {
         auto f = indexFileOf(mn);
@@ -2076,7 +2079,7 @@ private RefResult computeRefs(ref ServerState s, const ref Analysis a,
         inDmd(() {
             unloaded = dmdHasUnloadedImport(ca.module_);
             hidden = riskyMatters && dmdHasHiddenRefRisk(text, ident);
-            found = referencesForKey([cast(Module) ca.module_], key, includeDecl, f, text);
+            found = referencesForKey([cast(Module) ca.module_], key, includeDecl, f, text, ca.folds);
         });
         if (unloaded)
         {
@@ -2657,12 +2660,65 @@ private bool workerExchange(ref Worker w, const(char)[] req, ref char[] resp)
     if (!w.alive)
         return false;
     outChan.written = false;
-    serveRequest(*w.s, req);
+    // A fault in dmd (a null dereference on broken code) fails this request,
+    // not the server: dropping every dmd level restores a clean frontend.
+    import layers : levelRecoverable;
+
+    auto savedArena = jcur;
+    if (!levelRecoverable(() { serveRequest(*w.s, req); }))
+    {
+        jcur = savedArena; // the op's scope guards did not run
+        logFault(req);
+        engineHardReset(w.s.engine);
+        return false;
+    }
     if (!outChan.written)
         return false;
     // The reply buffer is reused by the next request: hand out a copy.
     resp = outChan.buf.dup;
     return true;
+}
+
+// Log a fault `levelRecoverable` caught: the op, the address, the frames.
+private void logFault(const(char)[] req)
+{
+    import layers : levelFaultAddress, levelFaultFrames;
+
+    const(char)[] op = "?";
+    enum key = `"op":"`;
+    foreach (i; 0 .. req.length > key.length ? req.length - key.length : 0)
+        if (req[i .. i + key.length] == key)
+        {
+            auto j = i + key.length;
+            auto k = j;
+            while (k < req.length && req[k] != '"')
+                k++;
+            op = req[j .. k];
+            break;
+        }
+    log("op FAILED op=%.*s: memory fault at %p in dmd; dropping every dmd level",
+        cast(int) op.length, op.ptr, levelFaultAddress());
+    auto frames = levelFaultFrames();
+    version (Posix)
+    {
+        static if (__traits(compiles, { import core.sys.linux.execinfo : backtrace_symbols; }))
+            import core.sys.linux.execinfo : backtrace_symbols;
+        else static if (__traits(compiles, { import core.sys.darwin.execinfo : backtrace_symbols; }))
+            import core.sys.darwin.execinfo : backtrace_symbols;
+        static if (__traits(compiles, backtrace_symbols))
+        {
+            import core.stdc.stdlib : free;
+            import core.stdc.string : strlen;
+
+            auto syms = backtrace_symbols(frames.ptr, cast(int) frames.length);
+            if (syms !is null)
+            {
+                foreach (i; 0 .. frames.length)
+                    log("  at %s", syms[i]);
+                free(syms);
+            }
+        }
+    }
 }
 
 void workerKill(ref Worker w)

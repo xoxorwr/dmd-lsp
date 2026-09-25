@@ -69,11 +69,10 @@ $(VSCODE_DIR)/node_modules: $(VSCODE_DIR)/package.json $(VSCODE_DIR)/package-loc
 
 # Guard: our sources stay struct-only (vendored dmd is excluded). The only
 # exceptions are interop adapters: classes deriving from a dmd `Visitor` (the
-# supported way to traverse the frontend's resolved AST), the dmd `ErrorSink`
-# that keeps messages off stdout, and `LayeredGC` (the druntime GC implementing
-# memory levels, src/layers.d).
+# supported way to traverse the frontend's resolved AST) and `LayeredGC` (the
+# druntime GC implementing memory levels, src/layers.d).
 check-no-oop:
-	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'LayeredGC' | grep -v 'ErrorSink' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
+	@if grep -rnE '^[[:space:]]*(extern[[:space:]]*\(C\+\+\)[[:space:]]*)?(final[[:space:]]+)?(class|interface)[[:space:]]' src/ | grep -v '^src/dmd/' | grep -v 'Visitor' | grep -v 'LayeredGC' ; then echo "OOP forbidden in src/ (outside vendor)"; exit 1; fi
 	@echo "struct-only check ok (interop adapters excepted)"
 
 # Guard: every mutable function-local static of dmd is in the memory-level
@@ -173,6 +172,7 @@ check: $(BIN) check-no-oop check-statics unittest
 	python3 tests/test_trivia.py
 	python3 tests/test_config.py
 	python3 tests/test_memory.py
+	python3 tests/test_analysis_budget.py
 	python3 tests/test_crash.py
 	python3 tests/test_crash.py segv
 	python3 tests/test_editor_session.py

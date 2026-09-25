@@ -4,6 +4,27 @@ module arena;
 // Chunks are reused via reset(); freeAll() releases to OS.
 import core.stdc.stdlib : malloc, free;
 
+// Chunks are registered with the GC as root ranges: arenas hold results that
+// point into GC memory (strings, dmd objects on a memory level), and a
+// collection must see those references or it frees what the arena still uses.
+private void* newChunk() nothrow @nogc
+{
+    import core.memory : GC;
+
+    auto h = malloc(Arena.ChunkSize);
+    if (h)
+        GC.addRange(h, Arena.ChunkSize);
+    return h;
+}
+
+private void freeChunk(void* h) nothrow @nogc
+{
+    import core.memory : GC;
+
+    GC.removeRange(h);
+    free(h);
+}
+
 struct Arena
 {
 nothrow @nogc:
@@ -37,7 +58,7 @@ nothrow @nogc:
                 chunks = p;
                 capChunks = ncap;
             }
-            void* h = malloc(ChunkSize);
+            void* h = newChunk();
             if (!h)
                 return null;
             chunks[nchunks++] = h;
@@ -57,49 +78,17 @@ nothrow @nogc:
         if (nchunks > 0)
         {
             for (size_t i = 1; i < nchunks; i++)
-                free(chunks[i]);
+                freeChunk(chunks[i]);
             curPtr = cast(ubyte*)chunks[0];
             curLeft = ChunkSize;
             nchunks = 1;
         }
     }
 
-    // High-water mark for the universe cache: analysis data stays live in
-    // scratch across requests while per-request temporaries (completion
-    // items) are dropped by rewinding. Only valid until reset()/freeAll().
-    struct Mark
-    {
-        size_t nchunks;
-        ubyte* ptr;
-        size_t left;
-    }
-
-    Mark mark()
-    {
-        return Mark(nchunks, curPtr, curLeft);
-    }
-
-    void rewind(Mark mk)
-    {
-        for (size_t i = mk.nchunks; i < nchunks; i++)
-            free(chunks[i]);
-        nchunks = mk.nchunks;
-        if (nchunks == 0)
-        {
-            curPtr = null;
-            curLeft = 0;
-        }
-        else
-        {
-            curPtr = mk.ptr;
-            curLeft = mk.left;
-        }
-    }
-
     void freeAll()
     {
         for (size_t i = 0; i < nchunks; i++)
-            free(chunks[i]);
+            freeChunk(chunks[i]);
         if (chunks)
             free(chunks);
         chunks = null;

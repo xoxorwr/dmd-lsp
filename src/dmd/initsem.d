@@ -362,10 +362,6 @@ Initializer initializerSemantic(Initializer init, Scope* sc, ref Type tx, NeedIn
     Initializer visitExp(ExpInitializer i)
     {
         //printf("ExpInitializer::semantic(%s), type = %s\n", i.exp.toChars(), t.toChars());
-        // dmd-lsp H1 (docs/hacks.md): keep manifest constants unfolded.
-        import dmd.optimize : lspNoManifestExpand;
-        if (needInterpret && lspNoManifestExpand)
-            needInterpret = NeedInterpret.INITnointerpret;
         if (needInterpret)
             sc = sc.startCTFE();
         i.exp = i.exp.expressionSemantic(sc);

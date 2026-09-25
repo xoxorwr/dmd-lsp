@@ -95,9 +95,8 @@ print('--- stderr ---')
 for line in err.splitlines()[-12:]:
     print(line)
 check('logs-failed-op', 'op FAILED op=analyze' in err, '')
-check('logs-message', ('intentional crash test' if MODE != 'segv' else 'NullPointerError') in err
-      or (MODE == 'segv' and 'null' in err.lower()), '')
-check('logs-stack', '  ??:?' in err or 'serveRequest' in err, '')
+check('logs-message', ('intentional crash test' if MODE != 'segv' else 'memory fault') in err, '')
+check('logs-stack', '  ??:?' in err or 'serveRequest' in err or '  at ' in err, '')
 check('same-process', alive, 'server exited')
 print('FAILURES: %s' % (fails if fails else 'none'))
 sys.exit(1 if fails else 0)

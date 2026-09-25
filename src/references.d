@@ -283,7 +283,7 @@ RefLoc[] findReferences(Module root, Dsymbol target, bool includeDeclaration,
 // universe (the request) and the uses found in independently analysed ones
 // (per-candidate-module workspace references).
 RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl,
-    const(char)[] rootPath = null, const(char)[] rootText = null)
+    const(char)[] rootPath = null, const(char)[] rootText = null, void*[] folds = null)
 {
     RefLoc[] out_;
     if (!key.valid)
@@ -296,7 +296,7 @@ RefLoc[] referencesForKey(Module[] mods, ref const DeclKey key, bool includeDecl
     {
         if (!m)
             continue;
-        walkModule(m, null, includeDecl, out_, rootPath, rootText);
+        walkModule(m, null, includeDecl, out_, rootPath, rootText, folds);
     }
     dedupe(out_);
     g_keyMode = false;
@@ -570,7 +570,7 @@ private bool importsAny(Module m, bool[Module] set)
 }
 
 private void walkModule(Module m, Dsymbol target, bool includeDecl, ref RefLoc[] out_,
-    const(char)[] rootPath, const(char)[] rootText)
+    const(char)[] rootPath, const(char)[] rootText, void*[] folds = null)
 {
     if (!m.members)
         return;
@@ -581,6 +581,17 @@ private void walkModule(Module m, Dsymbol target, bool includeDecl, ref RefLoc[]
     w.out_ = out_;
     foreach (i; 0 .. (*m.members).length)
         (*m.members)[i].accept(w);
+    // Uses constant folding replaced (H1, recorded during the analysis): the
+    // `VarExp`s are gone from the tree, walk them as they were. Only this
+    // module's: a fold inside another module's template body is not a use here.
+    foreach (f; folds)
+    {
+        auto ve = cast(VarExp) f;
+        auto fn = ve.loc.filename();
+        if (fn is null || m.srcfile.toString() != fn[0 .. strlen(fn)])
+            continue;
+        ve.accept(w);
+    }
     out_ = w.out_;
 }
 

@@ -1,5 +1,9 @@
 import json, os, select, subprocess, sys, tempfile, time
 
+# A realistic editing session (100 cycles of typing, completion, hover and
+# saves on one file) in the single server process: no child process ever, and
+# RSS flat once warm.
+
 BIN = './dmd-lsp'
 WORK = tempfile.mkdtemp(prefix='dmd-lsp-editor-')
 ROOT = os.path.join(WORK, 'app.d')
@@ -32,7 +36,7 @@ URI = 'file://' + ROOT
 
 proc = subprocess.Popen([BIN, '--import=' + WORK, '--debounce-ms=50'],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE)
+                        stderr=subprocess.DEVNULL)
 
 def send(obj):
     b = json.dumps(obj).encode()
@@ -75,18 +79,9 @@ def drain_messages(timeout=0.1):
             break
     return msgs
 
-def worker_pids():
-    out = []
-    try:
-        kids = subprocess.run(['pgrep', '-P', str(proc.pid)],
-                              capture_output=True, text=True).stdout.split()
-        for k in kids:
-            out.append(k)
-            out += subprocess.run(['pgrep', '-P', k],
-                                  capture_output=True, text=True).stdout.split()
-    except Exception:
-        pass
-    return set(out)
+def children():
+    return subprocess.run(['pgrep', '-P', str(proc.pid)],
+                          capture_output=True, text=True).stdout.split()
 
 def rss_kb(pid):
     try:
@@ -99,7 +94,7 @@ def rss_kb(pid):
     return 0
 
 def total_rss():
-    return sum(rss_kb(p) for p in worker_pids())
+    return rss_kb(proc.pid)
 
 # 1. Initialize
 send({
@@ -136,9 +131,8 @@ send({
 # wait for publishDiagnostics or responses
 drain_messages(0.2)
 
-pids0 = worker_pids()
 base_rss = total_rss()
-print(f"Base RSS: {base_rss} kB, Worker PIDs: {pids0}")
+print(f"Base RSS: {base_rss} kB")
 
 # 3. Simulate realistic editing loop:
 # User typing in `main()`, requesting completion, semanticTokens, highlight, hover, and debounced lint.
@@ -218,17 +212,29 @@ for i in range(100):
 peak_rss = max(rss_history)
 final_rss = rss_history[-1]
 growth = final_rss - base_rss
-pids_final = worker_pids()
 
 print(f"\nFinal Summary:")
 print(f"Base RSS: {base_rss} kB")
 print(f"Peak RSS: {peak_rss} kB")
 print(f"Final RSS: {final_rss} kB")
 print(f"Net Growth: {growth} kB")
-print(f"Worker PIDs start: {pids0}, end: {pids_final}")
+fails = []
+def check(name, cond, extra=''):
+    print(('PASS ' if cond else 'FAIL ') + name, extra)
+    if not cond:
+        fails.append(name)
+
+warm = rss_history[9] # after the first 10 cycles (first analyses, caches)
+check('rss-flat-after-warmup', peak_rss - warm < 8 * 1024,
+      'warm=%d kB peak=%d kB' % (warm, peak_rss))
+check('no-child-process', not children(), str(children()))
+check('alive', proc.poll() is None, '')
 
 proc.terminate()
 try:
     proc.wait(timeout=2)
 except Exception:
     proc.kill()
+
+print('FAILURES:', fails if fails else 'none')
+sys.exit(1 if fails else 0)

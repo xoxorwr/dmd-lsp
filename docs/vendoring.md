@@ -7,7 +7,7 @@ patches in `patches/` applied:
 
 | patch | what | doc |
 |---|---|---|
-| `h1-no-manifest-expand.patch` | `optimize.d`, `initsem.d` | [hacks.md](hacks.md) H1 |
+| `h1-record-const-folds.patch` | `optimize.d` | [hacks.md](hacks.md) H1 |
 | `h2-baseclass-loc.patch` | `dclass.d`, `dsymbolsem.d` | [hacks.md](hacks.md) H2 |
 | `h5-keep-errored-bodies.patch` | `statementsem.d` | [hacks.md](hacks.md) H5 |
 | `outbuffer-mem.patch` | `common/outbuffer.d` | [upstream.md](upstream.md) |

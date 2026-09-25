@@ -10,7 +10,8 @@ import lint;
 import complete;
 import lexutil : LexCache;
 public import engine : Analysis, Engine, EngineConfig, DocProvider, engineDocChanged, engineRoots,
-    engineDiskChanged, engineReset, engineHardReset, engineScratch, engineCheckIdentifiers;
+    engineDiskChanged, engineReset, engineHardReset, engineScratch, engineCheckIdentifiers,
+    engineBeginUnfolded, engineEndUnfolded;
 import engine;
 
 import dmd.dmodule : Module;

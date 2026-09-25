@@ -36,10 +36,11 @@ import dmd.tokens;
 import dmd.typesem;
 import dmd.visitor;
 
-// dmd-lsp H1 (docs/hacks.md): tooling-only switch. When set, manifest
-// constants are not substituted by their initializer, so a post-semantic walk
-// still sees the `VarExp` (references/rename). Off for normal compilation.
-__gshared bool lspNoManifestExpand;
+// dmd-lsp H1 (docs/hacks.md): tooling hook, null for normal compilation.
+// Called with each `VarExp` that constant folding is about to replace by the
+// variable's value, so a tool can still find the use (references/rename).
+// Folding itself is unchanged.
+__gshared void function(VarExp) nothrow lspConstFolded;
 
 /*************************************
  * If variable has a const initializer,
@@ -189,8 +190,6 @@ private Expression fromConstInitializer(int result, Expression e1)
 {
     //printf("fromConstInitializer(result = %x, %s)\n", result, e1.toChars());
     //static int xx; if (xx++ == 10) assert(0);
-    if (lspNoManifestExpand)
-        return e1;
     auto ve = e1.isVarExp();
     if (!ve)
         return e1;
@@ -214,6 +213,8 @@ private Expression fromConstInitializer(int result, Expression e1)
     }
     e.loc = e1.loc;
 
+    if (lspConstFolded && e !is e1) // dmd-lsp H1
+        lspConstFolded(ve);
     return e;
 }
 
@@ -751,6 +752,8 @@ Expression optimize(Expression e, int result, bool keepLvalue = false)
         {
             VarDeclaration v = ve.var.isVarDeclaration();
             ex = expandVar(result, v);
+            if (ex && lspConstFolded) // dmd-lsp H1 (may be folded below)
+                lspConstFolded(ve);
         }
         if (ex && ex.isStructLiteralExp())
         {

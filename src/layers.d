@@ -150,6 +150,58 @@ size_t levelMappedBytes(uint level) nothrow @nogc
     return n;
 }
 
+// Run `fn` so that a hardware fault in it (a null dereference in dmd on broken
+// code) fails the call instead of the process: returns false when `fn` faulted.
+// A fault never unwinds normally here; the caller must drop every dmd level
+// (`levelAbandonAll`), which restores dmd's heap state and globals, and reset
+// whatever else `fn` had changed. Page saves of the levels are not faults.
+// POSIX: `fn` runs under a `sigsetjmp` point the fault handler `siglongjmp`s
+// to. Windows: the handler makes the faulting code "call" a function that
+// throws an Error, which unwinds normally out of `fn` (callers catch it).
+pragma(inline, false)
+bool levelRecoverable(scope void delegate() fn)
+{
+    version (Posix)
+    {
+        if (layersSigsetjmp(gRecoverBuf.ptr, 1) != 0)
+        {
+            gRecoverArmed = false;
+            return false;
+        }
+        import core.sys.posix.pthread : pthread_self;
+
+        gRecoverThread = pthread_self();
+        gRecoverArmed = true;
+        scope (exit)
+            gRecoverArmed = false;
+        fn();
+        return true;
+    }
+    else version (Windows)
+    {
+        import core.sys.windows.winbase : GetCurrentThreadId;
+
+        gRecoverThread = GetCurrentThreadId();
+        gRecoverArmed = true;
+        scope (exit)
+            gRecoverArmed = false;
+        fn();
+        return true;
+    }
+}
+
+// The last fault `levelRecoverable` recovered from: address, and the frames
+// captured in the handler (empty where unsupported). For the log.
+void* levelFaultAddress() nothrow @nogc
+{
+    return gFaultAddr;
+}
+
+void*[] levelFaultFrames() nothrow @nogc
+{
+    return gFaultFrames[0 .. gFaultFrameCount];
+}
+
 // Level owning `p` (0 = runtime or not GC memory).
 uint levelOf(const void* p) nothrow @nogc
 {
@@ -897,8 +949,36 @@ bool onWriteFault(void* addr) nothrow @nogc
     return true;
 }
 
+__gshared bool gRecoverArmed;
+__gshared void* gFaultAddr;
+__gshared void*[48] gFaultFrames;
+__gshared int gFaultFrameCount;
+
 version (Posix)
 {
+    import core.sys.posix.pthread : pthread_t, pthread_self, pthread_equal;
+
+    __gshared pthread_t gRecoverThread;
+    // A sigjmp_buf, sized for every supported libc (glibc 200 bytes, Darwin
+    // arm64 196): druntime has no Darwin binding, so it is declared here.
+    __gshared align(16) ubyte[512] gRecoverBuf;
+
+    version (CRuntime_Glibc)
+        enum sigsetjmpName = "__sigsetjmp"; // `sigsetjmp` is a macro
+    else
+        enum sigsetjmpName = "sigsetjmp";
+    version (LDC)
+    {
+        import ldc.attributes : llvmAttr;
+
+        extern (C) pragma(mangle, sigsetjmpName) @llvmAttr("returns_twice")
+        int layersSigsetjmp(void* env, int savemask) nothrow @nogc;
+    }
+    else
+        extern (C) pragma(mangle, sigsetjmpName)
+        int layersSigsetjmp(void* env, int savemask) nothrow @nogc;
+    extern (C) void siglongjmp(void* env, int val) nothrow @nogc;
+
     __gshared sigaction_t gOldSegv;
     __gshared sigaction_t gOldBus;
 
@@ -906,7 +986,28 @@ version (Posix)
     {
         if (onWriteFault(info.si_addr))
             return;
-        // Not a layer page: hand it to whoever was there before.
+        // A real fault inside a recoverable call (dmd, on the thread that
+        // armed it): abandon the call.
+        if (gRecoverArmed && pthread_equal(pthread_self(), gRecoverThread))
+        {
+            gRecoverArmed = false;
+            gFaultAddr = info.si_addr;
+            gFaultFrameCount = 0;
+            version (linux)
+            {
+                import core.sys.linux.execinfo : backtrace;
+
+                gFaultFrameCount = backtrace(gFaultFrames.ptr, cast(int) gFaultFrames.length);
+            }
+            else version (Darwin)
+            {
+                import core.sys.darwin.execinfo : backtrace;
+
+                gFaultFrameCount = backtrace(gFaultFrames.ptr, cast(int) gFaultFrames.length);
+            }
+            siglongjmp(gRecoverBuf.ptr, 1);
+        }
+        // Not ours: hand it to whoever was there before.
         auto old = sig == SIGSEGV ? &gOldSegv : &gOldBus;
         if (old.sa_flags & SA_SIGINFO)
         {
@@ -936,14 +1037,37 @@ version (Posix)
 }
 else version (Windows)
 {
+    __gshared uint gRecoverThread;
+
     extern (Windows) LONG faultHandler(EXCEPTION_POINTERS* ep) nothrow
     {
+        import core.sys.windows.winbase : GetCurrentThreadId;
+
         auto rec = ep.ExceptionRecord;
-        if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec.NumberParameters >= 2
-            && rec.ExceptionInformation[0] == 1 // write
+        if (rec.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec.NumberParameters < 2)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (rec.ExceptionInformation[0] == 1 // write
             && onWriteFault(cast(void*) rec.ExceptionInformation[1]))
             return EXCEPTION_CONTINUE_EXECUTION;
+        // A real fault inside a recoverable call: make the faulting code call
+        // `throwFault` (push the faulting address as its return address), so
+        // the Error unwinds through the faulting frame like any throw.
+        version (Win64)
+            if (gRecoverArmed && GetCurrentThreadId() == gRecoverThread)
+            {
+                gRecoverArmed = false;
+                auto c = ep.ContextRecord;
+                c.Rsp -= 8;
+                *cast(ulong*) c.Rsp = c.Rip;
+                c.Rip = cast(ulong) &throwFault;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    extern (C) void throwFault()
+    {
+        throw new Error("access violation");
     }
 
     void installFaultHandler() nothrow @nogc

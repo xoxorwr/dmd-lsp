@@ -9,8 +9,7 @@ How `dmd-lsp` works and the conventions it is built on.
   reference/dev tree — refresh with `make vendor`, never edit `src/dmd/`.
 - Do not edit `../dmd` without explicit permission.
 - Our code is `struct`-only (no `class`/`interface`/inheritance), except
-  interop adapters: dmd `Visitor` subclasses, the dmd `ErrorSink` subclass and
-  the `LayeredGC` druntime GC.
+  interop adapters: dmd `Visitor` subclasses and the `LayeredGC` druntime GC.
 - Our code uses no phobos (`std.*`): JSON comes from the vendored
   `src/json.d` (kdom's `rt.json` adapted: `Arena` allocator, `core.stdc`
   libc, plus a serializer); files via C stdio.
@@ -113,10 +112,15 @@ cycle per edit (~420 ms) — the price of never serving an importer stale
 symbols. RSS is flat over hundreds of edits and full rebuilds
 (`tests/test_memory.py`).
 
-Failure recovery: an op that throws (a dmd assert, or a segfault turned into an
-`Error` by druntime's memory-error handler) is logged, every dmd level is
-dropped (`engineHardReset`) and the request fails; the next one starts from a
-fresh level 1 in the same process (`tests/test_crash.py`).
+Failure recovery: a request that fails inside dmd — an assert (`Error`), or a
+hardware fault on broken code — is logged with its op and stack, every dmd
+level is dropped (`engineHardReset`) and the request fails; the next one starts
+from a fresh level 1 in the same process (`tests/test_crash.py`, both kinds).
+Faults are caught by `levelRecoverable` (`src/layers.d`), for any compiler: on
+POSIX the fault handler `siglongjmp`s back to a `sigsetjmp` point around the
+op (no unwinding is needed: dropping the levels restores dmd's heap and
+globals); on Windows the vectored handler makes the faulting code call a
+function that throws an `Error`, which unwinds into the op's `catch`.
 
 ## Semantic pipeline
 
@@ -159,11 +163,12 @@ fresh level 1 in the same process (`tests/test_crash.py`).
   initializer (`auto q = Point(...)`, `new Point(...)`,
   `auto s = factory!(State)()`), so member access above the error keeps its
   `property`/`method` colour.
-- dmd's message-kind output (`pragma(msg)`) is rerouted to stderr by
-  replacing the compiler's `ErrorSink` (`LspErrorSink`): it bypasses
-  `DiagnosticHandler` straight to stdout, which would corrupt LSP framing. (It
-  used to be caught by swapping fd 1 around each analysis, which is not stable
-  for a process that also writes the LSP stream on Windows.) `initDMD` leaves the lexer identifier tables unset (stock sets
+- dmd prints to stdout in places (`pragma(msg)` bypasses `DiagnosticHandler`,
+  plus debug/diagnostic paths), which would corrupt LSP framing. At startup the
+  server keeps a private duplicate of fd 1 for the protocol (`lspTakeStdout`)
+  and points fd 1 at stderr, so all of it lands in the log. (It used to swap fd
+  1 around each analysis, which is not stable on Windows once the same process
+  writes the protocol.) `initDMD` leaves the lexer identifier tables unset (stock sets
   them from CLI flags), which segfaults on the first non-ASCII identifier —
   initialized like stock does.
 
@@ -174,6 +179,36 @@ analysis when it holds this exact text and nothing changed since; otherwise the
 overlay is popped (restoring level 2) and the root is analysed in a fresh one.
 Several roots share an overlay: analysing another file (a reference candidate,
 a hierarchy item, an open importer) adds it on top of the same dependencies.
+
+### What invalidates what
+
+The cache is only as good as its invalidation, so each event is scoped to what
+it actually changes (`tests/test_analysis_budget.py` pins the counts: in its
+editor session, typing with completion, signature help and token pulls,
+navigation, a function-reference search, a save and closing an unedited file
+cost **no** analysis; each debounced edit costs one):
+
+| event | effect |
+|---|---|
+| `didChange` with new text | overlay dropped at the next analysis; the dependency level only if the file was on it (first edit of a dependency) |
+| `didOpen`/`didClose`/`didSave` with the text dmd already reads (buffer equals disk, or unchanged) | nothing (the engine compares text hashes per document) |
+| `didChangeWatchedFiles` for an open document | nothing: it is served from its buffer (editors report every save) |
+| `didChangeWatchedFiles` for another source | levels that loaded it dropped; open documents re-analysed on the debounce, so diagnostics follow a checkout |
+| a file changing on disk with no notification | noticed by size/mtime when the next overlay is built |
+| request for a root the overlay lacks | the root is added to the same overlay (no rebuild) |
+| config change | everything rebuilt |
+
+Every analysis and level build logs its reason under `DMD_LSP_TIMING=1`
+(`analyze: 5 ms (doc-changed app.d)`, `deps: … (learned …)`), which is how the
+budget test counts them.
+
+Workspace references for a function, type, field or ordinary variable analyse
+the candidate importers as further roots of the current overlay. A constant
+target (enum, enum member, manifest/const/immutable variable) is different:
+folding erases its uses, so candidates are analysed with the H1 hook recording
+them, as roots kept out of the dependency and warm levels — one dependency
+rebuild for the search and one to restore afterwards (~0.3 s, only for
+constant searches).
 
 ### Completion never analyses
 

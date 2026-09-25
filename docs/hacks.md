@@ -11,7 +11,7 @@ Rule of thumb:
 - If it exists only so a *language server* can work — a mode, a global, an
   escape hatch no compiler user would want — it belongs here.
 
-Each lives as a patch file in `patches/` (`h1-no-manifest-expand.patch`,
+Each lives as a patch file in `patches/` (`h1-record-const-folds.patch`,
 `h2-baseclass-loc.patch`, `h5-keep-errored-bodies.patch`), applied by
 `make vendor` on top of stock dmd; every edited spot carries a
 `dmd-lsp Hn (docs/hacks.md)` comment. A patch that no longer applies fails the
@@ -24,95 +24,74 @@ vendor step. Beyond that:
 
 ---
 
-## H1. `lspNoManifestExpand` — keep manifest constants in the AST
+## H1. `lspConstFolded` — record the uses constant folding erases
 
-**Files**: `src/dmd/optimize.d`, `src/dmd/initsem.d`
-**Consumer**: `src/ops.d` (`computeRefs`)
+**Files**: `src/dmd/optimize.d` (`patches/h1-record-const-folds.patch`)
+**Consumer**: `src/engine.d` (`engineBeginUnfolded`, `analyzeFresh`),
+`src/references.d` (`walkModule`), `src/ops.d` (`computeRefs`)
 **Tests**: `tests/test_references.py` (`enum-compound-member-refs`,
 `enum-compound-type-refs`, `const-manifest-refs`), `tests/test_rename.py`
 (`rename-enum-compound-member`)
-**Status**: not upstreamable.
+**Status**: not upstreamable as is (a tooling hook), but harmless: it changes
+nothing dmd computes.
 
 ### Problem
 
-dmd substitutes **manifest constants** with their value during semantic:
-
-- function bodies: `dmd.optimize.fromConstInitializer` → `expandVar` replaces a
-  `VarExp` that refers to a literal-valued `enum`/`const`/`immutable` with the
-  literal (`src/dmd/optimize.d`); note `e.loc = e1.loc`, so the folded value
-  keeps the *use* location;
-- initializers: `ExpInitializer.initializerSemantic` runs `INITinterpret`
-  (`src/dmd/initsem.d`), whose `ctfeInterpret()` folds the same constants, so
-  module-level `Test t = Test.A;` is folded even though `fromConstInitializer`
-  would have stopped.
-
-A `VarExp` to an `EnumMember` is what gives references and rename their
-identity. Once folded, the member link is gone and one `IntegerExp` can stand
-for several accesses (`Test.A + Test.B`), so:
-
-- `Test.A` uses are simply not found;
-- rename renames the declaration and *some* uses and silently leaves the
-  compound ones — a broken rename.
-
-Simple accesses (`Test.A` alone) are additionally recovered from the folded
-`IntegerExp` in `src/references.d` (`emitEnumAccess`), but that cannot recover a
-compound expression whose result type is no longer the enum, nor the general
-`const` case.
+dmd substitutes **manifest constants** with their value during semantic
+(`dmd.optimize.fromConstInitializer` → `expandVar`, and the struct-constant
+field path in `visitDotVar`). A `VarExp` to an `EnumMember` or a constant is
+what gives references and rename their identity; once folded, the link is gone
+and one literal can stand for several uses (`Test.A + Test.B`), so those uses
+are not found and a rename would silently leave them behind. Simple enum
+accesses are also recovered from the folded, enum-typed `IntegerExp`
+(`emitEnumAccess` in `src/references.d`), but not compound expressions or
+plain constants.
 
 ### Hack
 
-A process-global `__gshared bool lspNoManifestExpand` in `dmd.optimize`
-(default `false`):
+A hook, `__gshared void function(VarExp) nothrow lspConstFolded` in
+`dmd.optimize`, null by default. When set, it is called with each `VarExp`
+that folding is about to replace. Folding is unchanged.
 
-- `fromConstInitializer` returns the expression unchanged when it is set;
-- `initsem.d`'s `visitExp` downgrades `needInterpret` from `INITinterpret` to
-  `INITnointerpret` when it is set, so initializers are not CTFE-folded either.
-
-`src/ops.d` sets it **only around the per-candidate analyses** in
-`computeRefs`, so diagnostics, completion, hover and lint keep the normal
-folded AST. The candidates get levels of their own: the overlay and the
-dependency level are dropped before (a candidate may live in either, analysed
-folded) and again after, so nothing unfolded is served to later requests.
+The engine sets it only during workspace reference search for a *foldable*
+target (an enum, an enum member, a manifest/const/immutable variable), around
+each candidate root's own analysis, and keeps the recorded `VarExp`s in
+`Analysis.folds`; the references walker visits them as if they were still in
+the tree (restricted to the module being searched). For such a search the
+candidate modules are analysed as roots in a fresh overlay — kept out of the
+dependency and warm levels, which were analysed without recording — and that
+overlay is dropped afterwards. Other targets need none of this: their
+candidates are just further roots of the current overlay.
 
 ```d
-// src/ops.d (computeRefs)
-import dmd.optimize : lspNoManifestExpand;
-engineReset(s.engine, true);
-lspNoManifestExpand = true;
+// src/engine.d (analyzeFresh, the root's semantic only)
+import dmd.optimize : lspConstFolded;
+g_folds = null;
+lspConstFolded = e.recordFolds ? &noteFold : null;
 scope (exit)
-{
-    engineReset(s.engine, true);
-    lspNoManifestExpand = false;
-}
+    lspConstFolded = null;
 ```
+
+The earlier version of this hack *disabled* folding (and CTFE of initializers)
+instead. That made dmd compute something else: Phobos CTFE met uninterpreted
+initializers and asserted (`copyRegionExp`), so references failed on any
+Phobos-heavy module. Recording leaves dmd's results alone.
 
 ### Why it is a hack
 
-It is a mutable global in the compiler that makes semantic produce a
-deliberately non-standard AST, toggled by the consumer. No compiler build
-wants this; upstream would reject it. It is the price of doing semantic-only
-references without a parse-time fallback.
+A consumer callback inside the optimizer, for tooling only. Upstream might
+accept a general "folded" notification, but not in this form.
 
 ### Cost
 
-Measured on a fold-heavy 60k-line module (60k functions, 6 manifest references
-each), 5 runs each, via `./dmd-lsp --check`:
-
-| build | mean |
-|---|---|
-| no flag (baseline) | 1.662 s |
-| flag present, false | 1.648 s |
-| flag **enabled** | 1.644 s |
-
-The added branch is one always-false, well-predicted `__gshared` read in
-`fromConstInitializer`; the difference is run noise.
+One null-pointer test per substitution when unset. When set (reference search
+only), one array append per substitution.
 
 ### Keeping it honest
 
-`src/ops.d` imports `dmd.optimize : lspNoManifestExpand` on purpose: if a
-`make vendor` drops the frontend half, the build fails here. If the frontend
-half survives but stops doing its job, `enum-compound-*` and
-`const-manifest-refs` fail. Both are required before merging a vendor refresh.
+`src/engine.d` imports `dmd.optimize : lspConstFolded`: a vendor refresh that
+loses the patch fails to build. If the hook stops firing, `enum-compound-*` and
+`const-manifest-refs` fail.
 
 ---
 

@@ -14,8 +14,7 @@ import dmd.dsymbolsem : dsymbolSemantic, importAll,
     runDeferredSemantic, runDeferredSemantic2, runDeferredSemantic3;
 import dmd.semantic2 : semantic2;
 import dmd.semantic3 : semantic3;
-import dmd.errors : DiagnosticHandler, FatalErrorHandler, ErrorSinkCompiler;
-import dmd.errorsink : ErrorKind;
+import dmd.errors : DiagnosticHandler, FatalErrorHandler;
 import dmd.astcodegen : ASTCodegen;
 import dmd.dmodule : Module;
 import dmd.console : Color;
@@ -109,32 +108,6 @@ private bool onDiag(const ref SourceLoc loc, Color headerColor, const(char)* hea
 private bool onFatal() nothrow
 {
     return true; // never exit() the daemon
-}
-
-// dmd's compiler sink prints plain messages (`pragma(msg)`, `-v`) straight to
-// stdout, bypassing the diagnostic handler. In the server, stdout is the LSP
-// stream: send them to stderr (the log) instead, like any other chatter.
-extern (C++) final class LspErrorSink : ErrorSinkCompiler
-{
-    override void emit(const SourceLoc loc, const(char)* format, va_list ap,
-        ErrorKind kind, bool supplemental, bool gagged)
-    {
-        if (kind != ErrorKind.message || supplemental)
-            return super.emit(loc, format, ap, kind, supplemental, gagged);
-        import core.stdc.stdio : fprintf, vfprintf, fputc, stderr;
-
-        if (loc.filename.length)
-            fprintf(stderr, "%.*s(%u): ", cast(int) loc.filename.length, loc.filename.ptr, loc.line);
-        vfprintf(stderr, format, ap);
-        fputc('\n', stderr);
-    }
-}
-
-ErrorSinkCompiler newLspErrorSink()
-{
-    auto s = new LspErrorSink();
-    s.errorLimit = 0; // unlimited: a daemon must survive error storms
-    return s;
 }
 
 DiagnosticHandler diagHandler()

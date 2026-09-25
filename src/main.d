@@ -780,13 +780,24 @@ private void poolDropAll(App* app)
 
 // A workspace source changed on disk: the symbol index and any dependency
 // level holding that file are stale.
-private void poolInvalidateIndex(App* app, const(char)[] path = null)
+// A workspace source changed on disk (VCS, another tool, or the editor's own
+// save). The symbol index reads disk, so it is stale either way. For analysis
+// an open document is its buffer, so its disk copy does not matter (editors
+// report every save); any other file may be one the open documents import:
+// the engine drops what loaded it, and the open documents are re-analysed on
+// the debounce, so their diagnostics follow the change.
+private void sourceChangedOnDisk(App* app, const(char)[] path)
 {
     foreach (ref e; app.pool)
-    {
         e.indexBuilt = false;
+    if (sessionFind(app.session, path) !is null)
+        return;
+    foreach (ref e; app.pool)
         engineDiskChanged(workerEngine(e.wk), path);
-    }
+    foreach (ref d; app.session.docs)
+        if (isDFilePath(d.path))
+            markPending(app, d.path);
+    app.lastMsgMs = nowMs();
 }
 
 // A document's text changed. `edited`: it no longer (necessarily) matches
@@ -2069,17 +2080,14 @@ private void handleMessage(App* app, ref RawMsg m)
                             if (uri is null)
                                 continue;
                         string path = uriToPath(uri);
-                        if (!sameDir(dirOf(path), app.root))
-                            continue;
                         if (isDFilePath(path))
                         {
-                            // A workspace source changed on disk: the
-                            // symbol index is stale (rebuilt lazily), and so
-                            // is a dependency level that loaded it.
-                            poolInvalidateIndex(app, path);
+                            if (pathUnder(path, app.root))
+                                sourceChangedOnDisk(app, path);
                             continue;
                         }
-                        if (!isDlsJson(path))
+                        // Config: the root `dls.json` only (single-root).
+                        if (!sameDir(dirOf(path), app.root) || !isDlsJson(path))
                             continue;
                         if (fileExists(path))
                             notifyNotice(loadFileConfig(app, app.root));
@@ -3804,15 +3812,6 @@ extern (C) int main(int argc, char** argv)
     // that implements them before the runtime starts.
     import layers : layersSelect;
     layersSelect();
-    // A fault in dmd (a null dereference on broken code) must fail the
-    // request, not the server: have druntime turn SIGSEGV into an Error the op
-    // guard catches. Installed before the runtime starts, so the memory-level
-    // write-fault handler goes on top and forwards everything else to it.
-    version (linux) version (X86_64)
-    {
-        import etc.linux.memoryerror : registerMemoryErrorHandler;
-        registerMemoryErrorHandler();
-    }
     import core.runtime : rt_init, rt_term;
     if (rt_init() == 0)
         return 1;
@@ -3927,6 +3926,7 @@ private int dmdLspMain(string[] args)
         // fgetc/fread would otherwise hoard messages in a userspace buffer
         // (poll blocks on an "empty" pipe while input sits buffered).
         setvbuf(stdin, null, _IONBF, 0);
+        lspTakeStdout();
 
         RawMsg m;
         string body_;
@@ -3976,6 +3976,7 @@ private int dmdLspMain(string[] args)
         _setmode(_fileno(cast(void*) stdout), _O_BINARY);
         setvbuf(stdin, null, _IONBF, 0);
         setvbuf(stdout, null, _IONBF, 0);
+        lspTakeStdout();
 
         auto hIn = GetStdHandle(STD_INPUT_HANDLE);
         RawMsg m;

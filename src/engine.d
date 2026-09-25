@@ -5,11 +5,12 @@
 //       dmd analyses imports. Never contains a root, an edited document, or a
 //       module that (transitively) imports one: those would have to change
 //       underneath it. Rebuilt when that set or the disk changes.
-//   L3  warm: a copy of the current root under another module name, analysed
-//       once. The template instances it creates with library-only arguments
-//       (`format!(char, int)`, `to!string`, ...) are cached here, so each edit
-//       re-instantiates only what depends on the root's own code. Rebuilt on a
-//       root switch or when an edited document it loaded changes.
+//   L3  warm: a copy of each root (up to 8) under another module name,
+//       analysed once. The template instances they create with library-only
+//       arguments (`format!(char, int)`, `to!string`, ...) are cached here, so
+//       each edit re-instantiates only what depends on the root's own code. A
+//       copy is added when a new root rebuilds the overlay; the level is
+//       rebuilt when an edited document it loaded changes.
 //   L4  the overlay: the roots analysed since the last change, from their
 //       editor buffers. Any document change pops it; the next request pushes a
 //       fresh one and analyses on top of the untouched lower levels.
@@ -39,6 +40,7 @@ import log : log;
 import timing : nowMs, traceMs;
 
 import dmd.dmodule : Module;
+import dmd.expression : VarExp;
 import dmd.globals : global;
 
 struct Analysis
@@ -50,6 +52,9 @@ struct Analysis
     LintOut lintImports;
     LintOut lintParams;
     SynMod syn; // pre-semantic structure snapshot (see complete.d)
+    // Uses of constants dmd folded away during this analysis (dmd `VarExp`s,
+    // only recorded during reference search: engineBeginUnfolded).
+    void*[] folds;
 }
 
 struct EngineConfig
@@ -82,6 +87,8 @@ struct Engine
     // Bumped on every document or disk change; the overlay records the value
     // it was built at.
     ulong generation;
+    // Hash of the text dmd reads for each document seen (buffer, else disk).
+    ulong[string] docHash;
 
     // L2
     bool depsBuilt;
@@ -97,10 +104,15 @@ struct Engine
     // L3
     bool warmBuilt;
     bool warmStale;           // an edited document it loaded changed
-    string warmPath;          // the root it is a copy of
+    string[] warmPaths;       // the roots it holds copies of
     string[] warmFiles;       // files it loaded above L2 (level 0)
     DiagMsg[] warmDiags;      // their diagnostics, for roots found there
     string[] noWarm;          // roots whose copy pulls the root itself in (cycle)
+
+    // Reference search (engineBeginUnfolded): overlay analyses record the uses
+    // of constants that folding replaces, and these files stay out of L2/L3.
+    bool recordFolds;
+    string[] isolated;
 
     // L4
     bool overlay;
@@ -136,6 +148,29 @@ void engineDocChanged(ref Engine e, const(char)[] path, bool edited)
     auto t = levelSuspend();
     scope (exit)
         levelResume(t);
+    // Only a change of the text dmd would read invalidates anything: opening
+    // or closing a document that matches the disk, or saving (or re-sending)
+    // an unchanged buffer, keeps every level and the overlay's analyses.
+    {
+        import session : sessionReadDisk;
+
+        const(char)[] now = e.docs.open !is null ? e.docs.open(path) : null;
+        if (now is null)
+            now = sessionReadDisk(path);
+        immutable h = fnv1a64(cast(const(ubyte)[]) now);
+        auto known = path in e.docHash;
+        ulong before;
+        if (known)
+            before = *known;
+        else
+        {
+            auto disk = sessionReadDisk(path);
+            before = fnv1a64(cast(const(ubyte)[]) disk);
+        }
+        e.docHash[path.idup] = h;
+        if (h == before)
+            return;
+    }
     e.generation++;
     if (edited && !contains(e.edited, path))
     {
@@ -155,6 +190,8 @@ void engineDiskChanged(ref Engine e, const(char)[] path)
     scope (exit)
         levelResume(t);
     e.generation++;
+    if (path !is null)
+        e.docHash.remove(cast(string) path); // remove only hashes the key
     if (path is null || contains(e.warmFiles, path))
         e.warmStale = true;
     if (path is null || contains(e.depsFiles, path))
@@ -236,6 +273,39 @@ void engineHardReset(ref Engine e)
     e.warmDiags = null;
 }
 
+// Reference search needs the uses constant folding erases: the frontend
+// substitutes a manifest constant (`Test.A`) with its value, losing the use.
+// Between these calls, overlay analyses record every such substitution (H1,
+// docs/hacks.md) in `Analysis.folds`; folding itself is unchanged. `files`
+// (the candidate modules) are kept out of the dependency and warm levels, like
+// edited documents, so each is analysed as a root, module-level initialisers
+// included (a module on those levels was analysed without recording).
+void engineBeginUnfolded(ref Engine e, const(char)[][] files)
+{
+    auto t = levelSuspend();
+    scope (exit)
+        levelResume(t);
+    e.isolated = null;
+    foreach (f; files)
+    {
+        e.isolated ~= f.idup;
+        if (contains(e.depsFiles, f))
+            e.depsStale = true;
+    }
+    e.recordFolds = true;
+    popWarm(e); // and the overlay: both may hold candidates, unrecorded
+}
+
+void engineEndUnfolded(ref Engine e)
+{
+    auto t = levelSuspend();
+    scope (exit)
+        levelResume(t);
+    e.recordFolds = false;
+    e.isolated = null;
+    popOverlay(e); // its analyses were built for the search
+}
+
 // Drop the overlay (and the warm and dependency levels if `deps`). The next
 // request rebuilds them.
 void engineReset(ref Engine e, bool deps)
@@ -296,7 +366,7 @@ void popWarm(ref Engine e)
     engineCheckIdentifiers("after warm pop");
     e.warmBuilt = false;
     e.warmStale = false;
-    e.warmPath = null;
+    e.warmPaths = null;
     e.warmFiles = null;
     e.warmDiags = null;
 }
@@ -324,7 +394,7 @@ void ensureInit(ref Engine e)
     import dmd.identifier : Identifier;
     import dmd.tokens : Token;
     import dmd.common.charactertables : IdentifierCharLookup, IdentifierTable;
-    import dmdwrap : diagHandler, fatalHandler, newLspErrorSink;
+    import dmdwrap : diagHandler, fatalHandler;
 
     levelPush(dmdGlobalRanges());
     levelEnter();
@@ -337,9 +407,6 @@ void ensureInit(ref Engine e)
     foreach (kw; __traits(getMember, dmd.tokens, "keywords"))
         Identifier.idPool(__traits(getMember, Token, "tochars")[kw], kw);
     initDMD(diagHandler(), fatalHandler());
-    // Plain messages (`pragma(msg)`) bypass the handler and go to stdout,
-    // which carries the LSP stream: replace the sink that prints them.
-    global.errorSink = newLspErrorSink();
     // H5 (docs/hacks.md): keep a function body past one broken statement, so
     // the half-typed buffer still has its scopes.
     import dmd.statementsem : lspKeepErroredBodies;
@@ -357,11 +424,48 @@ void ensureInit(ref Engine e)
     e.initialized = true;
 }
 
+void ownLintStrings(ref Arena arena, ref LintOut o)
+{
+    static string copy(ref Arena arena, const(char)[] str)
+    {
+        if (!str.length)
+            return null;
+        auto p = cast(char*) arena.alloc(str.length);
+        if (p is null)
+            return null;
+        p[0 .. str.length] = str[];
+        return cast(string) p[0 .. str.length];
+    }
+
+    foreach (i; 0 .. o.nhits)
+    {
+        o.hits[i].path = copy(arena, o.hits[i].path);
+        o.hits[i].name = copy(arena, o.hits[i].name);
+    }
+}
+
+// Folds recorded by the H1 hook during the current root analysis.
+__gshared void*[] g_folds;
+
+void noteFold(VarExp ve) nothrow
+{
+    g_folds ~= cast(void*) ve;
+}
+
 Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulong h, bool variant)
 {
     ensureInit(e);
     if (!contains(e.rootFiles, path))
         e.rootFiles ~= path.idup;
+    // Why the overlay could not answer (DMD_LSP_TIMING): the cache audit.
+    string why = variant ? "variant"
+        : !e.overlay ? "no-overlay"
+        : e.overlayVariant ? "after-variant"
+        : e.overlayGeneration != e.generation ? "doc-changed"
+        : "new-root";
+    foreach (ref r; e.roots)
+        if (why == "new-root" && r.path == path)
+            why = "text-changed";
     // Anything changed since the overlay was built, or a variant on either
     // side: start a fresh overlay.
     if (e.overlay && (variant || e.overlayVariant || e.overlayGeneration != e.generation))
@@ -387,6 +491,14 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
     levelEnter();
     size_t diagFrom = e.sink.msgs.length;
     {
+        // H1: record what folding erases during this root's own analysis
+        // (reference search only, see engineBeginUnfolded).
+        import dmd.optimize : lspConstFolded;
+
+        g_folds = null;
+        lspConstFolded = e.recordFolds ? &noteFold : null;
+        scope (exit)
+            lspConstFolded = null;
         auto m = findLoaded(path);
         if (m is null)
         {
@@ -407,6 +519,7 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         }
         a.module_ = cast(void*) m;
         a.ok = m !is null;
+        a.folds = g_folds; // overlay memory, like the rest of the analysis
     }
     // Messages for this file from the whole overlay, plus everything this
     // analysis reported (template errors point into other files).
@@ -431,10 +544,15 @@ Analysis analyzeFresh(ref Engine e, const(char)[] path, const(char)[] text, ulon
         auto m = cast(Module) a.module_;
         lintUnusedImports(&e.lintArena, m, path, text, errs != 0, a.lintImports);
         lintUnusedParams(&e.lintArena, m, path, text, errs != 0, a.lintParams);
+        // The hits slice `path`/`text` and dmd's identifiers; the arena is C
+        // memory the GC does not scan, so give them copies that live as long
+        // as the arena (this overlay).
+        ownLintStrings(e.lintArena, a.lintImports);
+        ownLintStrings(e.lintArena, a.lintParams);
     }
     learnLoads(e);
     levelLeave();
-    traceMs(variant ? "analyze.variant" : "analyze", nowMs() - t0, path);
+    traceMs(variant ? "analyze.variant" : "analyze", nowMs() - t0, why ~ " " ~ path);
     engineCheckIdentifiers("after analyze");
     e.roots ~= Root(path.idup, h, a);
     return a;
@@ -482,12 +600,28 @@ void addOpenDocuments(ref Engine e)
 // the root itself in (an import cycle) runs without one.
 void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
 {
-    if (e.warmBuilt && (e.warmStale || e.warmPath != path))
+    enum maxCopies = 8;
+    string why = !e.warmBuilt ? "none" : e.warmStale ? "stale" : "add";
+    if (e.warmBuilt && (e.warmStale || e.warmPaths.length >= maxCopies))
+    {
+        why = e.warmStale ? "stale" : "full";
         popWarm(e);
-    if (e.warmBuilt || contains(e.noWarm, path))
+    }
+    if (contains(e.warmPaths, path) || contains(e.noWarm, path) || e.isolated.length)
         return;
     auto t0 = nowMs();
-    levelPush(dmdGlobalRanges());
+    // The overlay is gone (we only get here while rebuilding it), so the warm
+    // level is the top and can take another copy.
+    if (!e.warmBuilt)
+    {
+        levelPush(dmdGlobalRanges());
+        e.warmBuilt = true;
+        e.warmStale = false;
+    }
+    // The buffers as they are now, before each copy: a copy may load an open
+    // document (an import of its root) that was opened or edited since the
+    // level was pushed. What it loads is tracked in `warmFiles`, so a later
+    // edit of that document invalidates the level.
     addOpenDocuments(e);
     DiagSink sink; // level 0 (see onDiag)
     gSink = &sink;
@@ -497,8 +631,12 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
         levelEnter();
         scope (exit)
             levelLeave();
-        analyzeCopy(text);
-        foreach (m; Module.amodules)
+        immutable before = Module.amodules.length;
+        analyzeCopy(text, e.warmPaths.length);
+        // What this copy loaded: the real root among it means the root is in
+        // an import cycle, and its copy is no use (the overlay could not
+        // load the root from the buffer).
+        foreach (m; Module.amodules[before .. $])
         {
             auto f = m.srcfile.toString();
             if (f == path)
@@ -510,24 +648,38 @@ void ensureWarm(ref Engine e, const(char)[] path, const(char)[] text)
     gSink = null;
     if (cyclic)
     {
-        levelPop();
+        // The level may now hold the real root: drop it, copies and all.
+        popWarm(e);
         e.noWarm ~= path.idup;
         log("warm: skipped for %.*s (import cycle through the root)", cast(int) path.length, path.ptr);
         return;
     }
-    e.warmBuilt = true;
-    e.warmStale = false;
-    e.warmPath = path.idup;
-    e.warmFiles = null;
+    e.warmPaths ~= path.idup;
     foreach (f; loaded)
-        e.warmFiles ~= f.idup;
-    e.warmDiags = sink.msgs;
-    traceMs("warm", nowMs() - t0, path);
+        if (!contains(e.warmFiles, f))
+            e.warmFiles ~= f.idup;
+    e.warmDiags ~= sink.msgs;
+    traceMs("warm", nowMs() - t0, why ~ " " ~ path);
 }
 
-// `text` as a root module named `__dmdlsp_warm` (its own module declaration
-// is ignored, so it cannot collide with the real root).
-void analyzeCopy(const(char)[] text)
+// Module name of the n-th warm copy.
+string warmCopyName(size_t n)
+{
+    import core.stdc.stdio : snprintf;
+
+    char[32] b;
+    auto k = snprintf(b.ptr, b.length, "__dmdlsp_warm%u", cast(uint) n);
+    return b[0 .. k].idup;
+}
+
+bool isWarmCopy(const(char)[] name)
+{
+    return name.length >= 13 && name[0 .. 13] == "__dmdlsp_warm";
+}
+
+// `text` as a root module named `__dmdlsp_warm<n>` (its own module
+// declaration is ignored, so it cannot collide with the real root).
+void analyzeCopy(const(char)[] text, size_t n)
 {
     import dmdwrap : dmdParseNoRegister;
     import dmd.identifier : Identifier;
@@ -536,12 +688,13 @@ void analyzeCopy(const(char)[] text)
     import dmd.semantic2 : semantic2;
     import dmd.semantic3 : semantic3;
 
-    auto pr = dmdParseNoRegister("__dmdlsp_warm.d", text, false);
+    auto name = warmCopyName(n);
+    auto pr = dmdParseNoRegister(name ~ ".d", text, false);
     if (!pr.ok)
         return;
     auto m = cast(Module) pr.module_;
     m.md = null;
-    m.ident = Identifier.idPool("__dmdlsp_warm");
+    m.ident = Identifier.idPool(name);
     if (!Module.modules.insert(m))
         return;
     Module.amodules.push(m);
@@ -581,6 +734,10 @@ void ensureDeps(ref Engine e, const(char)[] path, const(char)[] text)
     bool need = !e.depsBuilt || e.depsStale || e.learned.length;
     if (!need)
         return;
+    string why = !e.depsBuilt ? "none" : e.depsStale ? "stale" : "learned";
+    if (why == "learned")
+        foreach (n; e.learned)
+            why ~= " " ~ n;
     popDeps(e);
     // Wanted: what was wanted before, what the overlays had to load, and the
     // imports of this root.
@@ -654,7 +811,7 @@ void ensureDeps(ref Engine e, const(char)[] path, const(char)[] text)
     foreach (w; want)
         e.depsWanted ~= w.idup;
     e.depsBuilt = true;
-    traceMs("deps", nowMs() - t0, path);
+    traceMs("deps", nowMs() - t0, why ~ " " ~ path);
     log("deps: %d modules requested, %d files loaded", cast(int) e.depsWanted.length,
         cast(int) e.depsFiles.length);
 }
@@ -724,8 +881,11 @@ Module[] excludedLoaded(ref Engine e)
 {
     Module[] res;
     foreach (m; Module.amodules)
-        if (contains(e.edited, m.srcfile.toString()))
+    {
+        auto f = m.srcfile.toString();
+        if (contains(e.edited, f) || contains(e.isolated, f))
             res ~= m;
+    }
     return res;
 }
 
@@ -781,13 +941,18 @@ string moduleName(Module m)
 // held. They seed the next L2 build.
 void learnLoads(ref Engine e)
 {
+    // Only what this overlay loaded: modules the warm level loaded are cached
+    // there already, and moving them to L2 would cost a rebuild of both.
+    immutable overlayLevel = levelDepth();
     foreach (m; Module.amodules)
     {
+        if (levelOf(cast(void*) m) != overlayLevel)
+            continue;
         auto f = m.srcfile.toString();
         if (contains(e.depsFiles, f) || contains(e.edited, f) || contains(e.rootFiles, f))
             continue;
         auto n = moduleName(m);
-        if (n == "__dmdlsp_deps" || n == "__dmdlsp_warm" || contains(e.depsBanned, n))
+        if (n == "__dmdlsp_deps" || isWarmCopy(n) || contains(e.depsBanned, n))
             continue;
         auto t = levelSuspend();
         if (!contains(e.learned, n) && !contains(e.depsWanted, n))

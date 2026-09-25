@@ -5,7 +5,7 @@ module lsp;
 
 import arena;
 import json;
-import core.stdc.stdio : stdin, stdout, fread, fwrite, fflush, fgetc, EOF;
+import core.stdc.stdio : stdin, stdout, fread, fwrite, fflush, fgetc, EOF, FILE;
 import core.stdc.string : strlen;
 
 struct LspCompletionItem
@@ -212,13 +212,62 @@ bool jbool(JsonNode* n, bool def = false)
     return def;
 }
 
+version (Windows) // CRT low-level I/O (module scope, so they get C linkage)
+{
+    extern (C) int _dup(int) nothrow @nogc;
+    extern (C) int _dup2(int, int) nothrow @nogc;
+    extern (C) int _setmode(int, int) nothrow @nogc;
+    extern (C) FILE* _fdopen(int, const(char)*) nothrow @nogc;
+}
+
+// The protocol stream. `lspTakeStdout` moves it to a private descriptor, so
+// nothing else in the process can write into it.
+__gshared FILE* lspOut;
+
+// Once, before serving: keep a private copy of fd 1 for the protocol and point
+// fd 1 at stderr. dmd prints to stdout in places (`pragma(msg)`, debug and
+// diagnostic paths); all of that now lands in the log instead of corrupting
+// the framing. Done once at startup, so no handle changes under anyone later
+// (swapping fd 1 around each analysis is not stable on Windows).
+void lspTakeStdout()
+{
+    fflush(stdout);
+    version (Posix)
+    {
+        import core.sys.posix.unistd : dup, dup2;
+        import core.sys.posix.stdio : fdopen;
+
+        auto fd = dup(1);
+        lspOut = fd >= 0 ? fdopen(fd, "wb") : null;
+        if (lspOut !is null)
+            dup2(2, 1);
+    }
+    else version (Windows)
+    {
+        enum _O_BINARY = 0x8000;
+
+        auto fd = _dup(1);
+        if (fd >= 0)
+        {
+            _setmode(fd, _O_BINARY); // no CRLF translation in the framing
+            lspOut = _fdopen(fd, "wb");
+        }
+        if (lspOut !is null)
+            _dup2(2, 1);
+    }
+    if (lspOut is null)
+        lspOut = stdout; // keep serving; stray output is then possible
+}
+
 void lspWrite(string jsonBody)
 {
     import core.stdc.stdio : fprintf;
-    fprintf(stdout, "Content-Length: %u\r\n\r\n", cast(uint)jsonBody.length);
+
+    auto o = lspOut !is null ? lspOut : stdout;
+    fprintf(o, "Content-Length: %u\r\n\r\n", cast(uint)jsonBody.length);
     if (jsonBody.length)
-        fwrite(jsonBody.ptr, 1, jsonBody.length, stdout);
-    fflush(stdout);
+        fwrite(jsonBody.ptr, 1, jsonBody.length, o);
+    fflush(o);
 }
 
 void lspRespond(string idJson, string resultJson)

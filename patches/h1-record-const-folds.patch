@@ -1,0 +1,33 @@
+--- a/optimize.d
++++ b/optimize.d
+@@ -36,6 +36,12 @@
+ import dmd.typesem;
+ import dmd.visitor;
+ 
++// dmd-lsp H1 (docs/hacks.md): tooling hook, null for normal compilation.
++// Called with each `VarExp` that constant folding is about to replace by the
++// variable's value, so a tool can still find the use (references/rename).
++// Folding itself is unchanged.
++__gshared void function(VarExp) nothrow lspConstFolded;
++
+ /*************************************
+  * If variable has a const initializer,
+  * return that initializer.
+@@ -207,6 +213,8 @@
+     }
+     e.loc = e1.loc;
+ 
++    if (lspConstFolded && e !is e1) // dmd-lsp H1
++        lspConstFolded(ve);
+     return e;
+ }
+ 
+@@ -744,6 +752,8 @@
+         {
+             VarDeclaration v = ve.var.isVarDeclaration();
+             ex = expandVar(result, v);
++            if (ex && lspConstFolded) // dmd-lsp H1 (may be folded below)
++                lspConstFolded(ve);
+         }
+         if (ex && ex.isStructLiteralExp())
+         {
