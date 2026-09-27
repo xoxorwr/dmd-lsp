@@ -17,9 +17,9 @@ library — no DCD, no libdparse heuristics.
 
 ## Features
 
-- **Full D**: analysis *is* dmd's own semantic (used as a library), so
-  templates, `mixin`, CTFE, `__traits` and every other language feature work —
-  not a subset.
+- **Complete language support**: the server runs dmd's own semantic
+  analysis, so templates, `mixin`, CTFE, `__traits` and everything else are
+  understood exactly as the compiler sees them.
 - **Diagnostics** from real dmd semantic, plus lint for unused imports and
   unused parameters.
 - **Completion** with semantic types, locals and imports; LSP 3.17
