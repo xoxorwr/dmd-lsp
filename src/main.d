@@ -1,6 +1,6 @@
-// dmd-lsp: LSP front end (struct-only). All dmd work happens in the
-// worker (see ops.d); this module holds only session/config
-// state and formats results.
+// dmd-lsp: LSP front end (struct-only). All dmd work goes through the ops
+// layer (ops.d) on the in-process engine; this module holds only
+// session/config state and formats results.
 module main;
 
 version (Windows)
@@ -35,14 +35,14 @@ struct HitCache
     ops.WAnalysis analysis; // last analysis (lint, for codeAction)
 }
 
-// The analysis side (one in-process `ops.Worker`, see poolAcquire) and
-// whether its workspace index is built.
+// The analysis side (the in-process engine behind `ops.Worker`, see
+// poolAcquire) and whether its workspace index is built.
 struct PoolEntry
 {
     string root; // bound root path ("" when unbound)
     ops.Worker wk;
     ulong stamp; // LRU clock
-    bool indexBuilt; // this worker's workspace index is warm
+    bool indexBuilt; // the workspace index is warm
 }
 
 struct App
@@ -58,7 +58,7 @@ struct App
     bool debounceSet = false; // true when --debounce-ms= was given (beats file)
     // Explicit paths: CLI flags, replaced wholesale by editor settings.
     // Effective lists (explicit ++ file ++ builtin defaults) recomputed by
-    // refreshImports; applied at worker init.
+    // refreshImports; applied when the engine starts.
     string[] baseImports;
     string[] baseStringImports;
     string[] baseFlags; // dmd flags from CLI (--flag=...)
@@ -66,7 +66,7 @@ struct App
     string[] stringPaths; // effective
     string[] flags; // effective dmd flags (CLI ++ dls.json)
     string[] libraryPaths; // the stdlib's import dirs: code no edit can reach
-    ulong configGen = 0; // bumped on import-path change; invalidates worker
+    ulong configGen = 0; // bumped on import-path change; restarts the engine
     FileConfig fileCfg; // project dls.json (see below)
     PoolEntry[] pool;
     // Semantic tokens: last result per path and the text hash it was computed
@@ -250,7 +250,7 @@ private bool workerCompleteRetry(App* app, const(char)[] path, const(char)[] ate
             return true;
         if (r == ops.ExchangeResult.failed)
         {
-            // Drop it; the next attempt rebinds (spawning as needed).
+            // Retry; the failed op already reset the engine.
             poolDrop(app, path);
             continue;
         }
@@ -273,7 +273,7 @@ private bool workerSignatureRetry(App* app, const(char)[] path, const(char)[] at
             return true;
         if (r == ops.ExchangeResult.failed)
         {
-            // Drop it; the next attempt rebinds (spawning as needed).
+            // Retry; the failed op already reset the engine.
             poolDrop(app, path);
             continue;
         }
@@ -296,7 +296,7 @@ private bool workerDefinitionRetry(App* app, const(char)[] path, const(char)[] a
             return true;
         if (r == ops.ExchangeResult.failed)
         {
-            // Drop it; the next attempt rebinds (spawning as needed).
+            // Retry; the failed op already reset the engine.
             poolDrop(app, path);
             continue;
         }
@@ -414,7 +414,7 @@ private JsonNode* makeRange(Json js, uint sl, uint sc, uint el, uint ec)
     return range;
 }
 
-// A `CallHierarchyItem` from a worker item.
+// A `CallHierarchyItem` from an ops item.
 private JsonNode* callItemJson(Json js, const ref ops.WCallItem it)
 {
     auto o = js.create_object();
@@ -431,7 +431,7 @@ private JsonNode* callItemJson(Json js, const ref ops.WCallItem it)
     return o;
 }
 
-// A `TypeHierarchyItem` from a worker item.
+// A `TypeHierarchyItem` from an ops item.
 private JsonNode* typeItemJson(Json js, const ref ops.WTypeItem it)
 {
     auto o = js.create_object();
@@ -550,7 +550,7 @@ private bool workerHoverRetry(App* app, const(char)[] path, const(char)[] atext,
             return true;
         if (r == ops.ExchangeResult.failed)
         {
-            // Drop it; the next attempt rebinds (spawning as needed).
+            // Retry; the failed op already reset the engine.
             poolDrop(app, path);
             continue;
         }
@@ -733,9 +733,8 @@ private bool workerWorkspaceSymbolRetry(App* app, const(char)[] query,
     return false;
 }
 
-// Find the pool entry bound to `path`, or null.
-// The analysis side is one in-process `Worker` (ops.d) over the engine. The
-// pool vocabulary stayed: `poolAcquire` returns it (creating it on first use
+// The analysis side is one in-process engine (ops.d). The pool vocabulary
+// stayed: `poolAcquire` returns it (creating it on first use
 // or after a config change), `poolDrop` is a no-op the retry loops call after a
 // failed op (the op has already reset the engine).
 private PoolEntry* poolAcquire(App* app, const(char)[] path)
@@ -757,7 +756,7 @@ private PoolEntry* poolAcquire(App* app, const(char)[] path)
     };
     if (!workerSpawn(e.wk, app.importPaths, app.stringPaths, app.flags, app.libraryPaths, docs))
     {
-        log("worker: start failed");
+        log("engine: start failed");
         return null;
     }
     // Documents edited before a config change are still edited.
@@ -779,8 +778,6 @@ private void poolDropAll(App* app)
     app.pool = null;
 }
 
-// A workspace source changed on disk: the symbol index and any dependency
-// level holding that file are stale.
 // A workspace source changed on disk (VCS, another tool, or the editor's own
 // save). The symbol index reads disk, so it is stale either way. For analysis
 // an open document is its buffer, so its disk copy does not matter (editors
@@ -824,8 +821,7 @@ private void pushDocRemovalToPool(App* app, const(char)[] path)
         engineDocChanged(workerEngine(e.wk), path, false);
 }
 
-// Build the workspace index in the worker bound to `path` (null: the MRU
-// worker) once per worker/config generation.
+// Build the workspace index once per engine/config generation.
 private bool ensureIndex(App* app, const(char)[] path)
 {
     auto e = poolAcquire(app, path);
@@ -841,7 +837,7 @@ private bool ensureIndex(App* app, const(char)[] path)
     traceMs("index.discovery", nowMs() - t0);
     if (!workerBuildIndexRetry(app, path, files))
     {
-        log("worker: workspace index build failed");
+        log("engine: workspace index build failed");
         return false;
     }
     traceMs("index.build", nowMs() - t0);
@@ -1515,7 +1511,7 @@ private Notice loadFileConfig(App* app, const(char)[] root)
 }
 
 // The project config vanished from disk (watched-file delete): drop it and
-// invalidate the worker so analysis falls back to the defaults layer.
+// restart the engine so analysis falls back to the defaults layer.
 private void clearFileConfig(App* app)
 {
     if (!app.fileCfg.loaded)
@@ -1908,8 +1904,7 @@ private void handleMessage(App* app, ref RawMsg m)
             return;
         if (m.method == "exit")
         {
-            // C `exit` skips `scope (exit)`, so kill the workers explicitly;
-            // otherwise orphaned children keep the client's pipes open.
+            // C `exit` skips `scope (exit)`, so drop the engine explicitly.
             poolDropAll(app);
             import core.stdc.stdlib : exit;
             exit(app.shutdownRequested ? 0 : 1);
@@ -3422,7 +3417,7 @@ private void handleMessage(App* app, ref RawMsg m)
 private int runCheck(string[] files, string[] imports, string[] stringImports = null,
     string[] flags = null)
 {
-    // One-shot batch mode: single process.
+    // One-shot batch mode.
     App app;
     app.baseImports = imports;
     app.baseStringImports = stringImports;
@@ -3549,8 +3544,8 @@ private void refreshImports(App* app)
         app.flags = feff;
         app.configGen++;
         // The workspace index is rebuilt from the new import paths' files.
-        // Host bakes paths in at init; drop every worker so the next request
-        // spawns with the new configuration. Tokens may resolve differently
+        // The engine bakes paths in at start; drop it so the next request
+        // starts one with the new configuration. Tokens may resolve differently
         // under the new paths, so drop the cache too.
         app.tokCache = null;
         app.tokHash = null;
@@ -3932,8 +3927,8 @@ private int dmdLspMain(string[] args)
     // the analysis runs on the debounce idle (so the unsaved doc is analysed
     // without a save), reusing the live universe when the text is unchanged
     // since the last build. open/save force a real rebuild for exact
-    // diagnostics. All dmd work happens in the worker (ops.d); the
-    // parent holds no dmd state, so nothing accumulates across rebuilds.
+    // diagnostics. dmd runs in-process on memory levels (layers.d), so
+    // nothing accumulates across rebuilds.
     App app;
     app.debounceMs = debounceMs;
     app.debounceSet = debounceSet;

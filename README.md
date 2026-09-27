@@ -24,8 +24,11 @@ library — no DCD, no libdparse heuristics.
   unused parameters.
 - **Completion** with semantic types, locals and imports; LSP 3.17
   `labelDetails`.
-- **Signature help**, **goto definition**, **hover** (type + docs).
-- **Code actions** (remove unused import).
+- **Navigation**: goto definition/declaration/type definition/implementation,
+  references, document highlight, call and type hierarchy.
+- **Signature help**, **hover** (type + docs), **rename**, **inlay hints**.
+- **Code actions**: remove unused import(s), import a symbol from another
+  module, implement/override members.
 - **Semantic tokens** — identifier-level highlighting.
 
 Supported LSP methods:
@@ -34,15 +37,21 @@ Supported LSP methods:
 - sync: `textDocument/didOpen`, `didChange`, `didClose`, `didSave`
 - completion: `textDocument/completion` (LSP 3.17 `labelDetails` when opted in)
 - signature help: `textDocument/signatureHelp`
-- goto definition: `textDocument/definition`
-- references: `textDocument/references`
+- navigation: `textDocument/definition`, `declaration`, `typeDefinition`,
+  `implementation`, `references`, `documentHighlight`
+- call hierarchy: `textDocument/prepareCallHierarchy`,
+  `callHierarchy/incomingCalls`, `outgoingCalls`
+- type hierarchy: `textDocument/prepareTypeHierarchy`,
+  `typeHierarchy/supertypes`, `subtypes`
 - rename: `textDocument/prepareRename`, `textDocument/rename`
-- document symbols: `textDocument/documentSymbol`
-- workspace symbols: `workspace/symbol`
+- symbols: `textDocument/documentSymbol`, `workspace/symbol`
 - hover: `textDocument/hover` (type + docs)
-- code action: `textDocument/codeAction` (remove unused import)
+- code action: `textDocument/codeAction`
+- inlay hints: `textDocument/inlayHint` (opt-in)
+- folding / links: `textDocument/foldingRange`, `textDocument/documentLink`
 - semantic highlighting: `textDocument/semanticTokens/full`
 - diagnostics: `textDocument/publishDiagnostics`
+- workspace: `workspace/didChangeConfiguration`, `didChangeWatchedFiles`
 
 ## Build
 
@@ -150,9 +159,8 @@ of their pages saves a copy of the page. Popping the overlay copies those pages
 back, restores dmd's globals and unmaps the overlay's heap, so the dependency
 level is byte for byte what it was before the edit — no matter what dmd cached
 along the way (template instances, interned types, lazily analysed functions).
-An edit re-analyses only the overlay on the warm dependencies; memory is flat
-over any number of edits, root switches and rebuilds, with no worker process.
-It is `fork()` done in-process and scoped to dmd, and works the same on Linux,
+An edit re-analyses only the overlay on the warm dependencies, and memory is
+flat over any number of edits, root switches and rebuilds. It is `fork()` done in-process and scoped to dmd, and works the same on Linux,
 macOS and Windows (page protection via `mprotect`/`VirtualProtect`).
 
 Analysis is **debounce-only**: a keystroke never builds. Completion, hover and
