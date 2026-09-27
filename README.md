@@ -20,22 +20,24 @@ library — no DCD, no libdparse heuristics.
 - **Complete language support**: the server runs dmd's own semantic
   analysis, so templates, `mixin`, CTFE, `__traits` and everything else are
   understood exactly as the compiler sees them.
-- **Diagnostics** from real dmd semantic, plus lint for unused imports and
-  unused parameters.
-- **Completion** with semantic types, locals and imports; LSP 3.17
-  `labelDetails`.
+- **Diagnostics**: real dmd errors, plus lint for unused imports and unused
+  parameters.
+- **Completion**: semantic types, locals and imports.
 - **Navigation**: goto definition/declaration/type definition/implementation,
   references, document highlight, call and type hierarchy.
-- **Signature help**, **hover** (type + docs), **rename**, **inlay hints**.
+- **Signature help**: parameters of the call under the cursor.
+- **Hover**: type and docs.
+- **Rename**: across the workspace.
+- **Inlay hints**: inferred `auto` types and parameter names (opt-in).
 - **Code actions**: remove unused import(s), import a symbol from another
   module, implement/override members.
-- **Semantic tokens** — identifier-level highlighting.
+- **Semantic tokens**: identifier-level highlighting.
 
 Supported LSP methods:
 
 - lifecycle: `initialize`, `initialized`, `shutdown`, `exit`
 - sync: `textDocument/didOpen`, `didChange`, `didClose`, `didSave`
-- completion: `textDocument/completion` (LSP 3.17 `labelDetails` when opted in)
+- completion: `textDocument/completion`
 - signature help: `textDocument/signatureHelp`
 - navigation: `textDocument/definition`, `declaration`, `typeDefinition`,
   `implementation`, `references`, `documentHighlight`
@@ -75,9 +77,9 @@ Install `dmd-lsp.vsix` from the
 (or build it with `make vsix`). On first activation the extension downloads the
 server for your platform and keeps it updated. Settings:
 
-- `dmdLsp.serverPath` — use a local build instead of the downloaded binary.
-- `dmdLsp.autoUpdate` — re-download when the nightly changes (default `true`).
-- **dmd-lsp: Create dls.json** — write a starter config (see [Configuration](#configuration)).
+- `dmdLsp.serverPath`: use a local build instead of the downloaded binary.
+- `dmdLsp.autoUpdate`: re-download when the nightly changes (default `true`).
+- **dmd-lsp: Create dls.json**: write a starter config (see [Configuration](#configuration)).
 
 ### Other editors
 Download the standalone binary for your platform from the
@@ -147,11 +149,11 @@ loads at `initialize` and on save.
 `dmd-lsp` runs the real dmd frontend **in the server process**, on *memory
 levels* ([design.md](docs/design.md#memory-levels)):
 
-1. **dmd** — the frontend, configured (import paths, flags);
-2. **dependencies** — every module the open roots import, analysed once;
-3. **warm** — a renamed copy of the file being edited, analysed once, so the
+1. **dmd**: the frontend, configured (import paths, flags);
+2. **dependencies**: every module the open roots import, analysed once;
+3. **warm**: a renamed copy of the file being edited, analysed once, so the
    template instances it needs from libraries are already there;
-4. **overlay** — the file(s) being edited, analysed from the editor buffer.
+4. **overlay**: the file(s) being edited, analysed from the editor buffer.
 
 Each level has its own heap (a private druntime GC instance). While a level is
 on top, the levels below are write-protected; the first write dmd makes to one
@@ -160,8 +162,9 @@ back, restores dmd's globals and unmaps the overlay's heap, so the dependency
 level is byte for byte what it was before the edit — no matter what dmd cached
 along the way (template instances, interned types, lazily analysed functions).
 An edit re-analyses only the overlay on the warm dependencies, and memory is
-flat over any number of edits, root switches and rebuilds. It is `fork()` done in-process and scoped to dmd, and works the same on Linux,
-macOS and Windows (page protection via `mprotect`/`VirtualProtect`).
+flat over any number of edits, root switches and rebuilds. It is `fork()` done
+in-process and scoped to dmd, and works the same on Linux, macOS and Windows
+(page protection via `mprotect`/`VirtualProtect`).
 
 Analysis is **debounce-only**: a keystroke never builds. Completion, hover and
 the other read-only requests answer from the last analysis until the debounced
@@ -171,9 +174,9 @@ frontend, and the server keeps going.
 
 ## Docs
 
-- [design.md](docs/design.md) — internals, conventions, limitations, status
-- [vendoring.md](docs/vendoring.md) — vendored dmd sources, Makefile
-- [releases.md](docs/releases.md) — nightly CI, VS Code extension
-- [upstream.md](docs/upstream.md) — patches in `../dmd`, roadmap
-- [findings.md](docs/findings.md) — memory/GC investigation, and how it ended
-- [reclamation.md](docs/reclamation.md) — the memory-level invariants + vendor-update checklist
+- [design.md](docs/design.md): internals, conventions, limitations, status
+- [vendoring.md](docs/vendoring.md): vendored dmd sources, Makefile
+- [releases.md](docs/releases.md): nightly CI, VS Code extension
+- [upstream.md](docs/upstream.md): patches in `../dmd`, roadmap
+- [findings.md](docs/findings.md): memory/GC investigation, and how it ended
+- [reclamation.md](docs/reclamation.md): the memory-level invariants + vendor-update checklist
